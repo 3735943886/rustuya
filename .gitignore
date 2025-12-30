@@ -1,0 +1,23 @@
+# Rust
+/target/
+/examples/
+Cargo.lock
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Examples
+examples/test_*
+
+# Logs
+*.log
+
+# Environment
+.env

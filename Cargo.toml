@@ -1,0 +1,52 @@
+[package]
+name = "rustuya"
+version = "0.1.0"
+authors = ["3735943886"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/3735943886/rustuya"
+documentation = "https://docs.rs/rustuya"
+homepage = "https://github.com/3735943886/rustuya"
+description = "A Rust implementation of the Tuya Local API."
+keywords = ["tuya", "iot", "smart-home", "automation"]
+categories = ["hardware-support", "network-programming", "api-bindings"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE"
+]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+aes = "0.8"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+crc = "3.0"
+rand = "0.9"
+hex = "0.4"
+base64 = "0.22"
+thiserror = "2.0"
+log = "0.4"
+env_logger = "0.11"
+byteorder = "1.5"
+cipher = { version = "0.4", features = ["block-padding"] }
+block-padding = "0.3"
+ecb = "0.1"
+tokio = { version = "1.0", features = ["full"] }
+socket2 = { version = "0.5", features = ["all"] }
+async-stream = "0.3"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-core = "0.3"
+futures-util = "0.3"
+rlimit = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
