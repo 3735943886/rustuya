@@ -1,23 +1,27 @@
 //! UDP-based device discovery and scanning.
-//! Listens for Tuya broadcast packets and decodes device information.
+//!
+//! Listens for Tuya broadcast packets on the local network to discover devices.
 
 use crate::crypto::TuyaCipher;
 use crate::error::{Result, TuyaError};
 use crate::protocol::{self, CommandType, PREFIX_6699, TuyaMessage, Version};
-use log::{debug, error, info, warn};
+use log::{debug, info, trace, warn};
+use parking_lot::RwLock;
 use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, Instant};
 
-/// DiscoveryResult contains information about a discovered Tuya device.
-#[derive(Debug, Clone)]
+use serde::Serialize;
+
+/// Information about a discovered Tuya device.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DiscoveryResult {
     /// Device ID
     pub id: String,
@@ -28,7 +32,19 @@ pub struct DiscoveryResult {
     /// Product Key
     pub product_key: Option<String>,
     /// Time when the device was discovered
+    #[serde(skip)]
     pub discovered_at: Instant,
+}
+
+impl DiscoveryResult {
+    /// Checks if this result is substantially different from another,
+    /// ignoring the discovery timestamp.
+    pub fn is_same_device(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.ip == other.ip
+            && self.version == other.version
+            && self.product_key == other.product_key
+    }
 }
 
 /// v3.4 UDP discovery encryption key
@@ -41,48 +57,43 @@ const UDP_KEY_35: &[u8] = UDP_KEY_34;
 const UDP_KEY_33: &[u8] = b"yG9shRKIBrIBUjc3";
 
 const BROADCAST_INTERVAL: Duration = Duration::from_secs(6);
-const GLOBAL_SCAN_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
+const GLOBAL_SCAN_COOLDOWN: Duration = Duration::from_secs(1800); // 30 minutes
+const SCAN_THROTTLE_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds minimum gap between active scans
+const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(18); // Hardcoded 18s timeout
+const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
-static DISCOVERY_CACHE: OnceLock<Arc<RwLock<HashMap<String, DiscoveryResult>>>> = OnceLock::new();
-static SCAN_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
-static SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
-static LAST_SCAN_TIME: OnceLock<Arc<RwLock<Option<Instant>>>> = OnceLock::new();
-static PASSIVE_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
-static PASSIVE_CANCEL_TOKEN: OnceLock<tokio_util::sync::CancellationToken> = OnceLock::new();
+struct ScannerState {
+    cache: RwLock<HashMap<String, DiscoveryResult>>,
+    notify: Notify,
+    active_scanning: AtomicBool,
+    last_scan_time: RwLock<Option<Instant>>,
+    listener_started: AtomicBool,
+    cancel_token: RwLock<Option<tokio_util::sync::CancellationToken>>,
+    sockets: RwLock<HashMap<u16, Arc<UdpSocket>>>,
+}
 
-struct ScanGuard;
-impl Drop for ScanGuard {
-    fn drop(&mut self) {
-        SCAN_ACTIVE.store(false, Ordering::SeqCst);
+impl ScannerState {
+    fn new() -> Self {
+        Self {
+            cache: RwLock::new(HashMap::new()),
+            notify: Notify::new(),
+            active_scanning: AtomicBool::new(false),
+            last_scan_time: RwLock::new(None),
+            listener_started: AtomicBool::new(false),
+            cancel_token: RwLock::new(None),
+            sockets: RwLock::new(HashMap::new()),
+        }
     }
 }
 
-fn get_cache() -> Arc<RwLock<HashMap<String, DiscoveryResult>>> {
-    DISCOVERY_CACHE
-        .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-        .clone()
+static STATE: OnceLock<Arc<ScannerState>> = OnceLock::new();
+
+fn get_state() -> Arc<ScannerState> {
+    STATE.get_or_init(|| Arc::new(ScannerState::new())).clone()
 }
 
-fn get_last_scan_time() -> Arc<RwLock<Option<Instant>>> {
-    LAST_SCAN_TIME
-        .get_or_init(|| Arc::new(RwLock::new(None)))
-        .clone()
-}
-
-fn get_notify() -> Arc<Notify> {
-    SCAN_NOTIFY.get_or_init(|| Arc::new(Notify::new())).clone()
-}
-
-fn get_passive_cancel_token() -> tokio_util::sync::CancellationToken {
-    PASSIVE_CANCEL_TOKEN
-        .get_or_init(|| tokio_util::sync::CancellationToken::new())
-        .clone()
-}
-
-/// Scanner discovers Tuya devices on the local network using UDP broadcast.
-///
-/// It supports various protocol versions (3.1 - 3.5) and can find devices
-/// even if their IP addresses are unknown.
+/// Discovers Tuya devices on the local network using UDP broadcast.
+#[derive(Debug, Clone)]
 pub struct Scanner {
     /// Timeout for discovery
     pub timeout: Duration,
@@ -99,10 +110,10 @@ impl Default for Scanner {
 }
 
 impl Scanner {
-    /// Create a new Scanner with default settings.
+    /// Creates a new Scanner with default settings.
     pub fn new() -> Self {
         let scanner = Self {
-            timeout: Duration::from_secs(10),
+            timeout: DEFAULT_SCAN_TIMEOUT,
             bind_addr: "0.0.0.0".to_string(),
             ports: vec![6666, 6667, 7000],
         };
@@ -110,129 +121,218 @@ impl Scanner {
         scanner
     }
 
-    /// Ensures the background passive listener is running.
+    /// Ensures background passive listener is running.
     fn ensure_passive_listener(&self) {
-        if PASSIVE_LISTENER_STARTED.swap(true, Ordering::SeqCst) {
+        let state = get_state();
+        let mut ports_to_add = Vec::new();
+        {
+            let guard = state.sockets.read();
+            for &port in &self.ports {
+                if !guard.contains_key(&port) {
+                    ports_to_add.push(port);
+                }
+            }
+        }
+
+        if ports_to_add.is_empty() && state.listener_started.load(Ordering::SeqCst) {
             return;
         }
 
-        let ports = self.ports.clone();
         let bind_addr = self.bind_addr.clone();
-        let cancel_token = get_passive_cancel_token();
+        let cancel_token = {
+            state
+                .cancel_token
+                .write()
+                .get_or_insert_with(tokio_util::sync::CancellationToken::new)
+                .clone()
+        };
 
-        tokio::spawn(async move {
-            debug!("Starting background passive listener...");
-            let mut sockets = Vec::new();
-            for port in ports {
-                let addr: SocketAddr = match format!("{}:{}", bind_addr, port).parse() {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-
-                let socket = match Socket::new(
-                    Domain::for_address(addr),
-                    Type::DGRAM,
-                    Some(Protocol::UDP),
-                ) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-
-                let _ = socket.set_reuse_address(true);
-                let _ = socket.set_broadcast(true);
-                if socket.bind(&SockAddr::from(addr)).is_ok() {
-                    let _ = socket.set_nonblocking(true);
-                    let std_socket: std::net::UdpSocket = socket.into();
-                    if let Ok(tokio_socket) = UdpSocket::from_std(std_socket) {
-                        sockets.push(Arc::new(tokio_socket));
-                    }
+        let mut new_sockets = Vec::new();
+        {
+            let mut guard = state.sockets.write();
+            for port in ports_to_add {
+                if let Ok(socket) = Self::create_udp_socket(&bind_addr, port) {
+                    let arc_socket = Arc::new(socket);
+                    guard.insert(port, arc_socket.clone());
+                    new_sockets.push(arc_socket);
                 }
             }
+        }
 
-            if sockets.is_empty() {
+        if new_sockets.is_empty() {
+            if !state.listener_started.load(Ordering::SeqCst) {
                 warn!("Passive listener failed to bind to any ports");
-                PASSIVE_LISTENER_STARTED.store(false, Ordering::SeqCst);
-                return;
             }
+            return;
+        }
 
-            let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100);
+        state.listener_started.store(true, Ordering::SeqCst);
 
-            for socket in sockets {
-                let tx = tx.clone();
-                let ct = cancel_token.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    loop {
-                        tokio::select! {
-                            _ = ct.cancelled() => break,
-                            res = socket.recv_from(&mut buf) => {
-                                match res {
-                                    Ok((len, addr)) => {
-                                        if tx.send((buf[..len].to_vec(), addr)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
-                });
-            }
+        let cancel_token_clone = cancel_token.clone();
+        crate::runtime::spawn(async move {
+            debug!(
+                "Starting background receiver tasks for {} sockets...",
+                new_sockets.len()
+            );
 
+            let (mut rx, _ct) = Self::spawn_receiver_tasks(new_sockets, cancel_token_clone.clone());
             let scanner_temp = Scanner::new_silent();
             loop {
                 tokio::select! {
-                    _ = cancel_token.cancelled() => break,
+                    _ = cancel_token_clone.cancelled() => break,
                     Some((data, _addr)) = rx.recv() => {
                         if let Some(res) = scanner_temp.parse_packet(&data) {
-                            if let Ok(mut guard) = get_cache().write() {
-                                guard.insert(res.id.clone(), res);
-                                get_notify().notify_waiters();
+                            let mut guard = state.cache.write();
+
+                            // Keep memory clean by removing expired entries on every update.
+                            // This is efficient for typical device counts (< 1000).
+                            guard.retain(|_, v| v.discovered_at.elapsed() < CACHE_TTL);
+
+                            let should_log = match guard.get(&res.id) {
+                                Some(existing) => !res.is_same_device(existing),
+                                None => true,
+                            };
+
+                            let is_active = state.active_scanning.load(Ordering::SeqCst);
+                            if should_log {
+                                let mode = if is_active { "A" } else { "P" };
+                                let version = res
+                                    .version
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                info!(
+                                    "Discovered device {}(v{}) at {} - {}",
+                                    res.id, version, res.ip, mode
+                                );
                             }
+
+                            guard.insert(res.id.clone(), res.clone());
+                            state.notify.notify_waiters();
                         }
                     }
                 }
             }
-            debug!("Background passive listener stopped");
+            debug!("Background passive listener task stopped");
         });
     }
 
-    /// Internal constructor to avoid recursion in passive listener
+    fn spawn_receiver_tasks(
+        sockets: Vec<Arc<UdpSocket>>,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> (
+        mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+        Arc<tokio_util::sync::CancellationToken>,
+    ) {
+        let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100);
+        let ct = Arc::new(cancel_token);
+
+        for socket in sockets {
+            let tx = tx.clone();
+            let socket = socket.clone();
+            let ct = ct.clone();
+            crate::runtime::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    tokio::select! {
+                        _ = ct.cancelled() => break,
+                        res = socket.recv_from(&mut buf) => {
+                            match res {
+                                Ok((len, addr)) => {
+                                    if tx.send((buf[..len].to_vec(), addr)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        (rx, ct)
+    }
+
+    fn create_udp_socket(bind_addr: &str, port: u16) -> Result<UdpSocket> {
+        let addr: SocketAddr = format!("{}:{}", bind_addr, port)
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+        let _ = socket.set_reuse_address(true);
+        let _ = socket.set_broadcast(true);
+
+        socket.bind(&SockAddr::from(addr))?;
+        socket.set_nonblocking(true)?;
+
+        let std_socket: std::net::UdpSocket = socket.into();
+
+        // UdpSocket::from_std requires an active Tokio reactor.
+        // If we're called from a thread without one (e.g. sync examples),
+        // we must enter the global background runtime.
+        let _guard = crate::runtime::get_runtime().enter();
+        Ok(UdpSocket::from_std(std_socket)?)
+    }
+
     fn new_silent() -> Self {
         Self {
-            timeout: Duration::from_secs(10),
+            timeout: DEFAULT_SCAN_TIMEOUT,
             bind_addr: "0.0.0.0".to_string(),
             ports: vec![6666, 6667, 7000],
         }
     }
 
-    /// Stops the background passive listener.
+    /// Stops background passive listener.
     pub fn stop_passive_listener() {
-        get_passive_cancel_token().cancel();
-        PASSIVE_LISTENER_STARTED.store(false, Ordering::SeqCst);
+        let state = get_state();
+        if let Some(token) = state.cancel_token.write().take() {
+            token.cancel();
+        }
+        state.listener_started.store(false, Ordering::SeqCst);
+        state.sockets.write().clear();
     }
 
-    /// Set discovery timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Set ports to scan.
     pub fn with_ports(mut self, ports: Vec<u16>) -> Self {
         self.ports = ports;
+        self.ensure_passive_listener();
         self
     }
 
-    /// Get local IP address.
+    pub fn with_bind_addr(mut self, addr: String) -> Self {
+        self.bind_addr = addr;
+        self.ensure_passive_listener();
+        self
+    }
+
+    /// Returns a future that resolves when any device is discovered.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'static> {
+        STATE
+            .get()
+            .expect("Scanner state not initialized")
+            .notify
+            .notified()
+    }
+
+    /// Checks if a device was discovered within the last `within` duration.
+    pub fn is_recently_discovered(&self, device_id: &str, within: Duration) -> bool {
+        let state = get_state();
+        let guard = state.cache.read();
+        if let Some(res) = guard.get(device_id) {
+            return res.discovered_at.elapsed() < within;
+        }
+        false
+    }
+
     fn get_local_ip(&self) -> Option<String> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
         socket.connect("8.8.8.8:80").ok()?;
         socket.local_addr().ok().map(|addr| addr.ip().to_string())
     }
 
-    /// Send discovery broadcast for v3.x devices.
     async fn send_discovery_broadcast(&self, socket: &UdpSocket, port: u16) -> Result<()> {
         let local_ip = self.get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
         debug!(
@@ -291,219 +391,184 @@ impl Scanner {
         Ok(())
     }
 
-    /// Create and configure a UDP socket for a given port.
-    fn create_socket(&self, port: u16) -> Result<UdpSocket> {
-        let addr: SocketAddr = format!("{}:{}", self.bind_addr, port)
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-        debug!("Creating UDP socket for port {}...", port);
-        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-
-        if let Err(e) = socket.set_reuse_address(true) {
-            warn!("Failed to set reuse_address on port {}: {}", port, e);
+    /// Scans the local network for all Tuya devices.
+    pub async fn scan(&self) -> Result<Vec<DiscoveryResult>> {
+        let state = get_state();
+        if state.active_scanning.load(Ordering::SeqCst) {
+            return Err(TuyaError::DecodeError(
+                "Scan already in progress".to_string(),
+            ));
         }
 
-        if let Err(e) = socket.set_broadcast(true) {
-            warn!("Failed to set broadcast on port {}: {}", port, e);
-        }
-
-        match socket.bind(&SockAddr::from(addr)) {
-            Ok(_) => debug!("Successfully bound to {}", addr),
-            Err(e) => {
-                error!("Failed to bind to {}: {}", addr, e);
-                return Err(e.into());
+        // Global scan cooldown check
+        {
+            let last_scan = state.last_scan_time.read();
+            if let Some(instant) = *last_scan
+                && instant.elapsed() < GLOBAL_SCAN_COOLDOWN
+            {
+                let cache = state.cache.read();
+                return Ok(cache.values().cloned().collect());
             }
         }
 
-        socket.set_nonblocking(true)?;
+        state.active_scanning.store(true, Ordering::SeqCst);
+        *state.last_scan_time.write() = Some(Instant::now());
 
-        let std_socket: std::net::UdpSocket = socket.into();
-        Ok(UdpSocket::from_std(std_socket)?)
-    }
-
-    /// Scans the local network for all Tuya devices.
-    ///
-    /// Returns a list of all discovered devices and their basic information.
-    /// This method will block until the timeout is reached.
-    pub async fn scan(&self) -> Result<Vec<DiscoveryResult>> {
         info!(
             "Starting Tuya device scan (addr: {}, ports: {:?})...",
             self.bind_addr, self.ports
         );
 
-        // Use perform_discovery_loop but return all found devices
-        let _ = self.perform_discovery_loop(None).await?;
+        let scanner = self.clone();
+        let state_clone = state.clone();
+        crate::runtime::spawn(async move {
+            let _ = scanner.perform_discovery_loop().await;
+            state_clone.active_scanning.store(false, Ordering::SeqCst);
+            state_clone.notify.notify_waiters();
+        });
 
-        let cache = get_cache();
-        let guard = cache
-            .read()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let results: Vec<_> = guard.values().cloned().collect();
+        // Wait for scan to finish or timeout
+        let start_wait = Instant::now();
+        while state.active_scanning.load(Ordering::SeqCst) {
+            let elapsed = start_wait.elapsed();
+            if elapsed >= self.timeout {
+                break;
+            }
+            let remaining = self.timeout.saturating_sub(elapsed);
+            let _ = tokio::time::timeout(remaining, state.notify.notified()).await;
+        }
+
+        let cache = state.cache.read();
+        let results: Vec<_> = cache.values().cloned().collect();
         info!("Scan finished. Found {} devices.", results.len());
         Ok(results)
     }
 
-    /// Discovers a specific device by its ID.
-    ///
-    /// If the device is already in the local cache, it returns immediately.
-    /// Otherwise, it starts a network scan and waits for the device to respond
-    /// or for the timeout to occur.
     pub async fn discover_device(&self, device_id: &str) -> Result<Option<DiscoveryResult>> {
         self.discover_device_internal(device_id, false).await
     }
 
-    /// Internal version of discover_device that allows forcing a scan.
     pub async fn discover_device_internal(
         &self,
         device_id: &str,
         force_scan: bool,
     ) -> Result<Option<DiscoveryResult>> {
-        loop {
-            // 1. Check cache first (unless forced and cooldown passed)
-            if !force_scan {
-                if let Some(res) = get_cache()
-                    .read()
-                    .ok()
-                    .and_then(|g| g.get(device_id).cloned())
-                {
-                    if res.discovered_at.elapsed() < Duration::from_secs(30 * 60) {
-                        debug!("Found device {} in discovery cache", device_id);
-                        return Ok(Some(res));
-                    }
-                    debug!("Cached device {} expired, re-scanning...", device_id);
-                }
-            } else {
-                debug!("Force scan requested for device {}", device_id);
+        // 1. Check cache and cooldowns
+        if let Some(res) = self.check_cache_and_cooldown(device_id, force_scan) {
+            return Ok(Some(res));
+        }
+
+        // 2. Try to initiate or wait for scan
+        self.ensure_scan_started(device_id, force_scan).await;
+
+        // 3. Wait for the result to appear in cache
+        Ok(self.wait_for_cache_result(device_id).await)
+    }
+
+    fn check_cache_and_cooldown(
+        &self,
+        device_id: &str,
+        force_scan: bool,
+    ) -> Option<DiscoveryResult> {
+        let state = get_state();
+        let guard = state.cache.read();
+
+        if let Some(res) = guard.get(device_id).cloned()
+            && !force_scan
+            && res.discovered_at.elapsed() < GLOBAL_SCAN_COOLDOWN
+        {
+            debug!("Found device {} in discovery cache", device_id);
+            return Some(res);
+        }
+
+        if !force_scan
+            && let Some(last) = *state.last_scan_time.read()
+            && last.elapsed() < GLOBAL_SCAN_COOLDOWN
+            && let Some(res) = guard.get(device_id).cloned()
+        {
+            debug!(
+                "Global scan cooldown active (30m). Returning cached result for {}.",
+                device_id
+            );
+            return Some(res);
+        }
+        None
+    }
+
+    async fn ensure_scan_started(&self, device_id: &str, force_scan: bool) {
+        let state = get_state();
+        let can_scan = {
+            let last_scan = *state.last_scan_time.read();
+            match last_scan {
+                Some(last) if !force_scan && last.elapsed() < SCAN_THROTTLE_INTERVAL => false,
+                _ => !state.active_scanning.swap(true, Ordering::SeqCst),
             }
+        };
 
-            // 2. Check global cooldown if force_scan is requested
-            if force_scan {
-                let last_scan = get_last_scan_time().read().ok().and_then(|g| *g);
-                if let Some(last) = last_scan {
-                    if last.elapsed() < GLOBAL_SCAN_COOLDOWN {
-                        debug!(
-                            "Global scan cooldown active. Returning cached result if available."
-                        );
-                        if let Some(res) = get_cache()
-                            .read()
-                            .ok()
-                            .and_then(|g| g.get(device_id).cloned())
-                        {
-                            return Ok(Some(res));
-                        }
-                    }
-                }
-            }
+        if can_scan {
+            info!("Initiating background scan for device ID: {}...", device_id);
+            *state.last_scan_time.write() = Some(Instant::now());
 
-            // 3. Try to become the scan initiator
-            if !SCAN_ACTIVE.swap(true, Ordering::SeqCst) {
-                // We are the initiator
-                let _guard = ScanGuard; // Automatically resets SCAN_ACTIVE on drop
-                info!("Initiating scan for device ID: {}...", device_id);
-
-                // Update last scan time
-                if let Ok(mut guard) = get_last_scan_time().write() {
-                    *guard = Some(Instant::now());
-                }
-
-                let result = self.perform_discovery_loop(Some(device_id)).await;
-
-                // Notify others that a scan iteration has finished
-                get_notify().notify_waiters();
-
-                return result;
-            } else {
-                // 4. Scan already in progress, wait for notification but check cache periodically
-                debug!(
-                    "Scan already in progress, waiting for device {}...",
-                    device_id
-                );
-
-                let notify = get_notify();
-                let start_wait = Instant::now();
-
-                while start_wait.elapsed() < self.timeout {
-                    let notified = notify.notified();
-
-                    // Check cache before waiting to avoid race condition
-                    if let Some(res) = get_cache()
-                        .read()
-                        .ok()
-                        .and_then(|g| g.get(device_id).cloned())
-                    {
-                        return Ok(Some(res));
-                    }
-
-                    // Wait for notification or global timeout
-                    let remaining = self.timeout.saturating_sub(start_wait.elapsed());
-                    if remaining.is_zero() {
-                        break;
-                    }
-
-                    if tokio::time::timeout(remaining, notified).await.is_err() {
-                        // Global timeout reached
-                        break;
-                    }
-                }
-
-                if start_wait.elapsed() >= self.timeout {
-                    warn!("Timed out waiting for device {} discovery", device_id);
-                    return Ok(None);
-                }
-            }
+            let scanner = self.clone();
+            crate::runtime::spawn(async move {
+                let _ = scanner.perform_discovery_loop().await;
+                state.active_scanning.store(false, Ordering::SeqCst);
+                state.notify.notify_waiters();
+            });
         }
     }
 
-    /// Internal discovery loop that populates the cache.
-    async fn perform_discovery_loop(
-        &self,
-        target_id: Option<&str>,
-    ) -> Result<Option<DiscoveryResult>> {
-        let mut sockets = Vec::new();
-        for &port in &self.ports {
-            match self.create_socket(port) {
-                Ok(s) => sockets.push(Arc::new(s)),
-                Err(e) => warn!("Failed to listen on port {}: {}", port, e),
+    async fn wait_for_cache_result(&self, device_id: &str) -> Option<DiscoveryResult> {
+        let state = get_state();
+        let start_wait = Instant::now();
+
+        loop {
+            if let Some(res) = state.cache.read().get(device_id).cloned() {
+                return Some(res);
+            }
+
+            let elapsed = start_wait.elapsed();
+            if elapsed >= self.timeout || !state.active_scanning.load(Ordering::SeqCst) {
+                // One last check before giving up
+                return state.cache.read().get(device_id).cloned();
+            }
+
+            let remaining = self.timeout.saturating_sub(elapsed);
+            let _ = tokio::time::timeout(remaining, state.notify.notified()).await;
+        }
+    }
+
+    async fn perform_discovery_loop(self) -> Result<()> {
+        let state = get_state();
+        let mut target_sockets = Vec::new();
+
+        {
+            let guard = state.sockets.read();
+            for &port in &self.ports {
+                if let Some(socket) = guard.get(&port) {
+                    target_sockets.push((socket.clone(), port));
+                }
             }
         }
 
-        if sockets.is_empty() {
-            return Err(std::io::Error::other("No available ports for scanning").into());
+        if target_sockets.is_empty() {
+            // If no sockets found in passive listener, try to ensure it's started for these ports
+            self.ensure_passive_listener();
+            let guard = state.sockets.read();
+            for &port in &self.ports {
+                if let Some(socket) = guard.get(&port) {
+                    target_sockets.push((socket.clone(), port));
+                }
+            }
         }
 
-        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100);
-        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-
-        // Spawn a receiver task for each socket
-        for socket in &sockets {
-            let tx = tx.clone();
-            let socket = socket.clone();
-            let ct = cancel_token.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                loop {
-                    tokio::select! {
-                        _ = ct.cancelled() => break,
-                        res = socket.recv_from(&mut buf) => {
-                            match res {
-                                Ok((len, addr)) => {
-                                    if tx.send((buf[..len].to_vec(), addr)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                }
-            });
+        if target_sockets.is_empty() {
+            return Err(std::io::Error::other("No available ports for scanning").into());
         }
 
         let start = Instant::now();
         let mut broadcast_interval = tokio::time::interval(BROADCAST_INTERVAL);
         let mut broadcast_count = 0;
-        let mut result = None;
 
         while start.elapsed() < self.timeout {
             let remaining = self.timeout.saturating_sub(start.elapsed());
@@ -514,55 +579,26 @@ impl Scanner {
             tokio::select! {
                 _ = tokio::time::sleep(remaining) => break,
                 _ = broadcast_interval.tick() => {
-                    if broadcast_count < 2 {
-                        for (socket, port) in sockets.iter().zip(self.ports.iter()) {
-                            let _ = self.send_discovery_broadcast(socket, *port).await;
-                        }
+                    if broadcast_count < 3 {
                         broadcast_count += 1;
-                    }
-                }
-                Some((data, addr)) = rx.recv() => {
-                    debug!("Received UDP packet from {}: {} bytes", addr, data.len());
-
-                    if let Some(res) = self.parse_packet(&data) {
-                        // Update cache for all discovered devices
-                        if let Ok(mut guard) = get_cache().write() {
-                            guard.insert(res.id.clone(), res.clone());
-                            // Notify waiters that cache has been updated
-                            get_notify().notify_waiters();
-                        }
-
-                        if let Some(tid) = target_id
-                            && res.id == tid
-                        {
-                            info!(
-                                "Found target device: ID={}, IP={}, version={:?}",
-                                res.id, res.ip, res.version
-                            );
-                            result = Some(res);
-                            break;
+                        debug!("Sent broadcast {}/3", broadcast_count);
+                        for (socket, port) in &target_sockets {
+                            let _ = self.send_discovery_broadcast(socket, *port).await;
                         }
                     }
                 }
             }
         }
 
-        cancel_token.cancel();
-        if let Some(tid) = target_id
-            && result.is_none()
-        {
-            debug!("Device ID {} not found within timeout.", tid);
-        }
-        Ok(result)
+        Ok(())
     }
 
-    /// Parse a received UDP packet into a DiscoveryResult.
     fn parse_packet(&self, data: &[u8]) -> Option<DiscoveryResult> {
-        debug!("Parsing UDP packet of {} bytes...", data.len());
+        trace!("Parsing UDP packet of {} bytes...", data.len());
 
         // 1. Try raw JSON (v3.1, port 6666)
         if let Ok(val) = serde_json::from_slice::<Value>(data) {
-            debug!("Successfully parsed raw JSON packet");
+            trace!("Successfully parsed raw JSON packet");
             return self.parse_json(&val);
         }
 
@@ -591,7 +627,7 @@ impl Scanner {
 
                     // 2a. Payload is raw JSON (v3.5 or unencrypted v3.3)
                     if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
-                        debug!("Successfully parsed JSON from Tuya message payload");
+                        trace!("Successfully parsed JSON from Tuya message payload");
                         return self.parse_json(&val);
                     }
 
@@ -608,7 +644,7 @@ impl Scanner {
                                 cipher.decrypt(&msg.payload, false, None, None, None)
                             && let Ok(val) = serde_json::from_slice::<Value>(&decrypted)
                         {
-                            debug!(
+                            trace!(
                                 "Successfully decrypted and parsed JSON from Tuya message payload"
                             );
                             return self.parse_json(&val);
@@ -624,7 +660,7 @@ impl Scanner {
                             | crate::error::TuyaError::CrcMismatch
                             | crate::error::TuyaError::InvalidHeader
                     ) {
-                        debug!(
+                        trace!(
                             "unpack_message failed with key {:?}: {}",
                             key.map(hex::encode),
                             e
@@ -640,7 +676,7 @@ impl Scanner {
                 && let Ok(decrypted) = cipher.decrypt(data, false, None, None, None)
                 && let Ok(val) = serde_json::from_slice::<Value>(&decrypted)
             {
-                debug!("Successfully decrypted and parsed JSON from entire packet");
+                trace!("Successfully decrypted and parsed JSON from entire packet");
                 return self.parse_json(&val);
             }
         }
@@ -649,21 +685,19 @@ impl Scanner {
         if let Some(pos) = data.iter().position(|&b| b == b'{')
             && let Ok(val) = serde_json::from_slice::<Value>(&data[pos..])
         {
-            debug!("Successfully found and parsed JSON from middle of packet");
+            trace!("Successfully found and parsed JSON from middle of packet");
             return self.parse_json(&val);
         }
 
-        debug!("Failed to parse UDP packet");
+        trace!("Failed to parse UDP packet");
         None
     }
 
-    /// Invalidates a specific device from the cache.
-    pub fn invalidate_cache(&self, device_id: &str) -> bool {
-        if let Ok(mut guard) = get_cache().write() {
-            guard.remove(device_id).is_some()
-        } else {
-            false
-        }
+    /// Invalidates the cache entry for a specific device.
+    pub fn invalidate_cache(&self, id: &str) -> bool {
+        let state = get_state();
+        let mut guard = state.cache.write();
+        guard.remove(id).is_some()
     }
 
     /// Extract device info from JSON.

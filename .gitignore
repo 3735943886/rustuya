@@ -1,23 +1,14 @@
 # Rust
 /target/
-/examples/
+*/target/
 Cargo.lock
+*/Cargo.lock
 
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
+# Python
+/dist/
+*/dist/
+*.py
 
 # OS
 Thumbs.db
 .DS_Store
-
-# Examples
-examples/test_*
-
-# Logs
-*.log
-
-# Environment
-.env

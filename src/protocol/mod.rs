@@ -1,11 +1,14 @@
 //! Tuya wire protocol implementation.
-//! Handles packet framing, header parsing, and CRC/HMAC verification.
+//!
+//! Handles packet framing, header parsing, CRC calculation, and HMAC verification.
 
 use crate::crypto::TuyaCipher;
 use crate::error::{Result, TuyaError};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
 use crc::{CRC_32_ISO_HDLC, Crc};
 use hmac::{Hmac, Mac};
+use serde::Serialize;
+use serde_json::{Map, Value};
 use sha2::Sha256;
 use std::io::Cursor;
 
@@ -47,6 +50,17 @@ define_command_type! {
     LanExtStream = 0x40,
 }
 
+pub const NO_PROTOCOL_HEADER_CMDS: &[u32] = &[
+    CommandType::DpQuery as u32,
+    CommandType::DpQueryNew as u32,
+    CommandType::UpdateDps as u32,
+    CommandType::HeartBeat as u32,
+    CommandType::SessKeyNegStart as u32,
+    CommandType::SessKeyNegResp as u32,
+    CommandType::SessKeyNegFinish as u32,
+    CommandType::LanExtStream as u32,
+];
+
 define_version! {
     V3_1 = ("3.1", 3.1),
     V3_3 = ("3.3", 3.3),
@@ -54,21 +68,113 @@ define_version! {
     V3_5 = ("3.5", 3.5),
 }
 
-/// Tuya protocol message structure
-#[derive(Debug, Clone)]
+pub fn create_base_payload(
+    device_id: &str,
+    cid: Option<&str>,
+    data: Option<Value>,
+    t: Option<Value>,
+) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert("gwId".into(), device_id.into());
+    payload.insert("devId".into(), cid.unwrap_or(device_id).into());
+    payload.insert("uid".into(), device_id.into());
+    if let Some(c) = cid {
+        payload.insert("cid".into(), c.into());
+    }
+    if let Some(v) = t {
+        payload.insert("t".into(), v);
+    }
+    if let Some(d) = data {
+        payload.insert("dps".into(), d);
+    }
+    payload
+}
+
+pub mod dev22;
+pub mod v31;
+pub mod v33;
+pub mod v34;
+pub mod v35;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceType {
+    Default,
+    Device22,
+}
+
+impl std::str::FromStr for DeviceType {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "default" => Ok(DeviceType::Default),
+            "device22" => Ok(DeviceType::Device22),
+            _ => Err(()),
+        }
+    }
+}
+
+impl DeviceType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeviceType::Default => "default",
+            DeviceType::Device22 => "device22",
+        }
+    }
+}
+
+impl From<f32> for DeviceType {
+    fn from(v: f32) -> Self {
+        if (v - 3.2).abs() < f32::EPSILON {
+            DeviceType::Device22
+        } else {
+            DeviceType::Default
+        }
+    }
+}
+
+pub trait TuyaProtocol: Send + Sync {
+    fn version(&self) -> Version;
+    fn get_effective_command(&self, command: CommandType) -> u32;
+    fn generate_payload(
+        &self,
+        device_id: &str,
+        command: CommandType,
+        data: Option<Value>,
+        cid: Option<&str>,
+        t: u64,
+    ) -> Result<(u32, Value)>;
+    fn pack_payload(&self, payload: &[u8], cmd: u32, cipher: &TuyaCipher) -> Result<Vec<u8>>;
+    fn decrypt_payload(&self, payload: Vec<u8>, cipher: &TuyaCipher) -> Result<Vec<u8>>;
+    fn has_version_header(&self, payload: &[u8]) -> bool;
+}
+
+pub fn get_protocol(version: Version, dev_type: DeviceType) -> Box<dyn TuyaProtocol> {
+    match (version, dev_type) {
+        (Version::V3_1, _) => Box::new(v31::ProtocolV31),
+        (Version::V3_3, DeviceType::Device22) => Box::new(dev22::ProtocolDev22),
+        (Version::V3_3, _) => Box::new(v33::ProtocolV33),
+        (Version::V3_4, _) => Box::new(v34::ProtocolV34),
+        (Version::V3_5, _) => Box::new(v35::ProtocolV35),
+        _ => Box::new(v33::ProtocolV33), // Default to 3.3
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TuyaMessage {
-    /// Sequence number
     pub seqno: u32,
-    /// Command code
     pub cmd: u32,
-    /// Return code (optional)
     pub retcode: Option<u32>,
-    /// Actual payload (JSON or encrypted binary)
     pub payload: Vec<u8>,
-    /// Protocol prefix (0x55AA or 0x6699)
     pub prefix: u32,
-    /// IV (Initialization Vector, mainly for 6699 protocol)
     pub iv: Option<Vec<u8>>,
+}
+
+impl TuyaMessage {
+    pub fn payload_as_string(&self) -> Option<String> {
+        std::str::from_utf8(&self.payload)
+            .ok()
+            .map(|s| s.to_string())
+    }
 }
 
 impl Default for TuyaMessage {
@@ -84,29 +190,20 @@ impl Default for TuyaMessage {
     }
 }
 
-/// Tuya protocol header structure
 #[derive(Debug, Clone)]
 pub struct TuyaHeader {
-    /// Protocol prefix
     pub prefix: u32,
-    /// Sequence number
     pub seqno: u32,
-    /// Command code
     pub cmd: u32,
-    /// Payload length (includes encrypted data + HMAC/CRC + Suffix)
     pub payload_len: u32,
-    /// Total message length (header + payload)
     pub total_length: u32,
 }
 
-/// Pack TuyaMessage into binary data.
-/// If hmac_key is provided, uses HMAC-SHA256; otherwise, uses CRC32.
+/// Packs TuyaMessage into binary data.
 pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut data = Vec::new();
 
     if msg.prefix == PREFIX_55AA {
-        // 55AA Header: Prefix(4), Seq(4), Cmd(4), Len(4)
-        // Length = payload + (HMAC(32) + Suffix(4)) OR (CRC(4) + Suffix(4))
         let suffix_len = if hmac_key.is_some() { 32 + 4 } else { 4 + 4 };
         let payload_len = msg.payload.len() as u32 + suffix_len as u32;
 
@@ -115,10 +212,8 @@ pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8
         data.write_u32::<BigEndian>(msg.cmd)?;
         data.write_u32::<BigEndian>(payload_len)?;
 
-        // Add payload
         data.extend_from_slice(&msg.payload);
 
-        // Footer (checksum + Suffix)
         if let Some(key) = hmac_key {
             type HmacSha256 = Hmac<Sha256>;
             let mut mac =
@@ -135,9 +230,6 @@ pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8
     } else if msg.prefix == PREFIX_6699 {
         let key = hmac_key.ok_or(TuyaError::EncryptionFailed)?;
 
-        // 6699 Header: Prefix(4), Unknown(2), Seq(4), Cmd(4), Len(4)
-        // Length = IV(12) + encrypted_data(Retcode+Payload) + Tag(16) + Suffix(4)
-
         let mut raw = Vec::new();
         if let Some(rc) = msg.retcode {
             raw.write_u32::<BigEndian>(rc)?;
@@ -150,12 +242,11 @@ pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8
 
         let mut header_bytes = Vec::new();
         header_bytes.write_u32::<BigEndian>(PREFIX_6699)?;
-        header_bytes.write_u16::<BigEndian>(0)?; // Unknown
+        header_bytes.write_u16::<BigEndian>(0)?;
         header_bytes.write_u32::<BigEndian>(msg.seqno)?;
         header_bytes.write_u32::<BigEndian>(msg.cmd)?;
         header_bytes.write_u32::<BigEndian>(total_payload_len as u32)?;
 
-        // Determine IV (create new if not provided)
         let iv_vec = if let Some(ref iv) = msg.iv {
             iv.clone()
         } else {
@@ -164,20 +255,18 @@ pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8
             iv
         };
 
-        // GCM Encryption (AAD = Header[4..])
         let cipher = TuyaCipher::new(key)?;
         let encrypted =
             cipher.encrypt(&raw, false, Some(&iv_vec), Some(&header_bytes[4..]), false)?;
 
         data.extend_from_slice(&header_bytes);
-        data.extend_from_slice(&encrypted); // encrypt() returns IV + Ciphertext + Tag
+        data.extend_from_slice(&encrypted);
         data.write_u32::<BigEndian>(SUFFIX_6699)?;
     }
 
     Ok(data)
 }
 
-/// Parse Tuya header from binary data.
 pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
     if data.len() < 16 {
         return Err(TuyaError::DecodeError("Header too short".into()));
@@ -188,7 +277,6 @@ pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
 
     match prefix {
         PREFIX_55AA => {
-            // 55AA: Prefix(4), Seq(4), Cmd(4), Len(4)
             let seqno = cursor.read_u32::<BigEndian>()?;
             let cmd = cursor.read_u32::<BigEndian>()?;
             let payload_len = cursor.read_u32::<BigEndian>()?;
@@ -202,7 +290,6 @@ pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
             })
         }
         PREFIX_6699 => {
-            // 6699: Prefix(4), Unknown(2), Seq(4), Cmd(4), Len(4)
             if data.len() < 18 {
                 return Err(TuyaError::DecodeError("6699 header too short".into()));
             }
@@ -210,7 +297,7 @@ pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
             let seqno = cursor.read_u32::<BigEndian>()?;
             let cmd = cursor.read_u32::<BigEndian>()?;
             let payload_len = cursor.read_u32::<BigEndian>()?;
-            let total_length = payload_len + 18 + 4; // Header(18) + Payload(Length) + Suffix(4)
+            let total_length = payload_len + 18 + 4;
             Ok(TuyaHeader {
                 prefix,
                 seqno,
@@ -223,7 +310,6 @@ pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
     }
 }
 
-/// Unpack binary data into TuyaMessage structure.
 pub fn unpack_message(
     data: &[u8],
     hmac_key: Option<&[u8]>,
@@ -255,11 +341,9 @@ pub fn unpack_message(
         let mut payload_start = header_len;
         let mut retcode = None;
 
-        // Determine whether to parse retcode
         let should_parse_retcode = match no_retcode {
             Some(no) => !no,
             None => {
-                // Auto-detect: not JSON format and has space for 4 bytes
                 payload_end - payload_start >= 4
                     && data[payload_start] != b'{'
                     && (data[payload_start] == 0
@@ -274,7 +358,6 @@ pub fn unpack_message(
 
         let payload = data[payload_start..payload_end].to_vec();
 
-        // Verify checksum (CRC/HMAC)
         let checksum_data = &data[..payload_end];
         let footer = &data[payload_end..msg_len];
 
@@ -321,7 +404,6 @@ pub fn unpack_message(
         let iv = &payload_with_iv_tag[..iv_len];
         let ciphertext_with_tag = &payload_with_iv_tag[iv_len..];
 
-        // GCM Decryption (AAD = Header[4..])
         let cipher = TuyaCipher::new(key)?;
         let header_bytes = &data[4..header_len];
         let decrypted = cipher.decrypt(
@@ -336,11 +418,9 @@ pub fn unpack_message(
         let mut retcode = None;
         let retcode_len = 4;
 
-        // Determine whether to parse retcode (6699 protocol)
         let should_parse_retcode = match no_retcode {
             Some(no) => !no,
             None => {
-                // Auto-detect: if payload starts with 0 or non-'{', and followed by '{' or '3' (version header)
                 payload.len() >= retcode_len
                     && payload[0] != b'{'
                     && (payload.len() > retcode_len

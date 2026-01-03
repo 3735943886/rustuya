@@ -1,32 +1,17 @@
 //! # Rustuya
 //!
-//! A Rust implementation of the Tuya Local API.
-//!
-//! `rustuya` facilitates the control and monitoring of Tuya-compatible smart devices (plugs, switches, lights, gateways, etc.)
-//! directly over the local network, eliminating the need for Tuya Cloud dependency.
-//!
-//! ## Key Features
-//! - **Local LAN Control**: Direct device communication over the local network.
-//! - **Asynchronous Architecture**: Built on `tokio` for modern, non-blocking applications.
-//! - **Extensive Protocol Support**: Compatibility with versions 3.1, 3.2, 3.3, 3.4, and 3.5.
-//! - **Automated Discovery**: Integrated UDP scanning (Active & Passive) for device identification.
-//! - **Gateway Integration**: Management of sub-devices (Zigbee, Bluetooth) via Tuya Gateways.
+//! Asynchronous Tuya Local API implementation for local control and monitoring
+//! of Tuya-compatible devices without cloud dependencies.
 //!
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use rustuya::Device;
+//! use rustuya::sync::Device;
 //! use serde_json::json;
 //!
-//! #[tokio::main]
-//! async fn main() {
-//!     // Initialize a device with its ID, IP, Local Key, and Protocol Version.
-//!     // "Auto" can be used for IP and Version if the device is discoverable.
-//!     let device = Device::new("DEVICE_ID", "DEVICE_IP", "LOCAL_KEY", "VERSION");
+//! let device = Device::new("DEVICE_ID", "DEVICE_ADDRESS", "DEVICE_KEY", "DEVICE_VERSION");
 //!
-//!     // Set DP 1 (Power) to true
-//!     device.set_value(1, json!(true)).await;
-//! }
+//! device.set_value(1, json!(true));
 //! ```
 
 #[macro_use]
@@ -36,10 +21,18 @@ pub mod device;
 pub mod error;
 pub mod manager;
 pub mod protocol;
+pub mod runtime;
 pub mod scanner;
+pub mod sync;
 
-pub use device::Device;
+pub use device::{Device, DeviceBuilder};
 pub use error::TuyaError;
 pub use manager::{Manager, ManagerEvent};
 pub use protocol::{CommandType, Version};
 pub use scanner::Scanner;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn version() -> &'static str {
+    VERSION
+}

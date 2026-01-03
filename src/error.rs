@@ -1,77 +1,60 @@
-//! Error types and result definitions for the rustuya crate.
-//! Includes Tuya-specific error codes and conversion from standard IO/JSON errors.
+//! Error types and result definitions for the Tuya protocol.
+//!
+//! Defines Tuya-specific error codes and provides conversion from standard IO and JSON errors.
 
 use thiserror::Error;
 
-/// Represents all possible errors that can occur when communicating with a Tuya device.
 #[derive(Error, Debug, Clone)]
 pub enum TuyaError {
-    /// Standard IO error (network, timeout, etc.)
     #[error("IO error: {0}")]
     Io(String),
 
-    /// JSON serialization or deserialization error
     #[error("JSON error: {0}")]
     Json(String),
 
-    /// Failed to decrypt a message from the device (wrong key or version)
     #[error("Decryption failed")]
     DecryptionFailed,
 
-    /// Failed to encrypt a message for the device
     #[error("Encryption failed")]
     EncryptionFailed,
 
-    /// The payload received from the device was malformed or unexpected
     #[error("Invalid payload")]
     InvalidPayload,
 
-    /// Request timed out
     #[error("Timeout waiting for device")]
     Timeout,
 
-    /// CRC check failed for the received message
     #[error("CRC mismatch")]
     CrcMismatch,
 
-    /// HMAC signature verification failed (v3.4+)
     #[error("HMAC mismatch")]
     HmacMismatch,
 
-    /// TCP connection could not be established
     #[error("Socket connection failed")]
     ConnectionFailed,
 
-    /// The message header was invalid
     #[error("Invalid header")]
     InvalidHeader,
 
-    /// Failed to decode hex or base64 data
     #[error("Decode error: {0}")]
     DecodeError(String),
 
-    /// Device is currently unreachable or disconnected
     #[error("Device offline")]
     Offline,
 
-    /// Key negotiation (handshake) failed
     #[error("Handshake failed")]
     HandshakeFailed,
 
-    /// Generic error for wrong Local Key or Protocol Version
     #[error("Check device key or version (Error 914)")]
     KeyOrVersionError,
 
-    /// Device ID already exists in manager
     #[error("Device ID '{0}' already exists")]
     DuplicateDevice(String),
 
-    /// Device ID not found in manager or registry
     #[error("Device ID '{0}' not found")]
     DeviceNotFound(String),
 }
 
-/// A specialized Result type for Tuya operations.
 pub type Result<T> = std::result::Result<T, TuyaError>;
 
 impl From<std::io::Error> for TuyaError {
@@ -122,7 +105,6 @@ impl TuyaError {
     }
 }
 
-// TinyTuya Error Response Codes
 define_error_codes! {
     ERR_SUCCESS = 0 => "Connection Successful",
     ERR_JSON = 900 => "Invalid JSON Response from Device",

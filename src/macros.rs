@@ -1,10 +1,11 @@
-//! Helper macros for the rustuya crate.
-//! Primarily used for defining CommandType and other repetitive enums.
+//! Internal helper macros for the Tuya protocol.
+//!
+//! Provides macros for defining protocol structures, command types, and error codes.
 
 #[macro_export]
 macro_rules! define_command_type {
     ($($name:ident = $val:expr),* $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
         #[repr(u32)]
         pub enum CommandType {
             $($name = $val),*
@@ -30,7 +31,7 @@ macro_rules! define_command_type {
 #[macro_export]
 macro_rules! define_version {
     ($($variant:ident = ($str_val:expr, $float_val:expr)),* $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Default)]
+        #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
         pub enum Version {
             #[default]
             Auto,
