@@ -391,55 +391,111 @@ impl Scanner {
         Ok(())
     }
 
-    /// Scans the local network for all Tuya devices.
-    pub async fn scan(&self) -> Result<Vec<DiscoveryResult>> {
+    /// Scans the local network for all Tuya devices and returns a stream of results.
+    ///
+    /// This will yield currently cached devices first, then any newly discovered devices
+    /// until the scan timeout is reached. If a scan is already in progress, it will
+    /// join the existing scan instead of starting a new one.
+    pub fn scan_stream(
+        &self,
+    ) -> impl futures_util::Stream<Item = DiscoveryResult> + Send + 'static {
         let state = get_state();
-        if state.active_scanning.load(Ordering::SeqCst) {
-            return Err(TuyaError::DecodeError(
-                "Scan already in progress".to_string(),
-            ));
+        let timeout_dur = self.timeout;
+        let start_time = Instant::now();
+        let scanner = self.clone();
+
+        // 1. Start a new scan if none is in progress and cooldown has passed
+        let should_start = !state.active_scanning.load(Ordering::SeqCst) && {
+            let last_scan = state.last_scan_time.read();
+            last_scan.is_none_or(|t| t.elapsed() >= GLOBAL_SCAN_COOLDOWN)
+        };
+
+        if should_start {
+            state.active_scanning.store(true, Ordering::SeqCst);
+            *state.last_scan_time.write() = Some(Instant::now());
+            let state_clone = state.clone();
+            crate::runtime::spawn(async move {
+                let _ = scanner.perform_discovery_loop().await;
+                state_clone.active_scanning.store(false, Ordering::SeqCst);
+                state_clone.notify.notify_waiters();
+            });
         }
 
-        // Global scan cooldown check
-        {
-            let last_scan = state.last_scan_time.read();
-            if let Some(instant) = *last_scan
-                && instant.elapsed() < GLOBAL_SCAN_COOLDOWN
-            {
-                let cache = state.cache.read();
-                return Ok(cache.values().cloned().collect());
+        async_stream::stream! {
+            let mut yielded_ids = std::collections::HashSet::new();
+
+            // 2. Yield current cache first
+            let initial_items: Vec<_> = {
+                let guard = state.cache.read();
+                guard.values().cloned().collect()
+            };
+
+            for item in initial_items {
+                yielded_ids.insert(item.id.clone());
+                yield item;
+            }
+
+            // 3. Yield new items as they are discovered
+            loop {
+                let elapsed = start_time.elapsed();
+                if elapsed >= timeout_dur {
+                    break;
+                }
+
+                let remaining = timeout_dur.saturating_sub(elapsed);
+
+                // Wait for next discovery notification or timeout
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => break,
+                    _ = state.notify.notified() => {
+                        let new_items: Vec<_> = {
+                            let guard = state.cache.read();
+                            guard.values()
+                                .filter(|v| !yielded_ids.contains(&v.id))
+                                .cloned()
+                                .collect()
+                        };
+
+                        for item in new_items {
+                            yielded_ids.insert(item.id.clone());
+                            yield item;
+                        }
+
+                        // If scanning finished, we can stop after checking the cache one last time
+                        if !state.active_scanning.load(Ordering::SeqCst) {
+                             // Check one more time to catch any race conditions
+                             let final_items: Vec<_> = {
+                                let guard = state.cache.read();
+                                guard.values()
+                                    .filter(|v| !yielded_ids.contains(&v.id))
+                                    .cloned()
+                                    .collect()
+                            };
+                            for item in final_items {
+                                yield item;
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
+    }
 
-        state.active_scanning.store(true, Ordering::SeqCst);
-        *state.last_scan_time.write() = Some(Instant::now());
+    /// Scans the local network for all Tuya devices and returns a list of results.
+    ///
+    /// If a scan is already in progress, it will join that scan and return the results
+    /// once it finishes.
+    pub async fn scan(&self) -> Result<Vec<DiscoveryResult>> {
+        use futures_util::StreamExt;
 
         info!(
             "Starting Tuya device scan (addr: {}, ports: {:?})...",
             self.bind_addr, self.ports
         );
 
-        let scanner = self.clone();
-        let state_clone = state.clone();
-        crate::runtime::spawn(async move {
-            let _ = scanner.perform_discovery_loop().await;
-            state_clone.active_scanning.store(false, Ordering::SeqCst);
-            state_clone.notify.notify_waiters();
-        });
+        let results: Vec<_> = self.scan_stream().collect().await;
 
-        // Wait for scan to finish or timeout
-        let start_wait = Instant::now();
-        while state.active_scanning.load(Ordering::SeqCst) {
-            let elapsed = start_wait.elapsed();
-            if elapsed >= self.timeout {
-                break;
-            }
-            let remaining = self.timeout.saturating_sub(elapsed);
-            let _ = tokio::time::timeout(remaining, state.notify.notified()).await;
-        }
-
-        let cache = state.cache.read();
-        let results: Vec<_> = cache.values().cloned().collect();
         info!("Scan finished. Found {} devices.", results.len());
         Ok(results)
     }
