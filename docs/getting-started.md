@@ -7,7 +7,7 @@ Rustuya is a fast, concurrency-friendly library to control and monitor Tuya devi
 
 ```toml
 [dependencies]
-rustuya = "0.1.1"
+rustuya = "0.1"
 ```
 
 ## Quick Start
