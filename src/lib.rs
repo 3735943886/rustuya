@@ -7,11 +7,9 @@
 //!
 //! ```rust,no_run
 //! use rustuya::sync::Device;
-//! use serde_json::json;
 //!
 //! let device = Device::new("DEVICE_ID", "DEVICE_ADDRESS", "DEVICE_KEY", "DEVICE_VERSION");
-//!
-//! device.set_value(1, json!(true));
+//! device.set_value(1, true);
 //! ```
 
 #[macro_use]
