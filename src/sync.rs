@@ -10,7 +10,6 @@ use crate::runtime::{self, get_runtime};
 use crate::scanner::{DiscoveryResult, Scanner as AsyncScanner};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -181,6 +180,14 @@ impl Device {
 
     pub fn id(&self) -> &str {
         self.inner.id()
+    }
+
+    pub fn local_key(&self) -> &[u8] {
+        self.inner.local_key()
+    }
+
+    pub fn address(&self) -> String {
+        self.inner.address()
     }
 
     pub fn status(&self) {
@@ -381,7 +388,8 @@ enum ManagerCommand {
         std::sync::mpsc::Sender<Result<()>>,
     ),
     Get(String, std::sync::mpsc::Sender<Option<AsyncDevice>>),
-    List(std::sync::mpsc::Sender<HashMap<String, bool>>),
+    List(std::sync::mpsc::Sender<Vec<crate::manager::DeviceInfo>>),
+    Clear(std::sync::mpsc::Sender<()>),
     Shutdown(std::sync::mpsc::Sender<()>),
 }
 
@@ -429,6 +437,10 @@ impl Manager {
                     ManagerCommand::List(resp) => {
                         let res = inner_clone.list().await;
                         let _ = resp.send(res);
+                    }
+                    ManagerCommand::Clear(resp) => {
+                        inner_clone.clear().await;
+                        let _ = resp.send(());
                     }
                     ManagerCommand::Shutdown(resp) => {
                         inner_clone.clone().shutdown().await;
@@ -499,10 +511,14 @@ impl Manager {
         res.map(Device::from_async)
     }
 
-    pub fn list(&self) -> HashMap<String, bool> {
+    pub fn list(&self) -> Vec<crate::manager::DeviceInfo> {
         wait_for_response!(self.cmd_tx, ManagerCommand::List)
             .ok()
             .unwrap_or_default()
+    }
+
+    pub fn clear(&self) {
+        let _ = wait_for_response!(self.cmd_tx, ManagerCommand::Clear);
     }
 
     pub fn listener(&self) -> std::sync::mpsc::Receiver<ManagerEvent> {

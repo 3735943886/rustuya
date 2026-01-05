@@ -1,6 +1,6 @@
 [package]
 name = "rustuya"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["3735943886"]
 edition = "2024"
 license = "MIT"

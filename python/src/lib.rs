@@ -14,7 +14,6 @@ use log::LevelFilter;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyDictMethods, PyList, PyListMethods};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,6 +45,12 @@ pub struct Scanner {
     inner: SyncScanner,
 }
 
+impl Default for Scanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl Scanner {
     #[new]
@@ -56,8 +61,13 @@ impl Scanner {
     }
 
     /// Sets the scan timeout in milliseconds.
-    pub fn with_timeout(&mut self, timeout_ms: u64) {
-        self.inner.set_timeout(Duration::from_millis(timeout_ms));
+    pub fn with_timeout(&self, timeout_ms: u64) -> Self {
+        Scanner {
+            inner: self
+                .inner
+                .clone()
+                .with_timeout(Duration::from_millis(timeout_ms)),
+        }
     }
 
     /// Sets the local address to bind to.
@@ -197,6 +207,12 @@ impl Device {
     #[getter]
     pub fn version(&self) -> String {
         self.inner.version().to_string()
+    }
+
+    /// Returns the local key.
+    #[getter]
+    pub fn local_key(&self) -> String {
+        hex::encode(self.inner.local_key())
     }
 
     /// Returns the device IP address.
@@ -370,11 +386,10 @@ impl DeviceEventReceiver {
 
             // Check for signals periodically if no timeout is specified
             // This allows Python to handle Ctrl+C
-            if timeout_ms.is_none() {
-                recv_with_signals(&receiver)
-            } else {
-                let ms = timeout_ms.unwrap();
+            if let Some(ms) = timeout_ms {
                 Ok(receiver.recv_timeout(Duration::from_millis(ms)).ok())
+            } else {
+                recv_with_signals(&receiver)
             }
         })?;
 
@@ -423,11 +438,10 @@ impl ManagerEventReceiver {
 
             // Check for signals periodically if no timeout is specified
             // This allows Python to handle Ctrl+C
-            if timeout_ms.is_none() {
-                recv_with_signals(&receiver)
-            } else {
-                let ms = timeout_ms.unwrap();
+            if let Some(ms) = timeout_ms {
                 Ok(receiver.recv_timeout(Duration::from_millis(ms)).ok())
+            } else {
+                recv_with_signals(&receiver)
             }
         })?;
 
@@ -447,9 +461,25 @@ impl ManagerEventReceiver {
     }
 }
 
+#[pyclass(get_all)]
+#[derive(Clone)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub address: String,
+    pub local_key: String,
+    pub version: String,
+    pub is_connected: bool,
+}
+
 #[pyclass]
 pub struct Manager {
     inner: SyncManager,
+}
+
+impl Default for Manager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pymethods]
@@ -524,8 +554,24 @@ impl Manager {
         self.list(py).len()
     }
 
-    pub fn list(&self, py: Python<'_>) -> HashMap<String, bool> {
-        py.detach(|| self.inner.list())
+    pub fn clear(&self, py: Python<'_>) {
+        py.detach(|| self.inner.clear());
+    }
+
+    pub fn list(&self, py: Python<'_>) -> Vec<DeviceInfo> {
+        py.detach(|| {
+            self.inner
+                .list()
+                .into_iter()
+                .map(|info| DeviceInfo {
+                    id: info.id,
+                    address: info.address,
+                    local_key: hex::encode(info.local_key),
+                    version: info.version,
+                    is_connected: info.is_connected,
+                })
+                .collect()
+        })
     }
 
     pub fn listener(&self) -> ManagerEventReceiver {
@@ -567,6 +613,7 @@ fn rustuya(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<Manager>()?;
     m.add_class::<Device>()?;
+    m.add_class::<DeviceInfo>()?;
     m.add_class::<DeviceEventReceiver>()?;
     m.add_class::<SubDevice>()?;
     m.add_class::<ManagerEventReceiver>()?;

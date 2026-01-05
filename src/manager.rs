@@ -139,6 +139,15 @@ impl GlobalRegistry {
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub address: String,
+    pub local_key: String,
+    pub version: String,
+    pub is_connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ManagerEvent {
     pub device_id: String,
     pub message: TuyaMessage,
@@ -326,15 +335,34 @@ impl Manager {
         }
     }
 
+    pub async fn clear(&self) {
+        let mut devices = self.inner.devices.write();
+        let mut device_tokens = self.inner.device_tokens.write();
+
+        for (id, _) in devices.drain() {
+            if let Some(token) = device_tokens.remove(&id) {
+                token.cancel();
+            }
+            GlobalRegistry::release(&id);
+        }
+        info!("All devices removed from manager");
+    }
+
     pub async fn delete(&self, id: &str) {
         GlobalRegistry::delete(id);
     }
 
-    pub async fn list(&self) -> HashMap<String, bool> {
+    pub async fn list(&self) -> Vec<DeviceInfo> {
         let devices = self.inner.devices.read();
-        let mut result = HashMap::new();
-        for (id, device) in devices.iter() {
-            result.insert(id.clone(), device.is_connected());
+        let mut result = Vec::new();
+        for (_, device) in devices.iter() {
+            result.push(DeviceInfo {
+                id: device.id().to_string(),
+                address: device.address(),
+                local_key: hex::encode(device.local_key()),
+                version: device.version().to_string(),
+                is_connected: device.is_connected(),
+            });
         }
         result
     }

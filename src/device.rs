@@ -268,8 +268,18 @@ impl Device {
         self.with_state(|s| s.dev_type)
     }
 
+    pub fn local_key(&self) -> &[u8] {
+        &self.local_key
+    }
+
     pub fn address(&self) -> String {
-        self.with_state(|s| s.config_address.clone())
+        self.with_state(|s| {
+            if s.real_ip.is_empty() {
+                s.config_address.clone()
+            } else {
+                s.real_ip.clone()
+            }
+        })
     }
 
     pub fn version(&self) -> Version {
@@ -983,15 +993,20 @@ impl Device {
     }
 
     async fn resolve_address(&self) -> Result<String> {
-        let (config_addr, force_discovery) =
-            self.with_state(|s| (s.config_address.clone(), s.force_discovery));
-        if config_addr != "Auto" && config_addr != "0.0.0.0" && !config_addr.is_empty() {
+        let (config_addr, force_discovery, version) =
+            self.with_state(|s| (s.config_address.clone(), s.force_discovery, s.version));
+
+        let ip_explicit =
+            config_addr != "Auto" && config_addr != "0.0.0.0" && !config_addr.is_empty();
+        let ver_explicit = version != Version::Auto;
+
+        if ip_explicit && ver_explicit && !force_discovery {
             return Ok(config_addr);
         }
 
         debug!(
-            "Config address is {}, discovering device {} (force={})",
-            config_addr, self.id, force_discovery
+            "Resolving address/version for device {} (config_addr={}, version={}, force={})",
+            self.id, config_addr, version, force_discovery
         );
         if let Ok(Some(result)) = self
             .scanner
@@ -999,25 +1014,49 @@ impl Device {
             .await
         {
             let found_addr = result.ip;
-            let version = result.version;
-            if let Some(v) = version
+            let found_version = result.version;
+
+            if let Some(v) = found_version
                 && self.version() == Version::Auto
             {
                 debug!("Auto-detected version {} for device {}", v, self.id);
                 self.set_version(v);
             }
-            let version_str = version
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            debug!(
-                "Using discovered address {} for device {} (v{})",
-                found_addr, self.id, version_str
+
+            let version_str = self.version().to_string();
+
+            if ip_explicit {
+                debug!(
+                    "Using explicit address {} for device {} (v{})",
+                    config_addr, self.id, version_str
+                );
+                self.with_state_mut(|s| {
+                    s.real_ip = config_addr.clone();
+                    s.force_discovery = false;
+                });
+                Ok(config_addr)
+            } else {
+                debug!(
+                    "Using discovered address {} for device {} (v{})",
+                    found_addr, self.id, version_str
+                );
+                self.with_state_mut(|s| {
+                    s.real_ip = found_addr.clone();
+                    s.force_discovery = false;
+                });
+                Ok(found_addr)
+            }
+        } else if ip_explicit {
+            // Discovery failed but we have an explicit IP, try using it anyway
+            warn!(
+                "Discovery failed for device {}, attempting connection with explicit IP {}",
+                self.id, config_addr
             );
             self.with_state_mut(|s| {
-                s.real_ip = found_addr.clone();
+                s.real_ip = config_addr.clone();
                 s.force_discovery = false;
             });
-            Ok(found_addr)
+            Ok(config_addr)
         } else {
             Err(TuyaError::Offline)
         }
@@ -1180,15 +1219,17 @@ impl Device {
         // Base exponential backoff: 2^n * min_secs
         let base_secs = (2u64.pow(failure_count.min(10)) * min_secs).min(max_secs);
 
-        // Apply "Full Jitter": random value between 0 and base_secs
-        // This is highly effective for distributing reconnection attempts
-        // across many devices that might have disconnected simultaneously.
+        if base_secs == 0 {
+            return Duration::from_secs(0);
+        }
+
+        let base_ms = base_secs * 1000;
+        let fixed_ms = (base_ms * 70) / 100; // 70% fixed
+        let random_range_ms = base_ms - fixed_ms; // 30% random range
+
+        // Apply Jitter: 70% fixed + random(0% to 30%)
         let mut rng = rand::rng();
-        let jitter_ms = if base_secs > 0 {
-            rng.next_u64() % (base_secs * 1000)
-        } else {
-            0
-        };
+        let jitter_ms = fixed_ms + (rng.next_u64() % random_range_ms.max(1));
 
         Duration::from_millis(jitter_ms)
     }

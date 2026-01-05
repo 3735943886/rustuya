@@ -15,11 +15,10 @@ Minimal example to set a value on a device:
 
 ```rust
 use rustuya::sync::Device;
-use serde_json::json;
 
 fn main() {
     let device = Device::new("DEVICE_ID", "ADDRESS", "DEVICE_KEY", "VER");
-    device.set_value(1, json!(true));
+    device.set_value(1, true);
 }
 ```
 

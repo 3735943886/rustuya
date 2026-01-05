@@ -10,5 +10,5 @@ Rustuya is a Rust implementation of the Tuya Local API.
 - [FAQ](./faq.md)
 
 ## Credits
-This library refers to the protocol specifications documented in [tinytuya](https://github.com/jasonacox/tinytuya):
+This library refers to the protocol specifications and error codes documented in [tinytuya](https://github.com/jasonacox/tinytuya):
 - [Protocol Reference](https://github.com/jasonacox/tinytuya/blob/master/PROTOCOL.md)
