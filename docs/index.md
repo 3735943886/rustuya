@@ -5,6 +5,7 @@ Rustuya is a Rust implementation of the Tuya Local API.
 
 ## Table of Contents
 - [Getting Started](./getting-started.md)
+- [API Design Philosophy](./api.md)
 - [Python Guide](./python-api.md)
 - [Architecture](./architecture.md)
 - [FAQ](./faq.md)
