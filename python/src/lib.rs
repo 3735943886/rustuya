@@ -114,9 +114,8 @@ impl Scanner {
     }
 
     /// Stops the passive discovery listener.
-    #[staticmethod]
-    pub fn stop_passive_listener() {
-        SyncScanner::stop_passive_listener();
+    pub fn stop_passive_listener(&self) {
+        self.inner.stop_passive_listener();
     }
 }
 
@@ -596,7 +595,6 @@ fn rustuya(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[pyfunction]
     fn _rustuya_atexit() {
         log::set_max_level(LevelFilter::Off);
-        ::rustuya::scanner::Scanner::stop_passive_listener();
         ::rustuya::manager::Manager::shutdown_all();
     }
 

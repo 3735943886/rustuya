@@ -6,7 +6,7 @@ use crate::device::Device;
 use crate::error::{Result, TuyaError};
 use crate::protocol::{TuyaMessage, Version};
 use futures_util::{Stream, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -20,9 +20,83 @@ struct RegistryEntry {
     device: Device,
     ref_count: usize,
     update_tx: broadcast::Sender<Device>,
+    event_tx: broadcast::Sender<TuyaMessage>,
+    _monitor_token: CancellationToken,
 }
 
 static DEVICE_REGISTRY: OnceLock<Arc<RwLock<HashMap<String, RegistryEntry>>>> = OnceLock::new();
+
+pub struct DeviceHandle {
+    id: String,
+    device: Arc<RwLock<Device>>,
+    _update_token: CancellationToken,
+    update_rx: broadcast::Receiver<Device>,
+    event_rx: broadcast::Receiver<TuyaMessage>,
+}
+
+impl DeviceHandle {
+    pub fn device(&self) -> Device {
+        self.device.read().clone()
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn update_rx(&self) -> broadcast::Receiver<Device> {
+        self.update_rx.resubscribe()
+    }
+
+    pub fn event_rx(&self) -> broadcast::Receiver<TuyaMessage> {
+        self.event_rx.resubscribe()
+    }
+
+    fn spawn_update_task(&self) {
+        let _device_id = self.id.clone();
+        let device_arc = self.device.clone();
+        let mut update_rx = self.update_rx.resubscribe();
+        let token = self._update_token.clone();
+
+        crate::runtime::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    update_result = update_rx.recv() => {
+                        match update_result {
+                            Ok(new_device) => {
+                                *device_arc.write() = new_device;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl Clone for DeviceHandle {
+    fn clone(&self) -> Self {
+        GlobalRegistry::increment_ref(&self.id);
+        let new_handle = Self {
+            id: self.id.clone(),
+            device: self.device.clone(),
+            _update_token: CancellationToken::new(),
+            update_rx: self.update_rx.resubscribe(),
+            event_rx: self.event_rx.resubscribe(),
+        };
+        new_handle.spawn_update_task();
+        new_handle
+    }
+}
+
+impl Drop for DeviceHandle {
+    fn drop(&mut self) {
+        self._update_token.cancel();
+        GlobalRegistry::release(&self.id);
+    }
+}
 
 struct GlobalRegistry;
 
@@ -33,12 +107,15 @@ impl GlobalRegistry {
             .clone()
     }
 
-    fn acquire<V>(
-        id: &str,
-        address: &str,
-        local_key: &str,
-        version: V,
-    ) -> Result<(Device, broadcast::Receiver<Device>)>
+    fn increment_ref(id: &str) {
+        let registry = Self::get();
+        let mut guard = registry.write();
+        if let Some(entry) = guard.get_mut(id) {
+            entry.ref_count += 1;
+        }
+    }
+
+    fn acquire<V>(id: &str, address: &str, local_key: &str, version: V) -> Result<DeviceHandle>
     where
         V: Into<Version> + Send,
     {
@@ -52,21 +129,100 @@ impl GlobalRegistry {
                 entry.ref_count + 1
             );
             entry.ref_count += 1;
-            Ok((entry.device.clone(), entry.update_tx.subscribe()))
+            let handle = DeviceHandle {
+                id: id.to_string(),
+                device: Arc::new(RwLock::new(entry.device.clone())),
+                _update_token: CancellationToken::new(),
+                update_rx: entry.update_tx.subscribe(),
+                event_rx: entry.event_tx.subscribe(),
+            };
+            handle.spawn_update_task();
+            Ok(handle)
         } else {
             let (update_tx, _) = broadcast::channel(CHAN_UPDATE_CAPACITY);
+            let (event_tx, _) = broadcast::channel(CHAN_EVENT_CAPACITY);
             let device = Device::new(id, address, local_key, version);
+            let monitor_token = CancellationToken::new();
+
+            Self::spawn_global_monitor(
+                id,
+                device.clone(),
+                update_tx.subscribe(),
+                event_tx.clone(),
+                monitor_token.clone(),
+            );
+
             guard.insert(
                 id.to_string(),
                 RegistryEntry {
                     device: device.clone(),
                     ref_count: 1,
                     update_tx: update_tx.clone(),
+                    event_tx: event_tx.clone(),
+                    _monitor_token: monitor_token,
                 },
             );
             info!("Device {} registered in global registry", id);
-            Ok((device, update_tx.subscribe()))
+            let handle = DeviceHandle {
+                id: id.to_string(),
+                device: Arc::new(RwLock::new(device)),
+                _update_token: CancellationToken::new(),
+                update_rx: update_tx.subscribe(),
+                event_rx: event_tx.subscribe(),
+            };
+            handle.spawn_update_task();
+            Ok(handle)
         }
+    }
+
+    fn spawn_global_monitor(
+        id: &str,
+        mut device: Device,
+        mut update_rx: broadcast::Receiver<Device>,
+        event_tx: broadcast::Sender<TuyaMessage>,
+        token: CancellationToken,
+    ) {
+        let device_id = id.to_string();
+        crate::runtime::spawn(async move {
+            info!("Starting global event monitor for device {}", device_id);
+            loop {
+                let listener = device.listener();
+                tokio::pin!(listener);
+
+                let mut device_updated = false;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        update_result = update_rx.recv() => {
+                            match update_result {
+                                Ok(new_device) => {
+                                    info!("Device {} configuration updated, restarting monitor", device_id);
+                                    device = new_device;
+                                    device_updated = true;
+                                    break;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => return,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            }
+                        }
+                        msg_result = listener.next() => {
+                            match msg_result {
+                                Some(Ok(message)) => {
+                                    let _ = event_tx.send(message);
+                                }
+                                Some(Err(_)) => continue,
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                if !device_updated {
+                    break;
+                }
+            }
+            info!("Global event monitor for device {} stopped", device_id);
+        });
     }
 
     fn release(id: &str) {
@@ -81,6 +237,7 @@ impl GlobalRegistry {
         }
         if should_remove && let Some(entry) = guard.remove(id) {
             let device = entry.device;
+            entry._monitor_token.cancel();
             crate::runtime::spawn(async move {
                 device.stop().await;
             });
@@ -93,6 +250,7 @@ impl GlobalRegistry {
         let mut guard = registry.write();
         if let Some(entry) = guard.remove(id) {
             let device = entry.device;
+            entry._monitor_token.cancel();
             crate::runtime::spawn(async move {
                 device.stop().await;
             });
@@ -129,6 +287,7 @@ impl GlobalRegistry {
         let mut guard = registry.write();
         for (_, entry) in guard.drain() {
             let device = entry.device;
+            entry._monitor_token.cancel();
             crate::runtime::spawn(async move {
                 device.stop().await;
             });
@@ -166,10 +325,18 @@ pub struct Manager {
 }
 
 struct ManagerInner {
-    devices: RwLock<HashMap<String, Device>>,
-    device_tokens: RwLock<HashMap<String, CancellationToken>>,
+    devices: RwLock<HashMap<String, DeviceHandle>>,
     event_tx: broadcast::Sender<ManagerEvent>,
     cancel_token: CancellationToken,
+}
+
+impl Drop for ManagerInner {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        let mut devices = self.devices.write();
+        devices.clear();
+        debug!("Manager destroyed, all devices released");
+    }
 }
 
 impl Default for Manager {
@@ -200,7 +367,6 @@ impl Manager {
         Self {
             inner: Arc::new(ManagerInner {
                 devices: RwLock::new(HashMap::new()),
-                device_tokens: RwLock::new(HashMap::new()),
                 event_tx,
                 cancel_token: CancellationToken::new(),
             }),
@@ -229,19 +395,16 @@ impl Manager {
         V: Into<Version> + Send,
     {
         let mut devices = self.inner.devices.write();
-        let mut device_tokens = self.inner.device_tokens.write();
 
         if devices.contains_key(id) {
             return Err(TuyaError::DuplicateDevice(id.to_string()));
         }
 
-        let (device, update_rx) = GlobalRegistry::acquire(id, address, local_key, version)?;
+        let handle = GlobalRegistry::acquire(id, address, local_key, version)?;
 
-        let device_token = self.inner.cancel_token.child_token();
-        self.spawn_device_monitor(id, device.clone(), update_rx, device_token.clone());
+        self.spawn_device_forwarder(handle.clone(), self.inner.cancel_token.child_token());
 
-        devices.insert(id.to_string(), device);
-        device_tokens.insert(id.to_string(), device_token);
+        devices.insert(id.to_string(), handle);
 
         info!("Device {} added to manager", id);
         Ok(())
@@ -260,87 +423,38 @@ impl Manager {
         GlobalRegistry::modify(id, address, local_key, version)
     }
 
-    fn spawn_device_monitor(
-        &self,
-        id: &str,
-        mut device: Device,
-        mut update_rx: broadcast::Receiver<Device>,
-        token: CancellationToken,
-    ) {
-        let device_id = id.to_string();
+    fn spawn_device_forwarder(&self, handle: DeviceHandle, token: CancellationToken) {
+        let device_id = handle.id().to_string();
         let event_tx = self.inner.event_tx.clone();
-        let inner_weak = Arc::downgrade(&self.inner);
+        let mut event_rx = handle.event_rx();
 
         crate::runtime::spawn(async move {
-            info!("Starting event monitor for device {}", device_id);
-
+            info!("Starting event forwarder for device {}", device_id);
             loop {
-                let listener = device.listener();
-                tokio::pin!(listener);
-
-                let mut device_updated = false;
-
-                loop {
-                    tokio::select! {
-                        _ = token.cancelled() => return,
-                        update_result = update_rx.recv() => {
-                            match update_result {
-                                Ok(new_device) => {
-                                    info!("Device {} configuration updated, restarting monitor", device_id);
-                                    device = new_device.clone();
-                                    if let Some(inner) = inner_weak.upgrade() {
-                                        inner.devices.write().insert(device_id.clone(), new_device);
-                                        device_updated = true;
-                                        break;
-                                    } else {
-                                        return;
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    info!("Device {} removed globally, stopping monitor", device_id);
-                                    if let Some(inner) = inner_weak.upgrade() {
-                                        inner.devices.write().remove(&device_id);
-                                        inner.device_tokens.write().remove(&device_id);
-                                    }
-                                    return;
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    msg_result = event_rx.recv() => {
+                        match msg_result {
+                            Ok(message) => {
+                                let _ = event_tx.send(ManagerEvent {
+                                    device_id: device_id.clone(),
+                                    message,
+                                });
                             }
-                        }
-                        msg_result = listener.next() => {
-                            match msg_result {
-                                Some(Ok(message)) => {
-                                    let _ = event_tx.send(ManagerEvent {
-                                        device_id: device_id.clone(),
-                                        message,
-                                    });
-                                }
-                                Some(Err(_)) => continue,
-                                None => break, // Stream ended (e.g. device stopped or disconnected)
-                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         }
                     }
                 }
-
-                // If the device wasn't updated via broadcast, and the stream ended,
-                // it means the monitor should stop.
-                if !device_updated {
-                    info!("Event monitor for device {} stopped", device_id);
-                    break;
-                }
             }
+            info!("Event forwarder for device {} stopped", device_id);
         });
     }
 
     pub async fn remove(&self, id: &str) {
         let mut devices = self.inner.devices.write();
-        let mut device_tokens = self.inner.device_tokens.write();
-
         if devices.remove(id).is_some() {
-            if let Some(token) = device_tokens.remove(id) {
-                token.cancel();
-            }
-            GlobalRegistry::release(id);
             info!("Device {} removed from manager", id);
         } else {
             warn!("Attempted to remove non-existent device {}", id);
@@ -349,14 +463,7 @@ impl Manager {
 
     pub async fn clear(&self) {
         let mut devices = self.inner.devices.write();
-        let mut device_tokens = self.inner.device_tokens.write();
-
-        for (id, _) in devices.drain() {
-            if let Some(token) = device_tokens.remove(&id) {
-                token.cancel();
-            }
-            GlobalRegistry::release(&id);
-        }
+        devices.clear();
         info!("All devices removed from manager");
     }
 
@@ -367,9 +474,10 @@ impl Manager {
     pub async fn list(&self) -> Vec<DeviceInfo> {
         let devices = self.inner.devices.read();
         let mut result = Vec::new();
-        for (_, device) in devices.iter() {
+        for (_, handle) in devices.iter() {
+            let device = handle.device();
             result.push(DeviceInfo {
-                id: device.id().to_string(),
+                id: handle.id().to_string(),
                 address: device.address(),
                 local_key: hex::encode(device.local_key()),
                 version: device.version().to_string(),
@@ -380,19 +488,17 @@ impl Manager {
     }
 
     pub async fn get(&self, id: &str) -> Option<Device> {
-        self.inner.devices.read().get(id).cloned()
+        self.inner
+            .devices
+            .read()
+            .get(id)
+            .map(|h| h.device().clone())
     }
 
     pub async fn shutdown(self) {
         self.inner.cancel_token.cancel();
-
         let mut devices = self.inner.devices.write();
-        let mut tokens = self.inner.device_tokens.write();
-
-        for (id, _) in devices.drain() {
-            tokens.remove(&id);
-            GlobalRegistry::release(&id);
-        }
+        devices.clear();
         info!("Manager shut down");
     }
 
@@ -406,9 +512,6 @@ impl Drop for Manager {
         if Arc::strong_count(&self.inner) == 1 {
             self.inner.cancel_token.cancel();
             let mut devices = self.inner.devices.write();
-            for id in devices.keys().cloned().collect::<Vec<String>>() {
-                GlobalRegistry::release(&id);
-            }
             devices.clear();
         }
     }

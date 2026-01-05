@@ -358,8 +358,8 @@ impl Scanner {
         Ok(())
     }
 
-    pub fn stop_passive_listener() {
-        AsyncScanner::stop_passive_listener();
+    pub fn stop_passive_listener(&self) {
+        self.inner.stop_passive_listener();
     }
 }
 

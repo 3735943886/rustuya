@@ -12,8 +12,8 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, Instant};
@@ -62,13 +62,14 @@ const SCAN_THROTTLE_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds 
 const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(18); // Hardcoded 18s timeout
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
+#[derive(Debug)]
 struct ScannerState {
     cache: RwLock<HashMap<String, DiscoveryResult>>,
     notify: Notify,
     active_scanning: AtomicBool,
     last_scan_time: RwLock<Option<Instant>>,
     listener_started: AtomicBool,
-    cancel_token: RwLock<Option<tokio_util::sync::CancellationToken>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     sockets: RwLock<HashMap<u16, Arc<UdpSocket>>>,
 }
 
@@ -80,21 +81,25 @@ impl ScannerState {
             active_scanning: AtomicBool::new(false),
             last_scan_time: RwLock::new(None),
             listener_started: AtomicBool::new(false),
-            cancel_token: RwLock::new(None),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
             sockets: RwLock::new(HashMap::new()),
         }
     }
 }
 
-static STATE: OnceLock<Arc<ScannerState>> = OnceLock::new();
-
-fn get_state() -> Arc<ScannerState> {
-    STATE.get_or_init(|| Arc::new(ScannerState::new())).clone()
+impl Drop for Scanner {
+    fn drop(&mut self) {
+        // Only stop if this is the last instance
+        if Arc::strong_count(&self.inner) <= 1 {
+            self.stop_passive_listener();
+        }
+    }
 }
 
 /// Discovers Tuya devices on the local network using UDP broadcast.
 #[derive(Debug, Clone)]
 pub struct Scanner {
+    inner: Arc<ScannerState>,
     /// Timeout for discovery
     pub timeout: Duration,
     /// Local address to bind to
@@ -113,6 +118,7 @@ impl Scanner {
     /// Creates a new Scanner with default settings.
     pub fn new() -> Self {
         let scanner = Self {
+            inner: Arc::new(ScannerState::new()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             bind_addr: "0.0.0.0".to_string(),
             ports: vec![6666, 6667, 7000],
@@ -123,7 +129,7 @@ impl Scanner {
 
     /// Ensures background passive listener is running.
     fn ensure_passive_listener(&self) {
-        let state = get_state();
+        let state = &self.inner;
         let mut ports_to_add = Vec::new();
         {
             let guard = state.sockets.read();
@@ -167,24 +173,17 @@ impl Scanner {
 
         // Only start a new receiver task if it wasn't already started
         if !state.listener_started.swap(true, Ordering::SeqCst) {
-            let cancel_token = state
-                .cancel_token
-                .write()
-                .get_or_insert_with(tokio_util::sync::CancellationToken::new)
-                .clone();
-
-            let cancel_token_clone = cancel_token.clone();
-            let state_weak = Arc::downgrade(&state);
+            let cancel_token = state.cancel_token.clone();
+            let state_weak = Arc::downgrade(&self.inner);
 
             crate::runtime::spawn(async move {
                 debug!("Starting background passive listener task...");
 
-                let (mut rx, _ct) =
-                    Self::spawn_receiver_tasks(new_sockets, cancel_token_clone.clone());
+                let (mut rx, _ct) = Self::spawn_receiver_tasks(new_sockets, cancel_token.clone());
                 let scanner_temp = Scanner::new_silent();
                 loop {
                     tokio::select! {
-                        _ = cancel_token_clone.cancelled() => break,
+                        _ = cancel_token.cancelled() => break,
                         Some((data, _addr)) = rx.recv() => {
                             if let Some(res) = scanner_temp.parse_packet(&data) {
                                 let state = match state_weak.upgrade() {
@@ -215,16 +214,6 @@ impl Scanner {
                 }
                 debug!("Background passive listener task stopped");
             });
-        } else {
-            // If already started, we might need to spawn receiver tasks for the NEW sockets only
-            // But wait, the current architecture spawns ALL sockets into one mpsc.
-            // This is a bit of a limitation. For now, we'll just log that new ports were added.
-            // To properly fix this, we would need to be able to add sockets to the existing receiver loop.
-            debug!(
-                "Added new ports to existing passive listener: {:?}",
-                new_sockets.len()
-            );
-            // TODO: In a future refactor, make the receiver loop dynamic to handle new sockets.
         }
     }
 
@@ -287,6 +276,7 @@ impl Scanner {
 
     fn new_silent() -> Self {
         Self {
+            inner: Arc::new(ScannerState::new()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             bind_addr: "0.0.0.0".to_string(),
             ports: vec![6666, 6667, 7000],
@@ -294,13 +284,10 @@ impl Scanner {
     }
 
     /// Stops background passive listener.
-    pub fn stop_passive_listener() {
-        let state = get_state();
-        if let Some(token) = state.cancel_token.write().take() {
-            token.cancel();
-        }
-        state.listener_started.store(false, Ordering::SeqCst);
-        state.sockets.write().clear();
+    pub fn stop_passive_listener(&self) {
+        self.inner.cancel_token.cancel();
+        self.inner.listener_started.store(false, Ordering::SeqCst);
+        self.inner.sockets.write().clear();
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -321,18 +308,13 @@ impl Scanner {
     }
 
     /// Returns a future that resolves when any device is discovered.
-    pub fn notified(&self) -> tokio::sync::futures::Notified<'static> {
-        STATE
-            .get()
-            .expect("Scanner state not initialized")
-            .notify
-            .notified()
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.notify.notified()
     }
 
     /// Checks if a device was discovered within the last `within` duration.
     pub fn is_recently_discovered(&self, device_id: &str, within: Duration) -> bool {
-        let state = get_state();
-        let guard = state.cache.read();
+        let guard = self.inner.cache.read();
         if let Some(res) = guard.get(device_id) {
             return res.discovered_at.elapsed() < within;
         }
@@ -411,7 +393,7 @@ impl Scanner {
     pub fn scan_stream(
         &self,
     ) -> impl futures_util::Stream<Item = DiscoveryResult> + Send + 'static {
-        let state = get_state();
+        let state = self.inner.clone();
         let timeout_dur = self.timeout;
         let start_time = Instant::now();
         let scanner = self.clone();
@@ -538,7 +520,7 @@ impl Scanner {
         device_id: &str,
         force_scan: bool,
     ) -> Option<DiscoveryResult> {
-        let state = get_state();
+        let state = &self.inner;
         let guard = state.cache.read();
 
         if let Some(res) = guard.get(device_id).cloned()
@@ -564,7 +546,7 @@ impl Scanner {
     }
 
     async fn ensure_scan_started(&self, device_id: &str, force_scan: bool) {
-        let state = get_state();
+        let state = self.inner.clone();
         let can_scan = {
             let last_scan = *state.last_scan_time.read();
             match last_scan {
@@ -587,7 +569,7 @@ impl Scanner {
     }
 
     async fn wait_for_cache_result(&self, device_id: &str) -> Option<DiscoveryResult> {
-        let state = get_state();
+        let state = &self.inner;
         let start_wait = Instant::now();
 
         loop {
@@ -607,7 +589,7 @@ impl Scanner {
     }
 
     async fn perform_discovery_loop(self) -> Result<()> {
-        let state = get_state();
+        let state = &self.inner;
         let mut target_sockets = Vec::new();
 
         {
@@ -763,8 +745,7 @@ impl Scanner {
 
     /// Invalidates the cache entry for a specific device.
     pub fn invalidate_cache(&self, id: &str) -> bool {
-        let state = get_state();
-        let mut guard = state.cache.write();
+        let mut guard = self.inner.cache.write();
         guard.remove(id).is_some()
     }
 
