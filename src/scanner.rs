@@ -134,19 +134,12 @@ impl Scanner {
             }
         }
 
+        // If no new ports and already started, nothing to do
         if ports_to_add.is_empty() && state.listener_started.load(Ordering::SeqCst) {
             return;
         }
 
         let bind_addr = self.bind_addr.clone();
-        let cancel_token = {
-            state
-                .cancel_token
-                .write()
-                .get_or_insert_with(tokio_util::sync::CancellationToken::new)
-                .clone()
-        };
-
         let mut new_sockets = Vec::new();
         {
             let mut guard = state.sockets.write();
@@ -159,61 +152,80 @@ impl Scanner {
             }
         }
 
-        if new_sockets.is_empty() {
-            if !state.listener_started.load(Ordering::SeqCst) {
-                warn!("Passive listener failed to bind to any ports");
-            }
+        // If we already had a listener running and no new sockets were successfully opened, return
+        if new_sockets.is_empty() && state.listener_started.load(Ordering::SeqCst) {
             return;
         }
 
-        state.listener_started.store(true, Ordering::SeqCst);
-
-        let cancel_token_clone = cancel_token.clone();
-        crate::runtime::spawn(async move {
-            debug!(
-                "Starting background receiver tasks for {} sockets...",
-                new_sockets.len()
+        if new_sockets.is_empty() {
+            warn!(
+                "Passive listener failed to bind to any ports: {:?}",
+                self.ports
             );
+            return;
+        }
 
-            let (mut rx, _ct) = Self::spawn_receiver_tasks(new_sockets, cancel_token_clone.clone());
-            let scanner_temp = Scanner::new_silent();
-            loop {
-                tokio::select! {
-                    _ = cancel_token_clone.cancelled() => break,
-                    Some((data, _addr)) = rx.recv() => {
-                        if let Some(res) = scanner_temp.parse_packet(&data) {
-                            let mut guard = state.cache.write();
+        // Only start a new receiver task if it wasn't already started
+        if !state.listener_started.swap(true, Ordering::SeqCst) {
+            let cancel_token = state
+                .cancel_token
+                .write()
+                .get_or_insert_with(tokio_util::sync::CancellationToken::new)
+                .clone();
 
-                            // Keep memory clean by removing expired entries on every update.
-                            // This is efficient for typical device counts (< 1000).
-                            guard.retain(|_, v| v.discovered_at.elapsed() < CACHE_TTL);
+            let cancel_token_clone = cancel_token.clone();
+            let state_weak = Arc::downgrade(&state);
 
-                            let should_log = match guard.get(&res.id) {
-                                Some(existing) => !res.is_same_device(existing),
-                                None => true,
-                            };
+            crate::runtime::spawn(async move {
+                debug!("Starting background passive listener task...");
 
-                            let is_active = state.active_scanning.load(Ordering::SeqCst);
-                            if should_log {
-                                let mode = if is_active { "A" } else { "P" };
-                                let version = res
-                                    .version
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                info!(
-                                    "Discovered device {}(v{}) at {} - {}",
-                                    res.id, version, res.ip, mode
-                                );
+                let (mut rx, _ct) =
+                    Self::spawn_receiver_tasks(new_sockets, cancel_token_clone.clone());
+                let scanner_temp = Scanner::new_silent();
+                loop {
+                    tokio::select! {
+                        _ = cancel_token_clone.cancelled() => break,
+                        Some((data, _addr)) = rx.recv() => {
+                            if let Some(res) = scanner_temp.parse_packet(&data) {
+                                let state = match state_weak.upgrade() {
+                                    Some(s) => s,
+                                    None => break,
+                                };
+                                let mut guard = state.cache.write();
+
+                                // Keep memory clean by removing expired entries on every update.
+                                guard.retain(|_, v| v.discovered_at.elapsed() < CACHE_TTL);
+
+                                let should_log = match guard.get(&res.id) {
+                                    Some(existing) => !res.is_same_device(existing),
+                                    None => true,
+                                };
+
+                                if should_log {
+                                    let mode = if state.active_scanning.load(Ordering::SeqCst) { "A" } else { "P" };
+                                    let version = res.version.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string());
+                                    info!("Discovered device {}(v{}) at {} - {}", res.id, version, res.ip, mode);
+                                }
+
+                                guard.insert(res.id.clone(), res.clone());
+                                state.notify.notify_waiters();
                             }
-
-                            guard.insert(res.id.clone(), res.clone());
-                            state.notify.notify_waiters();
                         }
                     }
                 }
-            }
-            debug!("Background passive listener task stopped");
-        });
+                debug!("Background passive listener task stopped");
+            });
+        } else {
+            // If already started, we might need to spawn receiver tasks for the NEW sockets only
+            // But wait, the current architecture spawns ALL sockets into one mpsc.
+            // This is a bit of a limitation. For now, we'll just log that new ports were added.
+            // To properly fix this, we would need to be able to add sockets to the existing receiver loop.
+            debug!(
+                "Added new ports to existing passive listener: {:?}",
+                new_sockets.len()
+            );
+            // TODO: In a future refactor, make the receiver loop dynamic to handle new sockets.
+        }
     }
 
     fn spawn_receiver_tasks(

@@ -52,6 +52,10 @@ mod keys {
     pub const PAYLOAD_RAW: &str = "payloadRaw";
 }
 
+/// A sub-device (endpoint) of a gateway device.
+///
+/// Note: Holding a `SubDevice` will keep the parent `Device` alive because it contains
+/// an internal `Arc` reference to the parent.
 #[derive(Clone)]
 pub struct SubDevice {
     parent: Device,
@@ -255,8 +259,19 @@ impl Device {
             cancel_token: CancellationToken::new(),
         };
 
+        let cancel_token = device.cancel_token.clone();
         let d_clone = device.clone();
-        crate::runtime::spawn(async move { d_clone.run_connection_task(rx).await });
+        let d_id = device.id.clone();
+        crate::runtime::spawn(async move {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!("Device {} connection task stopped via token", d_id);
+                }
+                _ = d_clone.run_connection_task(rx) => {
+                    debug!("Device {} connection task finished", d_id);
+                }
+            }
+        });
         device
     }
 
@@ -1492,5 +1507,45 @@ impl Drop for Device {
         if self.tx.is_some() && Arc::strong_count(&self.state) <= 2 {
             self.cancel_token.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn test_device_memory_leak() {
+        let id = "test_device_id";
+        let key = "0123456789abcdef";
+        let addr = "127.0.0.1";
+
+        let weak_state;
+        {
+            let device = Device::new(id, addr, key, "3.3");
+            weak_state = Arc::downgrade(&device.state);
+
+            // strong_count should be 2 (one for device handle, one for background task)
+            assert!(Arc::strong_count(&device.state) >= 1);
+            assert!(weak_state.upgrade().is_some());
+
+            // Device goes out of scope here
+        }
+
+        // Wait a bit for the background task to detect cancellation and exit
+        for _ in 0..10 {
+            if weak_state.upgrade().is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // The state should be dropped now
+        assert!(
+            weak_state.upgrade().is_none(),
+            "DeviceState leaked! Background task might still be running."
+        );
     }
 }

@@ -134,6 +134,13 @@ impl GlobalRegistry {
             });
         }
     }
+
+    #[cfg(test)]
+    fn get_ref_count(id: &str) -> usize {
+        let registry = Self::get();
+        let guard = registry.read();
+        guard.get(id).map(|entry| entry.ref_count).unwrap_or(0)
+    }
 }
 
 use serde::Serialize;
@@ -262,33 +269,39 @@ impl Manager {
     ) {
         let device_id = id.to_string();
         let event_tx = self.inner.event_tx.clone();
-        let inner = self.inner.clone();
+        let inner_weak = Arc::downgrade(&self.inner);
 
         crate::runtime::spawn(async move {
+            info!("Starting event monitor for device {}", device_id);
+
             loop {
-                info!("Starting event listener for device {}", device_id);
                 let listener = device.listener();
                 tokio::pin!(listener);
 
-                let mut stream_ended = false;
+                let mut device_updated = false;
+
                 loop {
                     tokio::select! {
                         _ = token.cancelled() => return,
                         update_result = update_rx.recv() => {
                             match update_result {
                                 Ok(new_device) => {
-                                    info!("Device {} updated, restarting monitor", device_id);
+                                    info!("Device {} configuration updated, restarting monitor", device_id);
                                     device = new_device.clone();
-                                    let mut guard = inner.devices.write();
-                                    guard.insert(device_id.clone(), new_device);
-                                    break;
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        inner.devices.write().insert(device_id.clone(), new_device);
+                                        device_updated = true;
+                                        break;
+                                    } else {
+                                        return;
+                                    }
                                 }
                                 Err(broadcast::error::RecvError::Closed) => {
-                                    info!("Device {} removed globally, cleaning up local manager", device_id);
-                                    let mut devices = inner.devices.write();
-                                    devices.remove(&device_id);
-                                    let mut tokens = inner.device_tokens.write();
-                                    tokens.remove(&device_id);
+                                    info!("Device {} removed globally, stopping monitor", device_id);
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        inner.devices.write().remove(&device_id);
+                                        inner.device_tokens.write().remove(&device_id);
+                                    }
                                     return;
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -303,17 +316,16 @@ impl Manager {
                                     });
                                 }
                                 Some(Err(_)) => continue,
-                                None => {
-                                    stream_ended = true;
-                                    break;
-                                }
+                                None => break, // Stream ended (e.g. device stopped or disconnected)
                             }
                         }
                     }
                 }
 
-                if stream_ended {
-                    info!("Stream for device {} ended", device_id);
+                // If the device wasn't updated via broadcast, and the stream ended,
+                // it means the monitor should stop.
+                if !device_updated {
+                    info!("Event monitor for device {} stopped", device_id);
                     break;
                 }
             }
@@ -393,12 +405,178 @@ impl Drop for Manager {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
             self.inner.cancel_token.cancel();
-            if let Some(mut devices) = self.inner.devices.try_write() {
-                for id in devices.keys().cloned().collect::<Vec<String>>() {
-                    GlobalRegistry::release(&id);
-                }
-                devices.clear();
+            let mut devices = self.inner.devices.write();
+            for id in devices.keys().cloned().collect::<Vec<String>>() {
+                GlobalRegistry::release(&id);
             }
+            devices.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_manager_drop_ref_count() {
+        let manager = Manager::new();
+        let device_id = "test_device_drop";
+
+        // Add a device
+        manager
+            .add(
+                device_id,
+                "127.0.0.1",
+                "0123456789abcdef0123456789abcdef",
+                "3.3",
+            )
+            .await
+            .unwrap();
+
+        // Check ref count is 1
+        assert_eq!(GlobalRegistry::get_ref_count(device_id), 1);
+
+        // Clone manager
+        let manager_clone = manager.clone();
+
+        // Ref count should still be 1
+        assert_eq!(GlobalRegistry::get_ref_count(device_id), 1);
+
+        // Drop clone
+        drop(manager_clone);
+
+        // Ref count should still be 1 because the original manager still exists
+        assert_eq!(GlobalRegistry::get_ref_count(device_id), 1);
+
+        // Drop original
+        drop(manager);
+
+        // Ref count should be 0
+        assert_eq!(GlobalRegistry::get_ref_count(device_id), 0);
+    }
+
+    #[tokio::test]
+    async fn test_manager_manual_remove_ref_count() {
+        let manager = Manager::new();
+        let device_id = "test_device_remove";
+
+        manager
+            .add(
+                device_id,
+                "127.0.0.1",
+                "0123456789abcdef0123456789abcdef",
+                "3.3",
+            )
+            .await
+            .unwrap();
+        assert_eq!(GlobalRegistry::get_ref_count(device_id), 1);
+
+        manager.remove(device_id).await;
+        assert_eq!(GlobalRegistry::get_ref_count(device_id), 0);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_managers_sharing_device() {
+        let manager1 = Manager::new();
+        let manager2 = Manager::new();
+        let device_id = "shared_device";
+        let addr = "127.0.0.1";
+        let key = "0123456789abcdef0123456789abcdef";
+        let ver = "3.3";
+
+        // 양쪽 매니저에 동일 장치 추가
+        manager1.add(device_id, addr, key, ver).await.unwrap();
+        assert_eq!(GlobalRegistry::get_ref_count(device_id), 1);
+
+        manager2.add(device_id, addr, key, ver).await.unwrap();
+        assert_eq!(
+            GlobalRegistry::get_ref_count(device_id),
+            2,
+            "두 매니저가 공유하므로 ref_count는 2여야 함"
+        );
+
+        // 매니저 1 드랍
+        drop(manager1);
+        assert_eq!(
+            GlobalRegistry::get_ref_count(device_id),
+            1,
+            "매니저 1이 드랍되어 ref_count는 1로 감소해야 함"
+        );
+
+        // 매니저 2 드랍
+        drop(manager2);
+        assert_eq!(
+            GlobalRegistry::get_ref_count(device_id),
+            0,
+            "모든 매니저가 드랍되어 ref_count는 0이 되어야 함"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manager_repeated_add_clear() {
+        let manager = Manager::new();
+        let devices = vec![("dev1", "key1"), ("dev2", "key2"), ("dev3", "key3")];
+
+        for i in 1..=5 {
+            // Add all devices
+            for (id, key) in &devices {
+                manager.add(id, "127.0.0.1", key, "3.3").await.unwrap();
+                assert_eq!(
+                    GlobalRegistry::get_ref_count(id),
+                    1,
+                    "Iteration {}: {} ref_count should be 1 after add",
+                    i,
+                    id
+                );
+            }
+
+            // List should match
+            assert_eq!(manager.list().await.len(), 3);
+
+            // Clear all
+            manager.clear().await;
+
+            // All ref counts should be 0
+            for (id, _) in &devices {
+                assert_eq!(
+                    GlobalRegistry::get_ref_count(id),
+                    0,
+                    "Iteration {}: {} ref_count should be 0 after clear",
+                    i,
+                    id
+                );
+            }
+
+            assert_eq!(manager.list().await.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_manager_repeated_add_remove() {
+        let manager = Manager::new();
+        let device_id = "repeated_dev";
+        let key = "repeated_key";
+
+        for i in 1..=10 {
+            manager
+                .add(device_id, "127.0.0.1", key, "3.3")
+                .await
+                .unwrap();
+            assert_eq!(
+                GlobalRegistry::get_ref_count(device_id),
+                1,
+                "Iteration {}: ref_count should be 1 after add",
+                i
+            );
+
+            manager.remove(device_id).await;
+            assert_eq!(
+                GlobalRegistry::get_ref_count(device_id),
+                0,
+                "Iteration {}: ref_count should be 0 after remove",
+                i
+            );
         }
     }
 }
