@@ -1,29 +1,29 @@
 use crate::crypto::TuyaCipher;
 use crate::error::Result;
-use crate::protocol::{CommandType, TuyaProtocol, Version, create_base_payload};
+use crate::protocol::{
+    CommandType, NO_PROTOCOL_HEADER_CMDS, TuyaProtocol, Version, create_base_payload,
+};
 use log::trace;
 use serde_json::Value;
 
-pub struct ProtocolDev22 {
-    base: Box<dyn TuyaProtocol>,
-}
+pub struct ProtocolV32;
 
-impl ProtocolDev22 {
-    pub fn new(base: Box<dyn TuyaProtocol>) -> Self {
-        Self { base }
+impl ProtocolV32 {
+    fn add_protocol_header(&self, payload: &[u8]) -> Vec<u8> {
+        let mut header = Version::V3_2.as_bytes().to_vec();
+        header.extend_from_slice(&[0u8; 12]);
+        header.extend_from_slice(payload);
+        header
     }
 }
 
-impl TuyaProtocol for ProtocolDev22 {
+impl TuyaProtocol for ProtocolV32 {
     fn version(&self) -> Version {
-        self.base.version()
+        Version::V3_2
     }
 
     fn get_effective_command(&self, command: CommandType) -> u32 {
-        match command {
-            CommandType::DpQuery => CommandType::ControlNew as u32,
-            cmd => cmd as u32,
-        }
+        command as u32
     }
 
     fn generate_payload(
@@ -38,6 +38,7 @@ impl TuyaProtocol for ProtocolDev22 {
         let mut payload =
             create_base_payload(device_id, cid, data.clone(), Some(t.to_string().into()));
 
+        // Payload formation follows device22 (ProtocolDev22)
         match command {
             CommandType::UpdateDps => {
                 payload.retain(|k, _| k == "cid");
@@ -78,7 +79,7 @@ impl TuyaProtocol for ProtocolDev22 {
 
         let payload_obj = Value::Object(payload);
         trace!(
-            "dev22 generated payload (cmd {}): {}",
+            "v3.2 generated payload (cmd {}): {}",
             cmd_to_send, payload_obj
         );
 
@@ -86,14 +87,32 @@ impl TuyaProtocol for ProtocolDev22 {
     }
 
     fn pack_payload(&self, payload: &[u8], cmd: u32, cipher: &TuyaCipher) -> Result<Vec<u8>> {
-        self.base.pack_payload(payload, cmd, cipher)
+        // Encryption/Decryption same as v3.3
+        let mut packed = cipher.encrypt(payload, false, None, None, true)?;
+        if !NO_PROTOCOL_HEADER_CMDS.contains(&cmd) {
+            packed = self.add_protocol_header(&packed);
+        }
+        Ok(packed)
     }
 
-    fn decrypt_payload(&self, payload: Vec<u8>, cipher: &TuyaCipher) -> Result<Vec<u8>> {
-        self.base.decrypt_payload(payload, cipher)
+    fn decrypt_payload(&self, mut payload: Vec<u8>, cipher: &TuyaCipher) -> Result<Vec<u8>> {
+        // Encryption/Decryption same as v3.3 (but check for 3.2 header)
+        if payload.len() >= 15 && &payload[..3] == Version::V3_2.as_bytes() {
+            payload.drain(..15);
+        }
+        if !payload.is_empty()
+            && let Ok(decrypted) = cipher.decrypt(&payload, false, None, None, None)
+        {
+            let mut d = decrypted;
+            if d.len() >= 15 && &d[..3] == Version::V3_2.as_bytes() {
+                d.drain(..15);
+            }
+            return Ok(d);
+        }
+        Ok(payload)
     }
 
     fn has_version_header(&self, payload: &[u8]) -> bool {
-        self.base.has_version_header(payload)
+        payload.len() >= 15 && &payload[..3] == Version::V3_2.as_bytes()
     }
 }

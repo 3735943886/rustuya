@@ -63,6 +63,7 @@ pub const NO_PROTOCOL_HEADER_CMDS: &[u32] = &[
 
 define_version! {
     V3_1 = ("3.1", 3.1),
+    V3_2 = ("3.2", 3.2),
     V3_3 = ("3.3", 3.3),
     V3_4 = ("3.4", 3.4),
     V3_5 = ("3.5", 3.5),
@@ -92,6 +93,7 @@ pub fn create_base_payload(
 
 pub mod dev22;
 pub mod v31;
+pub mod v32;
 pub mod v33;
 pub mod v34;
 pub mod v35;
@@ -123,12 +125,8 @@ impl DeviceType {
 }
 
 impl From<f32> for DeviceType {
-    fn from(v: f32) -> Self {
-        if (v - 3.2).abs() < f32::EPSILON {
-            DeviceType::Device22
-        } else {
-            DeviceType::Default
-        }
+    fn from(_v: f32) -> Self {
+        DeviceType::Default
     }
 }
 
@@ -149,13 +147,19 @@ pub trait TuyaProtocol: Send + Sync {
 }
 
 pub fn get_protocol(version: Version, dev_type: DeviceType) -> Box<dyn TuyaProtocol> {
-    match (version, dev_type) {
-        (Version::V3_1, _) => Box::new(v31::ProtocolV31),
-        (Version::V3_3, DeviceType::Device22) => Box::new(dev22::ProtocolDev22),
-        (Version::V3_3, _) => Box::new(v33::ProtocolV33),
-        (Version::V3_4, _) => Box::new(v34::ProtocolV34),
-        (Version::V3_5, _) => Box::new(v35::ProtocolV35),
-        _ => Box::new(v33::ProtocolV33), // Default to 3.3
+    let base: Box<dyn TuyaProtocol> = match version {
+        Version::V3_1 => Box::new(v31::ProtocolV31),
+        Version::V3_2 => Box::new(v32::ProtocolV32),
+        Version::V3_3 => Box::new(v33::ProtocolV33),
+        Version::V3_4 => Box::new(v34::ProtocolV34),
+        Version::V3_5 => Box::new(v35::ProtocolV35),
+        _ => Box::new(v33::ProtocolV33),
+    };
+
+    if dev_type == DeviceType::Device22 {
+        Box::new(dev22::ProtocolDev22::new(base))
+    } else {
+        base
     }
 }
 
