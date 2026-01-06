@@ -32,4 +32,4 @@ Yes. While the core is asynchronous (`tokio`), a synchronous wrapper is provided
 ---
 
 ### **5. How many devices can I manage at once?**
-Rustuya is designed for high concurrency. You can manage hundreds of devices using the `Manager`. On Unix-like systems, remember to call `Manager::maximize_fd_limit()` to increase the number of allowed open sockets.
+Rustuya is designed for high concurrency. You can manage thousands of devices using the `Manager`. On Unix-like systems, remember to call `Manager::maximize_fd_limit()` to increase the number of allowed open sockets.

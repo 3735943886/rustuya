@@ -1,9 +1,6 @@
 # Rust API Reference
 
-This document provides a detailed reference for the core components of Rustuya: `Manager`, `Device`, `SubDevice`, and `Scanner`.
-
-> [!TIP]
-> **Thread-Safety**: All core types and the synchronous wrappers are **thread-safe**. They can be safely cloned and shared across multiple threads.
+This document provides a detailed reference for the core components of Rustuya: `Manager`, `Device`, `SubDevice`, and `Scanner`. All core types are **thread-safe** and designed for high-concurrency environments.
 
 ---
 
@@ -120,7 +117,7 @@ Centralized management for multiple devices, handling lifecycle and unified even
 
 ### `Manager::maximize_fd_limit()`
 - **Definition**: `pub fn maximize_fd_limit() -> Result<()>`
-- **Description**: (Unix-only) Attempts to increase the process file descriptor limit to handle more concurrent connections. Fails on non-Unix platforms or if the OS prevents the increase.
+- **Description**: (Unix-like systems only) Attempts to increase the process file descriptor limit to handle more concurrent connections. Fails on non-Unix platforms or if the OS prevents the increase.
 - **Arguments**: None.
 - **Returns**: `Result<()>`
 - **Behavior**: Immediate return

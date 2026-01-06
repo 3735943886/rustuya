@@ -44,12 +44,13 @@ Rustuya provides two distinct APIs to suit different application architectures:
 > [!NOTE]
 > For Python users, this synchronous wrapper allows for high-performance applications without the complexity of `asyncio`. Since the Rust core manages all network I/O in its own background thread pool and releases the GIL during blocking calls, standard Python threads provide excellent efficiency with minimal overhead.
 
-### **Thread-Safety**
+### **Thread-Safety & Concurrency**
 
-All core types and the synchronous wrappers are **thread-safe**.
+All core types and the synchronous wrappers are **thread-safe** (`Send + Sync`).
 
 - **Internal Architecture**: Rustuya uses a background worker model. `Device` and `Manager` instances (including sync wrappers) are handles to these workers, communicating via message-passing (`mpsc`).
 - **Concurrent Access**: Multiple threads can safely share a single `Device` or `Manager` instance. Cloning an instance creates a new handle to the same background worker, allowing for efficient and safe concurrent control.
+- **Python GIL Release**: The Python bindings are designed to release the Global Interpreter Lock (GIL) during blocking network operations. This allows Python's standard `threading` module to achieve true parallel execution for background tasks.
 - **Event Listeners**: Listeners (via `listener()`) provide a thread-safe channel to receive real-time updates across different parts of an application.
 
 ### **Execution Model Summary**

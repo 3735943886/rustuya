@@ -3,10 +3,9 @@
 This page provides comprehensive examples for using `rustuya` in Python. These examples cover common use cases from basic device control to advanced gateway management.
 
 > [!TIP]
-> **Performance & Thread-Safety**
-> - **Thread-Safe**: All classes (`Manager`, `Device`, `Scanner`) are thread-safe and can be shared across multiple threads.
+> **Performance & Concurrency**
 > - **High Performance**: Since the core is written in Rust using an asynchronous engine, the Python layer only needs minimal threading. Typically, just one background thread for a `listener()` is enough to handle hundreds of devices without significant performance loss.
-> - **No `asyncio` Required**: Because Rust handles the complex asynchronous I/O and releases the GIL during blocking operations, excellent performance is achievable using standard Python threads without the complexity of `asyncio`.
+> - **No `asyncio` Required**: Because Rust handles the complex asynchronous I/O and releases the GIL during blocking operations, excellent performance is achievable using standard Python threads without the complexity of `asyncio`. For more details on thread-safety, see the [Design Philosophy](./philosophy.md).
 
 ---
 

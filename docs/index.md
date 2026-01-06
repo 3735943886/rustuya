@@ -6,6 +6,7 @@ Rustuya is a high-performance, concurrency-friendly implementation of the Tuya L
 
 ## **Key Features**
 - **High Performance**: Built on Rust's `tokio` for efficient asynchronous I/O.
+- **Thread-Safe & Concurrent**: Designed for safe multi-threaded access across both Rust and Python.
 - **Multi-language Support**: Native Rust API and high-level Python bindings.
 - **Robust Connection Management**: Automatic background reconnection with exponential backoff.
 - **Gateway & Sub-device Support**: Comprehensive support for Zigbee/Bluetooth gateways and sub-devices.

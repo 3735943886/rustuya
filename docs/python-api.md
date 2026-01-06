@@ -1,9 +1,6 @@
 # Python API Reference
 
-This document provides a detailed reference for the `rustuya` Python bindings. The Python API is a synchronous wrapper around the high-performance Rust core, designed for ease of use while maintaining efficiency.
-
-> [!TIP]
-> **Thread-Safety**: The Python `Manager`, `Device`, and `Scanner` classes are **thread-safe**. They can be safely shared across multiple Python threads. The underlying implementation releases the Global Interpreter Lock (GIL) for most operations, allowing for true concurrent execution of background tasks.
+This document provides a detailed reference for the `rustuya` Python bindings. The Python API is a synchronous, thread-safe wrapper around the high-performance Rust core.
 
 For practical code examples, see the [Python Examples](./python-examples.md) page.
 
@@ -21,7 +18,7 @@ The `Manager` is used for managing multiple devices simultaneously and receiving
   ```
 
 ### `Manager.maximize_fd_limit()` (Static)
-- **Description**: (Unix-only) Increases the process file descriptor limit. Recommended when managing a large number of devices.
+- **Description**: (Unix-like systems only) Increases the process file descriptor limit. Recommended when managing a large number of devices.
 - **Example**: `Manager.maximize_fd_limit()`
 
 ### `manager.add(id, address, local_key, version)`
