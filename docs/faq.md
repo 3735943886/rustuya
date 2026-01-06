@@ -11,7 +11,7 @@ No. Rustuya is strictly a **Local API** implementation. It communicates directly
 
 ### **2. Which Tuya device versions are supported?**
 Rustuya supports all major Tuya protocol versions:
-- **3.1, 3.3, 3.4, 3.5**: Standard protocol versions used by most Wi-Fi devices.
+- **3.1 to 3.5**: Standard protocol versions used by most Wi-Fi devices.
 - **device22**: A special version used by some devices.
 
 ---

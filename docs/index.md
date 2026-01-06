@@ -11,7 +11,7 @@ Rustuya is a high-performance, concurrency-friendly implementation of the Tuya L
 - **Robust Connection Management**: Automatic background reconnection with exponential backoff.
 - **Gateway & Sub-device Support**: Comprehensive support for Zigbee/Bluetooth gateways and sub-devices.
 - **Real-time Monitoring**: Event-driven architecture for instant status updates.
-- **Universal Compatibility**: Supports Tuya protocol versions 3.1, 3.3, 3.4, 3.5, and device22.
+- **Universal Compatibility**: Supports Tuya protocol versions 3.1 to 3.5, and device22.
 
 ---
 
