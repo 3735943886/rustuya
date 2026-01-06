@@ -6,7 +6,7 @@
  *
  * Author: 3735943886
  */
-use rustuya::sync::Manager;
+use rustuya::sync::{Manager, DeviceBuilder};
 use std::{thread, time};
 
 fn main() {
@@ -27,7 +27,10 @@ fn main() {
 
     // 3. Add devices to the manager
     for (id, addr, key, ver) in &device_configs {
-        if let Err(e) = manager.add(id, addr, key, *ver) {
+        if let Err(e) = manager.add(
+            DeviceBuilder::new(id.to_string(), addr.to_string(), key.to_string(), *ver)
+                .build(),
+        ) {
             eprintln!("Failed to add device {}: {}", id, e);
         }
     }

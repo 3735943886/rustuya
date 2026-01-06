@@ -98,8 +98,10 @@ pub mod v33;
 pub mod v34;
 pub mod v35;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceType {
+    #[default]
+    Auto,
     Default,
     Device22,
 }
@@ -108,6 +110,7 @@ impl std::str::FromStr for DeviceType {
     type Err = ();
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "auto" | "" => Ok(DeviceType::Auto),
             "default" => Ok(DeviceType::Default),
             "device22" => Ok(DeviceType::Device22),
             _ => Err(()),
@@ -118,15 +121,40 @@ impl std::str::FromStr for DeviceType {
 impl DeviceType {
     pub fn as_str(&self) -> &'static str {
         match self {
+            DeviceType::Auto => "auto",
             DeviceType::Default => "default",
             DeviceType::Device22 => "device22",
         }
     }
 }
 
-impl From<f32> for DeviceType {
-    fn from(_v: f32) -> Self {
-        DeviceType::Default
+impl From<&str> for DeviceType {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap_or(DeviceType::Auto)
+    }
+}
+
+impl From<String> for DeviceType {
+    fn from(s: String) -> Self {
+        s.parse().unwrap_or(DeviceType::Auto)
+    }
+}
+
+impl From<Option<String>> for DeviceType {
+    fn from(s: Option<String>) -> Self {
+        match s {
+            Some(s) => s.parse().unwrap_or(DeviceType::Auto),
+            None => DeviceType::Auto,
+        }
+    }
+}
+
+impl From<Option<&str>> for DeviceType {
+    fn from(s: Option<&str>) -> Self {
+        match s {
+            Some(s) => s.parse().unwrap_or(DeviceType::Auto),
+            None => DeviceType::Auto,
+        }
     }
 }
 

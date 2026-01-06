@@ -201,12 +201,28 @@ pub struct Device {
 #[pymethods]
 impl Device {
     #[new]
-    pub fn new(id: &str, address: &str, local_key: &str, version: &str) -> PyResult<Self> {
+    #[pyo3(signature = (id, address, local_key, version, dev_type=None))]
+    pub fn new(
+        id: &str,
+        address: &str,
+        local_key: &str,
+        version: &str,
+        dev_type: Option<&str>,
+    ) -> PyResult<Self> {
         let v = Version::from_str(version).map_err(|_| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid version: {}", version))
         })?;
+
+        let mut builder = ::rustuya::device::DeviceBuilder::new(id, local_key.as_bytes())
+            .address(address)
+            .version(v);
+
+        if let Some(dt_str) = dev_type {
+            builder = builder.dev_type(dt_str);
+        }
+
         Ok(Device {
-            inner: SyncDevice::new(id, address, local_key.as_bytes(), v),
+            inner: SyncDevice::from_inner(builder.build()),
         })
     }
 
@@ -327,7 +343,7 @@ impl Device {
     /// Sets the device type.
     pub fn set_dev_type(slf: PyRefMut<'_, Self>, dev_type: &str) -> PyResult<PyRefMut<'_, Self>> {
         let dt = DeviceType::from_str(dev_type).map_err(|_| {
-            pyo3::exceptions::PyValueError::new_err(format!("Invalid device type: {}", dev_type))
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid device type: {}. Valid values: auto, default, device22", dev_type))
         })?;
         slf.inner.set_dev_type(dt);
         Ok(slf)
@@ -610,13 +626,22 @@ impl Manager {
         address: &str,
         local_key: &str,
         version: &str,
+        dev_type: Option<&str>,
     ) -> PyResult<Device> {
         let device = py
-            .detach(|| self.inner.add(id, address, local_key, version))
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to add device: {}", e))
-            })?;
-        Ok(Device { inner: device })
+            .detach(|| {
+                let mut builder = ::rustuya::device::DeviceBuilder::new(id, local_key.as_bytes())
+                    .address(address)
+                    .version(Version::from_str(version).unwrap_or(Version::Auto));
+                
+                if let Some(dt_str) = dev_type {
+                    builder = builder.dev_type(dt_str);
+                }
+                
+                builder.build()
+            });
+        
+        Ok(Device { inner: SyncDevice::from_inner(device) })
     }
 
     pub fn remove(&self, py: Python<'_>, id: &str) {

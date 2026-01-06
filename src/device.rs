@@ -147,7 +147,7 @@ pub struct DeviceBuilder {
     address: String,
     local_key: Vec<u8>,
     version: Version,
-    dev_type: Option<DeviceType>,
+    dev_type: DeviceType,
     port: u16,
     persist: bool,
     connection_timeout: Duration,
@@ -165,7 +165,7 @@ impl DeviceBuilder {
             address: ADDR_AUTO.to_string(),
             local_key: local_key.into(),
             version: Version::Auto,
-            dev_type: None,
+            dev_type: DeviceType::Auto,
             port: 6668,
             persist: true,
             connection_timeout: Duration::from_secs(10),
@@ -183,8 +183,8 @@ impl DeviceBuilder {
         self
     }
 
-    pub fn dev_type(mut self, dev_type: DeviceType) -> Self {
-        self.dev_type = Some(dev_type);
+    pub fn dev_type<DT: Into<DeviceType>>(mut self, dev_type: DT) -> Self {
+        self.dev_type = dev_type.into();
         self
     }
 
@@ -248,9 +248,6 @@ impl Device {
             "" | ADDR_AUTO => (ADDR_AUTO.to_string(), "".to_string()),
             _ => (builder.address.clone(), builder.address),
         };
-        let dev_type = builder
-            .dev_type
-            .unwrap_or_else(|| DeviceType::from(builder.version.val()));
 
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(CHAN_BROADCAST_CAPACITY);
         let (tx, rx) = mpsc::channel(CHAN_MPSC_CAPACITY);
@@ -259,7 +256,7 @@ impl Device {
             real_ip: ip,
             version: builder.version,
             port: builder.port,
-            dev_type,
+            dev_type: builder.dev_type,
             state: ConnectionState::Disconnected,
             last_received: Instant::now(),
             last_sent: Instant::now(),
@@ -406,11 +403,12 @@ impl Device {
 
     pub fn set_version<V: Into<Version>>(&self, version: V) {
         let ver = version.into();
-        let dev_type = DeviceType::from(ver.val());
 
         self.with_state_mut(|s| {
             s.version = ver;
-            s.dev_type = dev_type;
+            // If dev_type is Auto, we can either leave it as Auto (to allow future detection)
+            // or initialize it to Default. Given the user's requirement that only Auto
+            // allows switching, we should keep it as Auto if the user hasn't specified Default.
         });
     }
 
@@ -420,12 +418,12 @@ impl Device {
         self.clone()
     }
 
-    pub fn set_dev_type(&self, dev_type: DeviceType) {
-        self.with_state_mut(|s| s.dev_type = dev_type);
+    pub fn set_dev_type<DT: Into<DeviceType>>(&self, dev_type: DT) {
+        self.with_state_mut(|s| s.dev_type = dev_type.into());
     }
 
     /// Builder-style method to set device type and return the device.
-    pub fn with_dev_type(&self, dev_type: DeviceType) -> Self {
+    pub fn with_dev_type<DT: Into<DeviceType>>(&self, dev_type: DT) -> Self {
         self.set_dev_type(dev_type);
         self.clone()
     }
@@ -654,17 +652,17 @@ impl Device {
                     let mut seqno = 1u32;
 
                     // 1. Attempt to connect and handshake
-                    let stream = match self
+                    let (stream, initial_cmd) = match self
                         .try_connect_with_backoff(&mut rx, &mut seqno)
                         .await
                     {
-                        Some(s) => s,
+                        Some(res) => res,
                         None => return Some(()), // rx closed or stopped
                     };
 
                     // 2. Main loop for the active connection
                     let result = self
-                        .maintain_connection(stream, &mut rx, &mut seqno, &mut heartbeat_interval)
+                        .maintain_connection(stream, &mut rx, &mut seqno, &mut heartbeat_interval, initial_cmd)
                         .await;
 
                     // Cleanup on connection loss
@@ -707,9 +705,22 @@ impl Device {
         rx: &mut mpsc::Receiver<DeviceCommand>,
         seqno: &mut u32,
         heartbeat_interval: &mut tokio::time::Interval,
+        initial_cmd: Option<DeviceCommand>,
     ) -> Result<()> {
         let (mut read_half, mut write_half) = stream.into_split();
         let (internal_tx, mut internal_rx) = mpsc::channel::<TuyaError>(1);
+
+        // If there's an initial command (from on-demand connection), process it first
+        if let Some(cmd) = initial_cmd {
+            self.process_command(&mut write_half, seqno, cmd)
+                .await
+                .map_err(|e| {
+                    if !self.is_stopped() {
+                        error!("Initial command processing failed for {}: {}", self.id, e);
+                    }
+                    e
+                })?;
+        }
 
         let device_clone = self.clone();
         let connection_cancel_token = CancellationToken::new();
@@ -786,9 +797,13 @@ impl Device {
                         }
                     }
                     _ = heartbeat_interval.tick() => {
-                        if let Err(e) = self.process_heartbeat(&mut write_half, seqno).await {
-                            error!("Heartbeat failed for {}: {}", self.id, e);
-                            return Err(e);
+                        if self.with_state(|s| s.persist) {
+                            self.process_heartbeat(&mut write_half, seqno)
+                                .await
+                                .map_err(|e| {
+                                    error!("Heartbeat failed for {}: {}", self.id, e);
+                                    e
+                                })?;
                         }
                     }
                     err_opt = internal_rx.recv() => {
@@ -809,7 +824,7 @@ impl Device {
         &self,
         rx: &mut mpsc::Receiver<DeviceCommand>,
         seqno: &mut u32,
-    ) -> Option<TcpStream> {
+    ) -> Option<(TcpStream, Option<DeviceCommand>)> {
         loop {
             if self.is_stopped() {
                 self.drain_rx(rx, TuyaError::Offline, true);
@@ -855,7 +870,7 @@ impl Device {
                         self.with_state(|s| s.real_ip.clone())
                     );
                     self.broadcast_error(ERR_SUCCESS, None);
-                    return Some(s);
+                    return Some((s, None));
                 }
                 _ => {
                     let e = match result {
@@ -867,12 +882,53 @@ impl Device {
                     self.drain_rx(rx, e.clone(), false);
 
                     if !self.with_state(|s| s.persist) {
-                        error!(
-                            "Connection failed (persist: false) for device {}: {}",
+                        warn!(
+                            "Connection failed (persist: false) for device {}: {}. Waiting for next command to retry.",
                             self.id, e
                         );
-                        self.drain_rx(rx, e, true);
-                        return None;
+
+                        // Wait for the next command to trigger a reconnection attempt
+                        loop {
+                            match rx.recv().await {
+                                Some(DeviceCommand::ConnectNow) => break, // retry immediately
+                                Some(cmd @ DeviceCommand::Request { .. }) => {
+                                    // Received a request, try to connect now and process this command first
+                                    let retry_result = timeout(
+                                        self.connection_timeout() * 2,
+                                        self.connect_and_handshake(seqno),
+                                    )
+                                    .await;
+
+                                    match retry_result {
+                                        Ok(Ok(s)) => {
+                                            self.with_state_mut(|s| {
+                                                s.state = ConnectionState::Connected
+                                            });
+                                            info!(
+                                                "Connected to device {} on demand ({})",
+                                                self.id,
+                                                self.with_state(|s| s.real_ip.clone())
+                                            );
+                                            self.broadcast_error(ERR_SUCCESS, None);
+                                            return Some((s, Some(cmd)));
+                                        }
+                                        _ => {
+                                            let err = match retry_result {
+                                                Ok(Err(e)) => e,
+                                                _ => TuyaError::Offline,
+                                            };
+                                            self.handle_connection_error(&err).await;
+                                            cmd.respond(Err(err.clone()));
+                                            self.broadcast_error(ERR_OFFLINE, None);
+                                            // Stay in the loop waiting for another command
+                                        }
+                                    }
+                                }
+                                Some(DeviceCommand::Disconnect) => return None,
+                                None => return None,
+                            }
+                        }
+                        continue;
                     }
 
                     self.with_state_mut(|s| {
@@ -1164,7 +1220,11 @@ impl Device {
         data: Option<Value>,
         cid: Option<&str>,
     ) -> Result<(u32, Value)> {
-        let (version, dev_type) = self.with_state(|s| (s.version, s.dev_type));
+        let (version, mut dev_type) = self.with_state(|s| (s.version, s.dev_type));
+        // If dev_type is Auto, treat it as Default for protocol selection
+        if dev_type == DeviceType::Auto {
+            dev_type = DeviceType::Default;
+        }
         let protocol = get_protocol(version, dev_type);
         let t = self.get_timestamp();
         protocol.generate_payload(&self.id, command, data, cid, t)
@@ -1509,8 +1569,9 @@ impl Device {
         let hmac_key = (version >= 3.4).then_some(key.as_slice());
 
         unpack_message(packet, hmac_key, Some(header.clone()), Some(false)).or_else(|e| {
+            // Only allow switching if dev_type is Auto
             if version == 3.3
-                && self.dev_type() != DeviceType::Device22
+                && self.dev_type() == DeviceType::Auto
                 && let Ok(d) = unpack_message(packet, None, Some(header), Some(false))
             {
                 info!("Device22 detected via CRC32 fallback. Switching mode.");
@@ -1522,7 +1583,13 @@ impl Device {
     }
 
     async fn decrypt_and_clean_payload(&self, payload: Vec<u8>, _prefix: u32) -> Result<Vec<u8>> {
-        let (version, dev_type) = self.with_state(|s| (s.version, s.dev_type));
+        let (version, mut dev_type) = self.with_state(|s| (s.version, s.dev_type));
+        // If dev_type is Auto, treat it as Default for protocol selection
+        let original_dev_type = dev_type;
+        if dev_type == DeviceType::Auto {
+            dev_type = DeviceType::Default;
+        }
+
         let key = self.get_cipher_key();
         let cipher = TuyaCipher::new(&key)?;
         let protocol = get_protocol(version, dev_type);
@@ -1530,7 +1597,7 @@ impl Device {
         let decrypted = protocol.decrypt_payload(payload, &cipher)?;
 
         if (version.val() == 3.3 || version.val() == 3.4)
-            && dev_type != DeviceType::Device22
+            && original_dev_type == DeviceType::Auto
             && String::from_utf8_lossy(&decrypted).contains(DATA_UNVALID)
         {
             warn!(
