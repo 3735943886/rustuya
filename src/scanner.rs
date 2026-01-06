@@ -290,21 +290,40 @@ impl Scanner {
         self.inner.sockets.write().clear();
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    /// Sets the discovery timeout.
+    pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
-        self
     }
 
-    pub fn with_ports(mut self, ports: Vec<u16>) -> Self {
+    /// Sets the UDP ports to scan.
+    pub fn set_ports(&mut self, ports: Vec<u16>) {
         self.ports = ports;
         self.ensure_passive_listener();
-        self
     }
 
-    pub fn with_bind_addr(mut self, addr: String) -> Self {
-        self.bind_addr = addr;
+    /// Sets the local bind address.
+    pub fn set_bind_address(&mut self, addr: &str) -> Result<()> {
+        self.bind_addr = addr.to_string();
         self.ensure_passive_listener();
-        self
+        Ok(())
+    }
+
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        let mut s = self.clone();
+        s.set_timeout(timeout);
+        s
+    }
+
+    pub fn with_ports(&self, ports: Vec<u16>) -> Self {
+        let mut s = self.clone();
+        s.set_ports(ports);
+        s
+    }
+
+    pub fn with_bind_addr(&self, addr: String) -> Self {
+        let mut s = self.clone();
+        let _ = s.set_bind_address(&addr);
+        s
     }
 
     /// Returns a future that resolves when any device is discovered.

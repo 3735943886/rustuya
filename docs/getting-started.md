@@ -35,7 +35,7 @@ fn main() {
 }
 ```
 
-For full asynchronous usage with `tokio`, refer to the [Rust API Reference](./rust-api.md).
+For full asynchronous usage with `tokio`, refer to the [Rust API Reference](./rust-api).
 
 ---
 
@@ -70,7 +70,7 @@ print("Command dispatched!")
 ---
 
 ## **What's Next?**
-- Read the [Design Philosophy](./philosophy.md) to understand how Rustuya manages connections.
-- Check out the [Rust API Reference](./rust-api.md) for advanced Rust features.
-- Explore the [Python API Guide](./python-api.md) and [Python Examples](./python-examples.md) for more Python information.
+- Read the [Design Philosophy](./philosophy) to understand how Rustuya manages connections.
+- Check out the [Rust API Reference](./rust-api) for advanced Rust features.
+- Explore the [Python API Guide](./python-api) and [Python Examples](./python-examples) for more Python information.
 - See the [examples]({{ site.github_url }}/tree/master/examples) directory in the repository for more complex use cases.

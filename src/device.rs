@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Sha256;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -128,6 +129,7 @@ struct DeviceState {
     config_address: String,
     real_ip: String,
     version: Version,
+    port: u16,
     dev_type: DeviceType,
     state: ConnectionState,
     last_received: Instant,
@@ -148,6 +150,7 @@ pub struct DeviceBuilder {
     port: u16,
     persist: bool,
     connection_timeout: Duration,
+    nowait: bool,
 }
 
 impl DeviceBuilder {
@@ -164,6 +167,7 @@ impl DeviceBuilder {
             port: 6668,
             persist: true,
             connection_timeout: Duration::from_secs(10),
+            nowait: false,
         }
     }
 
@@ -192,6 +196,11 @@ impl DeviceBuilder {
         self
     }
 
+    pub fn nowait(mut self, nowait: bool) -> Self {
+        self.nowait = nowait;
+        self
+    }
+
     pub fn build(self) -> Device {
         Device::with_builder(self)
     }
@@ -201,12 +210,12 @@ impl DeviceBuilder {
 pub struct Device {
     id: String,
     local_key: Vec<u8>,
-    port: u16,
     state: Arc<RwLock<DeviceState>>,
     tx: Option<mpsc::Sender<DeviceCommand>>,
     pub(crate) broadcast_tx: tokio::sync::broadcast::Sender<TuyaMessage>,
     scanner: Arc<Scanner>,
     cancel_token: CancellationToken,
+    nowait: Arc<AtomicBool>,
 }
 
 impl Device {
@@ -236,6 +245,7 @@ impl Device {
             config_address: addr,
             real_ip: ip,
             version: builder.version,
+            port: builder.port,
             dev_type,
             state: ConnectionState::Disconnected,
             last_received: Instant::now(),
@@ -251,12 +261,12 @@ impl Device {
         let device = Self {
             id: builder.id,
             local_key: builder.local_key,
-            port: builder.port,
             state: Arc::new(RwLock::new(state)),
             tx: Some(tx),
             broadcast_tx,
             scanner: Arc::new(Scanner::new()),
             cancel_token: CancellationToken::new(),
+            nowait: Arc::new(AtomicBool::new(builder.nowait)),
         };
 
         let cancel_token = device.cancel_token.clone();
@@ -297,6 +307,11 @@ impl Device {
         })
     }
 
+    /// Returns the user-configured address (e.g., "Auto" or a specific IP).
+    pub fn config_address(&self) -> String {
+        self.with_state(|s| s.config_address.clone())
+    }
+
     pub fn version(&self) -> Version {
         self.with_state(|s| s.version)
     }
@@ -305,8 +320,30 @@ impl Device {
         self.with_state_mut(|s| s.persist = persist);
     }
 
+    /// Builder-style method to set persist mode and return the device.
+    pub fn with_persist(&self, persist: bool) -> Self {
+        self.set_persist(persist);
+        self.clone()
+    }
+
     pub fn set_connection_timeout(&self, timeout: Duration) {
         self.with_state_mut(|s| s.connection_timeout = timeout);
+    }
+
+    /// Builder-style method to set connection timeout and return the device.
+    pub fn with_connection_timeout(&self, timeout: Duration) -> Self {
+        self.set_connection_timeout(timeout);
+        self.clone()
+    }
+
+    pub fn set_port(&self, port: u16) {
+        self.with_state_mut(|s| s.port = port);
+    }
+
+    /// Builder-style method to set port and return the device.
+    pub fn with_port(&self, port: u16) -> Self {
+        self.set_port(port);
+        self.clone()
     }
 
     fn connection_timeout(&self) -> Duration {
@@ -319,6 +356,24 @@ impl Device {
 
     pub fn is_stopped(&self) -> bool {
         self.with_state(|s| s.state == ConnectionState::Stopped)
+    }
+
+    /// Sets whether requests should wait for a response from the device.
+    /// If true, methods like `status()` and `set_value()` will return immediately after
+    /// dispatching the command, without waiting for the network response.
+    pub fn set_nowait(&self, nowait: bool) {
+        self.nowait.store(nowait, Ordering::Relaxed);
+    }
+
+    /// Returns whether the device is in nowait mode.
+    pub fn nowait(&self) -> bool {
+        self.nowait.load(Ordering::Relaxed)
+    }
+
+    /// Builder-style method to set nowait mode and return the device.
+    pub fn with_nowait(&self, nowait: bool) -> Self {
+        self.set_nowait(nowait);
+        self.clone()
     }
 
     pub fn set_version<V: Into<Version>>(&self, version: V) {
@@ -499,7 +554,9 @@ impl Device {
     ) {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.send_to_task(cmd_generator(resp_tx)).await;
-        let _ = resp_rx.await;
+        if !self.nowait.load(Ordering::Relaxed) {
+            let _ = resp_rx.await;
+        }
     }
 
     pub async fn request(&self, command: CommandType, data: Option<Value>, cid: Option<String>) {
@@ -987,11 +1044,12 @@ impl Device {
 
     async fn connect_and_handshake(&self, seqno: &mut u32) -> Result<TcpStream> {
         let addr = self.resolve_address().await?;
+        let port = self.with_state(|s| s.port);
 
-        info!("Connecting to device {} at {}:{}", self.id, addr, self.port);
+        info!("Connecting to device {} at {}:{}", self.id, addr, port);
         let mut stream = timeout(
             self.connection_timeout(),
-            TcpStream::connect(format!("{}:{}", addr, self.port)),
+            TcpStream::connect(format!("{}:{}", addr, port)),
         )
         .await
         .map_err(|_| TuyaError::Timeout)?

@@ -258,7 +258,7 @@ impl GlobalRegistry {
         }
     }
 
-    fn modify<V>(id: &str, address: &str, local_key: &str, version: V) -> Result<()>
+    fn modify<V>(id: &str, address: &str, local_key: &str, version: V) -> Result<Device>
     where
         V: Into<Version> + Send,
     {
@@ -271,12 +271,12 @@ impl GlobalRegistry {
             let new_device = Device::new(id, address, local_key, version);
 
             entry.device = new_device.clone();
-            let _ = entry.update_tx.send(new_device);
+            let _ = entry.update_tx.send(new_device.clone());
 
             crate::runtime::spawn(async move {
                 old_device.stop().await;
             });
-            Ok(())
+            Ok(new_device)
         } else {
             Err(TuyaError::DeviceNotFound(id.to_string()))
         }
@@ -390,37 +390,50 @@ impl Manager {
         }
     }
 
-    pub async fn add<V>(&self, id: &str, address: &str, local_key: &str, version: V) -> Result<()>
+    pub async fn add<V>(
+        &self,
+        id: &str,
+        address: &str,
+        local_key: &str,
+        version: V,
+    ) -> Result<Device>
     where
         V: Into<Version> + Send,
     {
         let mut devices = self.inner.devices.write();
+        let version = version.into();
 
-        if devices.contains_key(id) {
-            return Err(TuyaError::DuplicateDevice(id.to_string()));
+        if let Some(handle) = devices.get(id) {
+            let existing = handle.device();
+            let key_bytes = if local_key.len() == 32 {
+                local_key.as_bytes().to_vec()
+            } else {
+                hex::decode(local_key)
+                    .map_err(|e| TuyaError::Io(format!("Invalid hex key: {}", e)))?
+            };
+
+            if existing.config_address() == address
+                && existing.version() == version
+                && existing.local_key() == key_bytes
+            {
+                return Err(TuyaError::DuplicateDevice(id.to_string()));
+            }
+
+            // Different parameters, update existing device
+            let new_device = GlobalRegistry::modify(id, address, local_key, version)?;
+            *handle.device.write() = new_device.clone();
+            return Ok(new_device);
         }
 
         let handle = GlobalRegistry::acquire(id, address, local_key, version)?;
+        let device = handle.device();
 
         self.spawn_device_forwarder(handle.clone(), self.inner.cancel_token.child_token());
 
         devices.insert(id.to_string(), handle);
 
         info!("Device {} added to manager", id);
-        Ok(())
-    }
-
-    pub async fn modify<V>(
-        &self,
-        id: &str,
-        address: &str,
-        local_key: &str,
-        version: V,
-    ) -> Result<()>
-    where
-        V: Into<Version> + Send,
-    {
-        GlobalRegistry::modify(id, address, local_key, version)
+        Ok(device)
     }
 
     fn spawn_device_forwarder(&self, handle: DeviceHandle, token: CancellationToken) {
@@ -613,6 +626,35 @@ mod tests {
             GlobalRegistry::get_ref_count(device_id),
             0,
             "모든 매니저가 드랍되어 ref_count는 0이 되어야 함"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manager_add_duplicate_and_modify() {
+        let manager = Manager::new();
+        let device_id = "test_device_add_logic";
+        let addr1 = "127.0.0.1";
+        let addr2 = "127.0.0.2";
+        let key = "0123456789abcdef0123456789abcdef";
+        let ver = "3.3";
+
+        // 1. Initial add
+        manager.add(device_id, addr1, key, ver).await.unwrap();
+        assert_eq!(
+            manager.get(device_id).await.unwrap().config_address(),
+            addr1
+        );
+
+        // 2. Add with same parameters -> Duplicate error
+        let res = manager.add(device_id, addr1, key, ver).await;
+        assert!(matches!(res, Err(TuyaError::DuplicateDevice(_))));
+
+        // 3. Add with different parameter -> Modify and return device
+        let device = manager.add(device_id, addr2, key, ver).await.unwrap();
+        assert_eq!(device.config_address(), addr2);
+        assert_eq!(
+            manager.get(device_id).await.unwrap().config_address(),
+            addr2
         );
     }
 

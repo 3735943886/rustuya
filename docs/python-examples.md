@@ -5,7 +5,7 @@ This page provides comprehensive examples for using `rustuya` in Python. These e
 > [!TIP]
 > **Performance & Concurrency**
 > - **High Performance**: Since the core is written in Rust using an asynchronous engine, the Python layer only needs minimal threading. Typically, just one background thread for a `listener()` is enough to handle hundreds of devices without significant performance loss.
-> - **No `asyncio` Required**: Because Rust handles the complex asynchronous I/O and releases the GIL during blocking operations, excellent performance is achievable using standard Python threads without the complexity of `asyncio`. For more details on thread-safety, see the [Design Philosophy](./philosophy.md).
+> - **No `asyncio` Required**: Because Rust handles the complex asynchronous I/O and releases the GIL during blocking operations, excellent performance is achievable using standard Python threads without the complexity of `asyncio`. For more details on thread-safety, see the [Design Philosophy](./philosophy).
 
 ---
 
@@ -74,8 +74,8 @@ mgr = Manager()
 
 # Add multiple devices
 devices = [
-    {"id": "dev1", "addr": "192.168.1.101", "key": "key1", "ver": "3.3"},
-    {"id": "dev2", "addr": "192.168.1.102", "key": "key2", "ver": "3.3"},
+    {"id": "dev1", "addr": "ip1", "key": "key1", "ver": "ver1"},
+    {"id": "dev2", "addr": "ip2", "key": "key2", "ver": "ver2"},
 ]
 
 for d in devices:
@@ -117,7 +117,7 @@ from rustuya import Scanner
 print("Scanning for devices...")
 
 # Create scanner and set timeout to 5 seconds
-results = Scanner().with_timeout(5000).scan()
+results = Scanner().scan()
 
 print(f"Found {len(results)} devices:")
 for dev in results:

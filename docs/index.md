@@ -16,13 +16,13 @@ Rustuya is a high-performance, concurrency-friendly implementation of the Tuya L
 ---
 
 ## **Documentation**
-- [**Getting Started**](./getting-started.md) - Quick installation and usage guide for Rust and Python.
-- [**Rust API Reference**](./rust-api.md) - Detailed documentation for the core Rust library.
-- [**Python API Guide**](./python-api.md) - Guide and reference for Python developers.
-- [**Python Examples**](./python-examples.md) - Practical code examples for Python.
-- [**Design Philosophy**](./philosophy.md) - Understanding how Rustuya works under the hood.
-- [**Architecture**](./architecture.md) - Internal structure and module overview.
-- [**FAQ**](./faq.md) - Frequently asked questions.
+- [**Getting Started**](./getting-started) - Quick installation and usage guide for Rust and Python.
+- [**Rust API Reference**](./rust-api) - Detailed documentation for the core Rust library.
+- [**Python API Guide**](./python-api) - Guide and reference for Python developers.
+- [**Python Examples**](./python-examples) - Practical code examples for Python.
+- [**Design Philosophy**](./philosophy) - Understanding how Rustuya works under the hood.
+- [**Architecture**](./architecture) - Internal structure and module overview.
+- [**FAQ**](./faq) - Frequently asked questions.
 
 ---
 

@@ -99,6 +99,10 @@ impl SubDevice {
         Self { inner, cmd_tx: tx }
     }
 
+    pub fn id(&self) -> &str {
+        self.inner.id()
+    }
+
     pub fn status(&self) {
         let _ = send_sync(&self.cmd_tx, SubDeviceCommand::Status);
     }
@@ -180,6 +184,50 @@ impl Device {
 
     pub fn id(&self) -> &str {
         self.inner.id()
+    }
+
+    pub fn set_nowait(&self, nowait: bool) {
+        self.inner.set_nowait(nowait);
+    }
+
+    pub fn nowait(&self) -> bool {
+        self.inner.nowait()
+    }
+
+    /// Builder-style method to set nowait mode and return the device.
+    pub fn with_nowait(&self, nowait: bool) -> Self {
+        self.set_nowait(nowait);
+        self.clone()
+    }
+
+    pub fn set_persist(&self, persist: bool) {
+        self.inner.set_persist(persist);
+    }
+
+    /// Builder-style method to set persist mode and return the device.
+    pub fn with_persist(&self, persist: bool) -> Self {
+        self.set_persist(persist);
+        self.clone()
+    }
+
+    pub fn set_connection_timeout(&self, timeout: Duration) {
+        self.inner.set_connection_timeout(timeout);
+    }
+
+    /// Builder-style method to set connection timeout and return the device.
+    pub fn with_connection_timeout(&self, timeout: Duration) -> Self {
+        self.set_connection_timeout(timeout);
+        self.clone()
+    }
+
+    pub fn set_port(&self, port: u16) {
+        self.inner.set_port(port);
+    }
+
+    /// Builder-style method to set port and return the device.
+    pub fn with_port(&self, port: u16) -> Self {
+        self.set_port(port);
+        self.clone()
     }
 
     pub fn local_key(&self) -> &[u8] {
@@ -317,19 +365,22 @@ impl Scanner {
         Self { inner, cmd_tx: tx }
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.inner = self.inner.with_timeout(timeout);
-        self
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        let mut s = self.clone();
+        s.set_timeout(timeout);
+        s
     }
 
-    pub fn with_ports(mut self, ports: Vec<u16>) -> Self {
-        self.inner = self.inner.with_ports(ports);
-        self
+    pub fn with_ports(&self, ports: Vec<u16>) -> Self {
+        let mut s = self.clone();
+        s.set_ports(ports);
+        s
     }
 
-    pub fn with_bind_address(mut self, addr: String) -> Self {
-        self.inner = self.inner.with_bind_addr(addr);
-        self
+    pub fn with_bind_address(&self, addr: String) -> Self {
+        let mut s = self.clone();
+        let _ = s.set_bind_address(&addr);
+        s
     }
 
     pub fn scan(&self) -> Result<Vec<DiscoveryResult>> {
@@ -350,12 +401,15 @@ impl Scanner {
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) {
-        self.inner = self.inner.clone().with_timeout(timeout);
+        self.inner.set_timeout(timeout);
+    }
+
+    pub fn set_ports(&mut self, ports: Vec<u16>) {
+        self.inner.set_ports(ports);
     }
 
     pub fn set_bind_address(&mut self, addr: &str) -> Result<()> {
-        self.inner = self.inner.clone().with_bind_addr(addr.to_string());
-        Ok(())
+        self.inner.set_bind_address(addr)
     }
 
     pub fn stop_passive_listener(&self) {
@@ -376,17 +430,10 @@ enum ManagerCommand {
         String,
         String,
         Version,
-        std::sync::mpsc::Sender<Result<()>>,
+        std::sync::mpsc::Sender<Result<AsyncDevice>>,
     ),
     Remove(String, std::sync::mpsc::Sender<()>),
     Delete(String, std::sync::mpsc::Sender<()>),
-    Modify(
-        String,
-        String,
-        String,
-        Version,
-        std::sync::mpsc::Sender<Result<()>>,
-    ),
     Get(String, std::sync::mpsc::Sender<Option<AsyncDevice>>),
     List(std::sync::mpsc::Sender<Vec<crate::manager::DeviceInfo>>),
     Clear(std::sync::mpsc::Sender<()>),
@@ -426,10 +473,6 @@ impl Manager {
                         inner_clone.delete(&id).await;
                         let _ = resp.send(());
                     }
-                    ManagerCommand::Modify(id, addr, key, ver, resp) => {
-                        let res = inner_clone.modify(&id, &addr, &key, ver).await;
-                        let _ = resp.send(res);
-                    }
                     ManagerCommand::Get(id, resp) => {
                         let res = inner_clone.get(&id).await;
                         let _ = resp.send(res);
@@ -461,17 +504,18 @@ impl Manager {
         AsyncManager::shutdown_all();
     }
 
-    pub fn add<V>(&self, id: &str, address: &str, local_key: &str, version: V) -> Result<()>
+    pub fn add<V>(&self, id: &str, address: &str, local_key: &str, version: V) -> Result<Device>
     where
-        V: Into<Version>,
+        V: Into<Version> + Send,
     {
-        wait_for_response!(self.cmd_tx, |resp_tx| ManagerCommand::Add(
+        let res = wait_for_response!(self.cmd_tx, |resp_tx| ManagerCommand::Add(
             id.to_string(),
             address.to_string(),
             local_key.to_string(),
             version.into(),
             resp_tx,
-        ))?
+        ))?;
+        res.map(Device::from_async)
     }
 
     pub fn remove(&self, id: &str) {
@@ -486,19 +530,6 @@ impl Manager {
             id.to_string(),
             resp_tx
         ));
-    }
-
-    pub fn modify<V>(&self, id: &str, address: &str, local_key: &str, version: V) -> Result<()>
-    where
-        V: Into<Version>,
-    {
-        wait_for_response!(self.cmd_tx, |resp_tx| ManagerCommand::Modify(
-            id.to_string(),
-            address.to_string(),
-            local_key.to_string(),
-            version.into(),
-            resp_tx,
-        ))?
     }
 
     pub fn get(&self, id: &str) -> Option<Device> {

@@ -13,15 +13,19 @@ Core initialization methods, such as `Device::new()` and `Manager::add()`, are d
   - Connection attempts are intelligently staggered using randomized jitter to mitigate "thundering herd" effects on the network.
   - Resilience is maintained even if a device is offline; initialization completes successfully, and the background worker manages reconnection logic using an exponential backoff strategy.
 
-## **2. Synchronous Command Dispatch**
+## **2. Synchronous Command Dispatch & `nowait` Configuration**
 
-Methods responsible for device interaction, including `set_value()`, `set_dps()`, and `status()`, operate in a **synchronous** manner.
+Methods responsible for device interaction, including `set_value()`, `set_dps()`, `status()`, and `sub_discover()`, operate in a **synchronous** manner by default.
 
 - **Rationale**: This ensures strict command serialization and provides immediate confirmation that the command has been successfully dispatched to the network interface.
-- **Implementation Details**:
-  - The calling thread is suspended until the command packet is successfully written to the underlying TCP socket.
-  - Commands are strictly serialized via an internal per-device queue to prevent race conditions or protocol desynchronization.
-  - **Note**: A successful return signifies that the command has been **dispatched to the network**, which is distinct from the device having completed the physical execution of the request.
+- **The `nowait` Setting**:
+  - **`nowait = false` (Default)**: The calling thread is suspended until the command packet is successfully written to the underlying TCP socket. This ensures the command has at least left the host machine.
+  - **`nowait = true`**: The method returns immediately after the command is placed in the device's internal queue. This is useful for high-throughput scenarios where waiting for TCP confirmation for every command is undesirable.
+- **Important Considerations**:
+  - **Non-Guarantee of Execution**: A successful return from a command method (regardless of `nowait` setting) signifies that the command has been **dispatched to the network stack**, not that the device has completed the physical execution of the request.
+  - **Response Handling**: Results for commands like `status()` or `sub_discover()` are **never returned directly** by the method. Instead, they are always delivered asynchronously via the `listener()`.
+  - **Automation Risks**: When using `nowait = true`, the method may return while the device is still connecting. If your logic relies on precise timing (e.g., `set_value()` -> `sleep(1)` -> `set_value()`), the sleep might occur before the first command is even sent, leading to unexpected behavior. 
+  - **Best Practice**: Always monitor the `listener()` to confirm the device's actual state transitions and command responses.
 
 ## **3. Decoupled Event-Driven Feedback**
 
@@ -46,7 +50,7 @@ Rustuya provides two distinct APIs to suit different application architectures:
 
 ### **Thread-Safety & Concurrency**
 
-All core types and the synchronous wrappers are **thread-safe** (`Send + Sync`).
+All core types and the synchronous wrappers are **thread-safe**.
 
 - **Internal Architecture**: Rustuya uses a background worker model. `Device` and `Manager` instances (including sync wrappers) are handles to these workers, communicating via message-passing (`mpsc`).
 - **Concurrent Access**: Multiple threads can safely share a single `Device` or `Manager` instance. Cloning an instance creates a new handle to the same background worker, allowing for efficient and safe concurrent control.
@@ -58,6 +62,6 @@ All core types and the synchronous wrappers are **thread-safe** (`Send + Sync`).
 | Action | Blocking | Description |
 | :--- | :--- | :--- |
 | `Device.new()` / `Manager.add()` | No | Registers the device; connection is established in the background. |
-| `device.set_value()` / `status()` | Yes | Blocks until the command packet is committed to the TCP socket. |
+| `device.set_value()` / `status()` | Optional | Blocks until the command packet is committed to TCP (if `nowait=false`). |
 | `device.listener()` | No | Provides a stream/iterator for real-time protocol events. |
-| `scanner.scan()` | Yes | Suspends execution for the duration of the configured discovery timeout. |
+| `scanner.scan()` | Yes | Suspends execution for the duration of the discovery timeout. |

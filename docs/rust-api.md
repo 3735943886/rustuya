@@ -10,7 +10,7 @@ Centralized management for multiple devices, handling lifecycle and unified even
 ### `Manager::new()`
 - **Definition**: `pub fn new() -> Self`
 - **Description**: Creates a new manager instance.
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: `Manager`
 - **Behavior**: Immediate return
 - **Example**:
@@ -19,18 +19,20 @@ Centralized management for multiple devices, handling lifecycle and unified even
   ```
 
 ### `manager.add()`
-- **Definition**: `pub async fn add<V>(&self, id: &str, addr: &str, key: &str, ver: V) -> Result<()>`
-- **Description**: Registers a device with the manager. This starts a background connection task and event forwarder. Fails if the device ID is already registered or internal registry errors occur.
+- **Definition**: `pub async fn add<V>(&self, id: &str, addr: &str, key: &str, ver: V) -> Result<Device>`
+- **Description**: Registers a device with the manager. If a device with the same ID already exists:
+  - If all parameters (addr, key, version) match exactly, returns a `DuplicateDevice` error.
+  - If any parameter differs, it updates the existing device configuration (behaving like a modify) and returns the updated device.
 - **Arguments**:
   - `id`: Unique device ID.
   - `addr`: IP address or "Auto" for discovery.
   - `key`: Local key for encryption.
   - `ver`: Protocol version (e.g., "3.1", "3.3", "3.4", "3.5") or "Auto" for discovery.
-- **Returns**: `Result<()>`
-- **Behavior**: Immediate return (after registration)
+- **Returns**: `Result<Device>`
+- **Behavior**: Returns the registered or updated device handle, allowing for method chaining.
 - **Example**:
   ```rust
-  manager.add(DEVICE_ID, DEVICE_IP, DEVICE_KEY, DEVICE_VER).await?;
+  let device = manager.add(DEVICE_ID, DEVICE_IP, DEVICE_KEY, DEVICE_VER).await?.with_nowait(true);
   ```
 
 ### `manager.get()`
@@ -60,7 +62,7 @@ Centralized management for multiple devices, handling lifecycle and unified even
 ### `manager.clear()`
 - **Definition**: `pub async fn clear(&self)`
 - **Description**: Removes all devices currently tracked by this manager instance.
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: None
 - **Behavior**: Immediate return
 - **Example**:
@@ -79,21 +81,10 @@ Centralized management for multiple devices, handling lifecycle and unified even
   manager.delete(DEVICE_ID).await;
   ```
 
-### `manager.modify()`
-- **Definition**: `pub async fn modify<V>(&self, id: &str, addr: &str, key: &str, ver: V) -> Result<()>`
-- **Description**: Updates the configuration for an existing device. Fails if the device ID is not found.
-- **Arguments**: Same as `add()`.
-- **Returns**: `Result<()>`
-- **Behavior**: Immediate return
-- **Example**:
-  ```rust
-  manager.modify(DEVICE_ID, NEW_IP, DEVICE_KEY, DEVICE_VER).await?;
-  ```
-
 ### `manager.list()`
 - **Definition**: `pub async fn list(&self) -> Vec<DeviceInfo>`
 - **Description**: Returns a list of all devices currently managed by this instance with status information.
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: `Vec<DeviceInfo>`
 - **Behavior**: Immediate return
 - **Example**:
@@ -104,7 +95,7 @@ Centralized management for multiple devices, handling lifecycle and unified even
 ### `manager.listener()`
 - **Definition**: `pub fn listener(&self) -> impl Stream<Item = ManagerEvent>`
 - **Description**: Returns an asynchronous stream of events from all devices managed by this instance.
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: `impl Stream<Item = ManagerEvent>`
 - **Behavior**: Immediate return
 - **Example**:
@@ -118,47 +109,45 @@ Centralized management for multiple devices, handling lifecycle and unified even
 ### `Manager::maximize_fd_limit()`
 - **Definition**: `pub fn maximize_fd_limit() -> Result<()>`
 - **Description**: (Unix-like systems only) Attempts to increase the process file descriptor limit to handle more concurrent connections. Fails on non-Unix platforms or if the OS prevents the increase.
-- **Arguments**: None.
-- **Returns**: `Result<()>`
-- **Behavior**: Immediate return
-- **Example**:
-  ```rust
-  Manager::maximize_fd_limit()?;
-  ```
+- **Arguments**: None
+- **Returns**: None
+- **Example**: `Manager::maximize_fd_limit();`
 
 ---
 
 ## **2. Device API**
-Direct interaction and control for individual Tuya devices.
+Direct interaction with individual Tuya devices.
 
 ### `Device::new()`
-- **Definition**: `pub fn new(id, addr, key, ver) -> Self`
-- **Description**: Creates a device object. The actual connection is managed automatically in the background. Note that `Device` instances obtained through `manager.add()` and `manager.get()` provide the same functionality and handle as those created directly via `new()`.
-- **Arguments**: `id`, `addr`, `key`, `ver`.
+- **Definition**: `pub fn new(id: &str, address: &str, local_key: &str, version: &str) -> Self`
+- **Description**: Creates a new device handle.
+- **Arguments**: `id`, `address`, `local_key`, `version`.
 - **Returns**: `Device`
-- **Behavior**: Immediate return
-- **Example**:
-  ```rust
-  let device = Device::new(DEVICE_ID, DEVICE_IP, DEVICE_KEY, DEVICE_VER);
-  ```
+- **Example**: `let device = Device::new("id", "ip", "key", "3.3");`
+
+### `device.set_nowait()`
+- **Definition**: `pub fn set_nowait(&self, nowait: bool)`
+- **Description**: Configures whether command methods should wait for TCP transmission.
+  - When `false` (default), methods wait until the command is written to the socket.
+  - When `true`, methods return immediately after queuing the command.
+- **Arguments**: `nowait` (bool)
+- **Returns**: None
+- **Note**: For detailed behavior and automation risks, see [API Design Philosophy](./philosophy#2-synchronous-command-dispatch--nowait-configuration).
+- **Example**: `device.set_nowait(true);`
 
 ### `device.status()`
 - **Definition**: `pub async fn status(&self)`
-- **Description**: Requests the current status (all DPS values) from the device.
-- **Arguments**: None.
-- **Returns**: None
-- **Behavior**: Wait until dispatched (Results arrive via listener)
-- **Example**:
-  ```rust
-  device.status().await;
-  ```
+- **Description**: Requests current status (DPS values) from the device.
+- **Returns**: None (Response is received via [listener](#devicelistener))
+- **Behavior**: Respects `nowait` setting.
+- **Example**: `device.status().await;`
 
 ### `device.set_value()`
 - **Definition**: `pub async fn set_value<I: ToString, T: Serialize>(&self, dp_id: I, value: T)`
 - **Description**: Helper to set a single DP value.
-- **Arguments**: `dp_id` (e.g., "1"), `value` (e.g., `true`).
+- **Arguments**: `dp_id` (e.g., "1"), `value` (e.g., `true`)
 - **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Behavior**: Waits for TCP transmission by default (`nowait=false`). If `nowait` is `true`, it returns immediately after queuing.
 - **Example**:
   ```rust
   device.set_value("1", true).await;
@@ -167,9 +156,9 @@ Direct interaction and control for individual Tuya devices.
 ### `device.set_dps()`
 - **Definition**: `pub async fn set_dps(&self, dps: Value)`
 - **Description**: Sends a command to set multiple DPS values.
-- **Arguments**: `dps`: A `serde_json::Value` object.
+- **Arguments**: `dps`: A `serde_json::Value` object
 - **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Behavior**: Waits for TCP transmission by default (`nowait=false`). If `nowait` is `true`, it returns immediately after queuing.
 - **Example**:
   ```rust
   device.set_dps(json!({"1": true, "2": 50})).await;
@@ -178,7 +167,7 @@ Direct interaction and control for individual Tuya devices.
 ### `device.listener()`
 - **Definition**: `pub fn listener(&self) -> impl Stream<Item = Result<TuyaMessage>>`
 - **Description**: Returns a stream of messages/events from this specific device.
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: `impl Stream`
 - **Behavior**: Immediate return
 - **Example**:
@@ -199,7 +188,7 @@ Direct interaction and control for individual Tuya devices.
   - `data`: Optional JSON payload.
   - `cid`: Optional Child ID for gateway sub-devices.
 - **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Behavior**: Waits for TCP transmission by default (`nowait=false`). If `nowait` is `true`, it returns immediately after queuing.
 - **Example**:
   ```rust
   use rustuya::CommandType;
@@ -212,9 +201,9 @@ These methods are used for interacting with sub-devices connected via a Tuya Gat
 #### `device.sub_discover()`
 - **Definition**: `pub async fn sub_discover(&self)`
 - **Description**: Sends a command to the gateway to discover its connected sub-devices.
-- **Arguments**: None.
-- **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Arguments**: None
+- **Returns**: None (Response is received via [listener](#devicelistener))
+- **Behavior**: Waits for TCP transmission by default (`nowait=false`). If `nowait` is `true`, it returns immediately after queuing.
 - **Example**:
   ```rust
   device.sub_discover().await;
@@ -223,7 +212,7 @@ These methods are used for interacting with sub-devices connected via a Tuya Gat
 #### `device.sub()`
 - **Definition**: `pub fn sub(&self, cid: &str) -> SubDevice`
 - **Description**: Returns a `SubDevice` handle for an endpoint connected via the gateway.
-- **Arguments**: `cid`: Child ID.
+- **Arguments**: `cid`: Child ID
 - **Returns**: `SubDevice`
 - **Behavior**: Immediate return
 - **Example**:
@@ -236,11 +225,14 @@ These methods are used for interacting with sub-devices connected via a Tuya Gat
 ## **3. SubDevice API**
 API for interacting with sub-devices (endpoints) through a parent Gateway `Device`. These objects are obtained via `device.sub(cid)`.
 
+> [!NOTE]
+> **Gateway Configuration**: `SubDevice` objects share the connection and configuration of their parent Gateway. For example, calling `set_nowait()` on the parent Gateway will also affect all its sub-devices.
+
 ### `sub_device.status()`
 - **Definition**: `pub async fn status(&self)`
-- **Description**: Requests the current status from the sub-device via the gateway.
-- **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Description**: Requests the status for the sub-device via the gateway.
+- **Returns**: None (Response is received via parent device's [listener](#devicelistener))
+- **Behavior**: Respects `nowait` setting of the parent `Device`.
 - **Example**:
   ```rust
   sub_device.status().await;
@@ -249,9 +241,9 @@ API for interacting with sub-devices (endpoints) through a parent Gateway `Devic
 ### `sub_device.set_value()`
 - **Definition**: `pub async fn set_value<I: ToString, T: Serialize>(&self, index: I, value: T)`
 - **Description**: Sets a single DP value for the sub-device.
-- **Arguments**: `index` (DP ID), `value` (Serializable value).
+- **Arguments**: `index` (DP ID), `value` (Serializable value)
 - **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Behavior**: Waits for TCP transmission by default (`nowait=false`). If `nowait` is `true` (on the parent Gateway), it returns immediately after queuing.
 - **Example**:
   ```rust
   sub_device.set_value(1, true).await;
@@ -260,9 +252,9 @@ API for interacting with sub-devices (endpoints) through a parent Gateway `Devic
 ### `sub_device.set_dps()`
 - **Definition**: `pub async fn set_dps(&self, dps: Value)`
 - **Description**: Sets multiple DPS values for the sub-device.
-- **Arguments**: `dps`: A `serde_json::Value` object.
+- **Arguments**: `dps`: A `serde_json::Value` object
 - **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Behavior**: Waits for TCP transmission by default (`nowait=false`). If `nowait` is `true` (on the parent Gateway), it returns immediately after queuing.
 - **Example**:
   ```rust
   sub_device.set_dps(json!({"1": false, "2": 30})).await;
@@ -277,7 +269,7 @@ API for interacting with sub-devices (endpoints) through a parent Gateway `Devic
   - `cmd`: The `CommandType` to send.
   - `data`: Optional JSON payload.
 - **Returns**: None
-- **Behavior**: Wait until dispatched
+- **Behavior**: Waits for TCP transmission by default (`nowait=false`). If `nowait` is `true` (on the parent Gateway), it returns immediately after queuing.
 - **Example**:
   ```rust
   use rustuya::CommandType;
@@ -292,7 +284,7 @@ Used for discovering Tuya devices on the local network via UDP broadcast.
 ### `Scanner::new()`
 - **Definition**: `pub fn new() -> Self`
 - **Description**: Creates a new scanner with default settings (timeout: 18s, bind: 0.0.0.0).
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: `Scanner`
 - **Behavior**: Immediate return
 - **Example**:
@@ -320,7 +312,7 @@ These methods use the builder pattern to configure the scanner before performing
 ### `scanner.scan()`
 - **Definition**: `pub async fn scan(&self) -> Result<Vec<DiscoveryResult>>`
 - **Description**: Performs an active scan and returns a list of all discovered devices. Fails if UDP port binding fails or network interface issues occur.
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: `Result<Vec<DiscoveryResult>>`
 - **Behavior**: Wait until discovery timeout
 - **Example**:
@@ -339,7 +331,7 @@ These methods use the builder pattern to configure the scanner before performing
 ### `scanner.scan_stream()`
 - **Definition**: `pub fn scan_stream(&self) -> impl Stream<Item = DiscoveryResult>`
 - **Description**: Performs an active scan and returns a stream that yields devices as they are found.
-- **Arguments**: None.
+- **Arguments**: None
 - **Returns**: `impl Stream`
 - **Behavior**: Immediate return (returns stream handle)
 - **Example**:

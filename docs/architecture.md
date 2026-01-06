@@ -16,12 +16,12 @@ Rustuya is designed with a layered architecture that separates network concerns,
 
 ## **Component Breakdown**
 
-- **Manager ([manager.rs](file:///e:/Libraries/Documents/trae_projects/rustuya/src/manager.rs))**: Central registry for all devices. Handles unified event streaming and lifecycle management.
-- **Device ([device.rs](file:///e:/Libraries/Documents/trae_projects/rustuya/src/device.rs))**: Represents a single physical Tuya device. Manages its own background connection task.
-- **Protocol ([protocol/mod.rs](file:///e:/Libraries/Documents/trae_projects/rustuya/src/protocol/mod.rs))**: Implements the Tuya protocol versions (3.1, 3.3, 3.4, 3.5, and device22).
-- **Crypto ([crypto.rs](file:///e:/Libraries/Documents/trae_projects/rustuya/src/crypto.rs))**: Handles AES encryption and MD5/HMAC hashing required by the protocol.
-- **Scanner ([scanner.rs](file:///e:/Libraries/Documents/trae_projects/rustuya/src/scanner.rs))**: Manages UDP discovery for finding devices on the local network.
-- **Runtime ([runtime.rs](file:///e:/Libraries/Documents/trae_projects/rustuya/src/runtime.rs))**: Internal utilities for managing background tasks and timers.
+- **Manager ([manager.rs](https://github.com/3735943886/rustuya/blob/master/src/manager.rs))**: Central registry for all devices. Handles unified event streaming and lifecycle management.
+- **Device ([device.rs](https://github.com/3735943886/rustuya/blob/master/src/device.rs))**: Represents a single physical Tuya device. Manages its own background connection task.
+- **Protocol ([protocol/mod.rs](https://github.com/3735943886/rustuya/blob/master/src/protocol/mod.rs))**: Implements the Tuya protocol versions (3.1, 3.3, 3.4, 3.5, and device22).
+- **Crypto ([crypto.rs](https://github.com/3735943886/rustuya/blob/master/src/crypto.rs))**: Handles AES encryption and MD5/HMAC hashing required by the protocol.
+- **Scanner ([scanner.rs](https://github.com/3735943886/rustuya/blob/master/src/scanner.rs))**: Manages UDP discovery for finding devices on the local network.
+- **Runtime ([runtime.rs](https://github.com/3735943886/rustuya/blob/master/src/runtime.rs))**: Internal utilities for managing background tasks and timers.
 
 ---
 

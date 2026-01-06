@@ -60,21 +60,35 @@ impl Scanner {
         }
     }
 
-    /// Sets the scan timeout in milliseconds.
-    pub fn with_timeout(&self, timeout_ms: u64) -> Self {
-        Scanner {
-            inner: self
-                .inner
-                .clone()
-                .with_timeout(Duration::from_millis(timeout_ms)),
-        }
+    /// Sets the scan timeout in seconds.
+    pub fn timeout(mut slf: PyRefMut<'_, Self>, timeout_sec: f64) -> PyRefMut<'_, Self> {
+        slf.inner.set_timeout(Duration::from_secs_f64(timeout_sec));
+        slf
+    }
+
+    /// Sets the scan timeout in seconds. (Deprecated: use timeout instead)
+    pub fn with_timeout(mut slf: PyRefMut<'_, Self>, timeout_sec: f64) -> PyRefMut<'_, Self> {
+        slf.inner.set_timeout(Duration::from_secs_f64(timeout_sec));
+        slf
     }
 
     /// Sets the local address to bind to.
-    pub fn set_bind_address(&mut self, addr: &str) -> PyResult<()> {
-        self.inner.set_bind_address(addr).map_err(|e| {
+    pub fn bind_address<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        addr: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        slf.inner.set_bind_address(addr).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to set bind address: {}", e))
-        })
+        })?;
+        Ok(slf)
+    }
+
+    /// Sets the local address to bind to.
+    pub fn set_bind_address<'a>(
+        slf: PyRefMut<'a, Self>,
+        addr: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        Self::bind_address(slf, addr)
     }
 
     /// Scans the local network for Tuya devices.
@@ -242,14 +256,37 @@ impl Device {
     }
 
     /// Sets whether to keep the connection persistent.
-    pub fn set_persist(&self, persist: bool) {
-        self.inner.set_persist(persist);
+    pub fn set_persist(slf: PyRefMut<'_, Self>, persist: bool) -> PyRefMut<'_, Self> {
+        slf.inner.set_persist(persist);
+        slf
+    }
+
+    /// Sets whether to keep the connection persistent.
+    pub fn with_persist(slf: PyRefMut<'_, Self>, persist: bool) -> PyRefMut<'_, Self> {
+        Self::set_persist(slf, persist)
     }
 
     /// Sets the connection timeout in milliseconds.
-    pub fn set_connection_timeout(&self, timeout_ms: u64) {
-        self.inner
+    pub fn set_connection_timeout(slf: PyRefMut<'_, Self>, timeout_ms: u64) -> PyRefMut<'_, Self> {
+        slf.inner
             .set_connection_timeout(Duration::from_millis(timeout_ms));
+        slf
+    }
+
+    /// Sets the connection timeout in milliseconds.
+    pub fn with_connection_timeout(slf: PyRefMut<'_, Self>, timeout_ms: u64) -> PyRefMut<'_, Self> {
+        Self::set_connection_timeout(slf, timeout_ms)
+    }
+
+    /// Sets the device port.
+    pub fn set_port(slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
+        slf.inner.set_port(port);
+        slf
+    }
+
+    /// Sets the device port.
+    pub fn with_port(slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
+        Self::set_port(slf, port)
     }
 
     /// Sets the protocol version.
@@ -269,6 +306,23 @@ impl Device {
     /// Requests the device status.
     pub fn status(&self, py: Python<'_>) {
         py.detach(|| self.inner.status());
+    }
+
+    /// Sets whether requests should wait for a response from the device.
+    pub fn set_nowait(slf: PyRefMut<'_, Self>, nowait: bool) -> PyRefMut<'_, Self> {
+        slf.inner.set_nowait(nowait);
+        slf
+    }
+
+    /// Sets whether requests should wait for a response from the device.
+    pub fn with_nowait(slf: PyRefMut<'_, Self>, nowait: bool) -> PyRefMut<'_, Self> {
+        Self::set_nowait(slf, nowait)
+    }
+
+    /// Returns whether the device is in nowait mode.
+    #[getter]
+    pub fn nowait(&self) -> bool {
+        self.inner.nowait()
     }
 
     /// Sets multiple DP values.
@@ -509,11 +563,13 @@ impl Manager {
         address: &str,
         local_key: &str,
         version: &str,
-    ) -> PyResult<()> {
-        py.detach(|| self.inner.add(id, address, local_key, version))
+    ) -> PyResult<Device> {
+        let device = py
+            .detach(|| self.inner.add(id, address, local_key, version))
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to add device: {}", e))
-            })
+            })?;
+        Ok(Device { inner: device })
     }
 
     pub fn remove(&self, py: Python<'_>, id: &str) {
@@ -522,20 +578,6 @@ impl Manager {
 
     pub fn delete(&self, py: Python<'_>, id: &str) {
         py.detach(|| self.inner.delete(id));
-    }
-
-    pub fn modify(
-        &self,
-        py: Python<'_>,
-        id: &str,
-        address: &str,
-        local_key: &str,
-        version: &str,
-    ) -> PyResult<()> {
-        py.detach(|| self.inner.modify(id, address, local_key, version))
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to modify device: {}", e))
-            })
     }
 
     pub fn get(&self, py: Python<'_>, id: &str) -> Option<Device> {
