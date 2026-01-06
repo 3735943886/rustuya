@@ -310,6 +310,7 @@ pub struct DeviceInfo {
     pub address: String,
     pub local_key: String,
     pub version: String,
+    pub dev_type: String,
     pub is_connected: bool,
 }
 
@@ -494,6 +495,7 @@ impl Manager {
                 address: device.address(),
                 local_key: hex::encode(device.local_key()),
                 version: device.version().to_string(),
+                dev_type: device.dev_type().as_str().to_string(),
                 is_connected: device.is_connected(),
             });
         }

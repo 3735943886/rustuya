@@ -234,10 +234,34 @@ impl Device {
         self.inner.address()
     }
 
+    /// Returns the user-configured address (e.g., "Auto" or a specific IP).
+    #[getter]
+    pub fn config_address(&self) -> String {
+        self.inner.config_address()
+    }
+
     /// Returns the device type.
     #[getter]
     pub fn dev_type(&self) -> String {
         self.inner.dev_type().as_str().to_string()
+    }
+
+    /// Returns the device port.
+    #[getter]
+    pub fn port(&self) -> u16 {
+        self.inner.port()
+    }
+
+    /// Returns whether the connection is persistent.
+    #[getter]
+    pub fn persist(&self) -> bool {
+        self.inner.persist()
+    }
+
+    /// Returns the connection timeout in milliseconds.
+    #[getter]
+    pub fn connection_timeout(&self) -> u64 {
+        self.inner.connection_timeout().as_millis() as u64
     }
 
     /// Checks if the device is connected.
@@ -290,17 +314,39 @@ impl Device {
     }
 
     /// Sets the protocol version.
-    pub fn set_version(&self, version: &str) {
-        self.inner.set_version(version);
+    pub fn set_version(slf: PyRefMut<'_, Self>, version: &str) -> PyRefMut<'_, Self> {
+        slf.inner.set_version(version);
+        slf
+    }
+
+    /// Sets the protocol version.
+    pub fn with_version(slf: PyRefMut<'_, Self>, version: &str) -> PyRefMut<'_, Self> {
+        Self::set_version(slf, version)
     }
 
     /// Sets the device type.
-    pub fn set_dev_type(&self, dev_type: &str) -> PyResult<()> {
+    pub fn set_dev_type(slf: PyRefMut<'_, Self>, dev_type: &str) -> PyResult<PyRefMut<'_, Self>> {
         let dt = DeviceType::from_str(dev_type).map_err(|_| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid device type: {}", dev_type))
         })?;
-        self.inner.set_dev_type(dt);
-        Ok(())
+        slf.inner.set_dev_type(dt);
+        Ok(slf)
+    }
+
+    /// Sets the device type.
+    pub fn with_dev_type(slf: PyRefMut<'_, Self>, dev_type: &str) -> PyResult<PyRefMut<'_, Self>> {
+        Self::set_dev_type(slf, dev_type)
+    }
+
+    /// Sets the device address.
+    pub fn set_address(slf: PyRefMut<'_, Self>, address: &str) -> PyRefMut<'_, Self> {
+        slf.inner.set_address(address);
+        slf
+    }
+
+    /// Sets the device address.
+    pub fn with_address(slf: PyRefMut<'_, Self>, address: &str) -> PyRefMut<'_, Self> {
+        Self::set_address(slf, address)
     }
 
     /// Requests the device status.
@@ -521,6 +567,7 @@ pub struct DeviceInfo {
     pub address: String,
     pub local_key: String,
     pub version: String,
+    pub dev_type: String,
     pub is_connected: bool,
 }
 
@@ -607,8 +654,9 @@ impl Manager {
                 .map(|info| DeviceInfo {
                     id: info.id,
                     address: info.address,
-                    local_key: hex::encode(info.local_key),
+                    local_key: info.local_key,
                     version: info.version,
+                    dev_type: info.dev_type,
                     is_connected: info.is_connected,
                 })
                 .collect()
