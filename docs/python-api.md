@@ -1,100 +1,151 @@
-# Python Guide
+# Python API Reference
 
-Python bindings expose API wrappers under the `rustuya` module.
+This document provides a detailed reference for the `rustuya` Python bindings. The Python API is a synchronous wrapper around the high-performance Rust core, designed for ease of use while maintaining efficiency.
 
-## Installation
+> [!TIP]
+> **Thread-Safety**: The Python `Manager`, `Device`, and `Scanner` classes are **thread-safe**. They can be safely shared across multiple Python threads. The underlying implementation releases the Global Interpreter Lock (GIL) for most operations, allowing for true concurrent execution of background tasks.
 
-```bash
-pip install rustuya
-```
+For practical code examples, see the [Python Examples](./python-examples.md) page.
 
-## Check Version
+---
 
-```python
-import rustuya
-print(rustuya.version())
-```
+## **1. Manager API**
+The `Manager` is used for managing multiple devices simultaneously and receiving a unified event stream.
 
-## Device
-- Create: `Device(id, address, local_key, version)`
-- Request status: `status()`
-- Set single value: `set_value(dp_id, value)`
-- Set multiple DPs: `set_dps({...})`
-- Event listener: `listener()`
+### `Manager()`
+- **Description**: Creates a new manager instance.
+- **Example**:
+  ```python
+  from rustuya import Manager
+  mgr = Manager()
+  ```
 
-```python
-from rustuya import Device
+### `Manager.maximize_fd_limit()` (Static)
+- **Description**: (Unix-only) Increases the process file descriptor limit. Recommended when managing a large number of devices.
+- **Example**: `Manager.maximize_fd_limit()`
 
-dev = Device("ID", "ADDRESS", "LOCAL_KEY", "VER")
-dev.set_value(1, True)
+### `manager.add(id, address, local_key, version)`
+- **Description**: Registers a device with the manager. Starts a background connection task.
+- **Arguments**:
+  - `id`: Unique device ID.
+  - `address`: IP address or "Auto" for discovery.
+  - `local_key`: Local key for encryption.
+  - `version`: Protocol version (e.g., "3.1", "3.3", "3.4", "3.5") or "Auto" for discovery.
+- **Example**: `mgr.add("id", "192.168.1.100", "key", "3.3")`
 
-for msg in dev.listener():
-    print(msg)
-```
+### `manager.get(id)`
+- **Description**: Returns a `Device` handle for the given ID. Returns `None` if not found.
+- **Example**: `dev = mgr.get("id")`
 
-## Manager
-- Create: `Manager()`
-- Global settings: `maximize_fd_limit()` (static method). Recommended for Unix-like systems when managing many devices.
-- Add/modify/remove/delete devices: `add(...)`, `modify(...)`, `remove(...)`, `delete(...)`
-- Get/list: `get(id)`, `list()`
-- Event listener: `listener()`
+### `manager.remove(id)`
+- **Description**: Removes a device from the manager's tracking.
+- **Example**: `mgr.remove("id")`
 
-```python
-from rustuya import Manager
+### `manager.list()`
+- **Description**: Returns a list of `DeviceInfo` objects for all managed devices.
+- **Example**: `devices = mgr.list()`
 
-Manager.maximize_fd_limit()
+### `manager.listener()`
+- **Description**: Returns a `ManagerEventReceiver` to iterate over events from all managed devices.
+- **Example**:
+  ```python
+  for event in mgr.listener():
+      print(f"Device {event['device_id']} sent: {event['payload']}")
+  ```
 
-mgr = Manager()
-mgr.add("ID", "ADDRESS", "LOCAL_KEY", "VER")
+---
 
-for msg in mgr.listener():
-    print(msg)
-```
+## **2. Device API**
+Direct interaction and control for individual Tuya devices.
 
-## Logging, Listening and Control
+### `Device(id, address, local_key, version)`
+- **Description**: Creates a new device handle.
+- **Note**: `Device` objects obtained via `manager.get()` provide the same functionality.
 
-```python
-import logging
-import threading
-import time
-from rustuya import Manager
+### `device.status()`
+- **Description**: Requests the current status (all DPS) from the device.
+- **Returns**: None (Results arrive via listener).
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+### `device.set_value(dp_id, value)`
+- **Description**: Sets a single DP value.
+- **Arguments**: `dp_id` (int or str), `value` (bool, int, str, etc.).
 
-mgr = Manager()
-mgr.add("ID1", "ADDRESS1", "LOCAL_KEY1", "VER1")
-mgr.add("ID2", "ADDRESS2", "LOCAL_KEY2", "VER2")
+### `device.set_dps(dps_dict)`
+- **Description**: Sets multiple DP values at once.
+- **Arguments**: A dictionary of DP ID to value.
+- **Example**: `dev.set_dps({"1": True, "2": 50})`
 
-def listen():
-    for msg in mgr.listener():
-        print(msg)
+### `device.listener()`
+- **Description**: Returns a `DeviceMessageReceiver` that yields messages from the device.
+- **Example**:
+  ```python
+  listener = dev.listener()
+  msg = listener.recv(timeout_ms=5000) # Optional timeout
+  ```
 
-def control():
-    while True:
-        mgr.get("ID1").set_value(1, True)
-        time.sleep(1)
-        mgr.get("ID2").set_value(2, True)
-        time.sleep(1)
-        mgr.get("ID1").set_value(1, False)
-        time.sleep(1)
-        mgr.get("ID2").set_value(2, False)
-        time.sleep(1)
+### **Advanced Usage**
 
-t_listen = threading.Thread(target=listen, daemon=True)
-t_control = threading.Thread(target=control, daemon=True)
-t_listen.start()
-t_control.start()
+#### `device.request(command, data=None, cid=None)`
+- **Description**: Low-level method to send a raw Tuya command.
+- **Arguments**: `command` (int from `CommandType`), `data` (dict, optional), `cid` (str, optional).
+- **Example**:
+  ```python
+  from rustuya import CommandType
+  dev.request(CommandType["DpQuery"], None)
+  ```
 
-time.sleep(10)
-```
+### **Gateway API**
 
-## Scanner
+#### `device.sub_discover()`
+- **Description**: Sends a command to the gateway to discover connected sub-devices.
 
-```python
-import logging
-from rustuya import Scanner
+#### `device.sub(cid)`
+- **Description**: Returns a `SubDevice` handle for the given cid.
+- **Example**: `sub_device = dev.sub("sub_id_123")`
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-scanner = Scanner()
-scanner.scan()
-```
+---
+
+## **3. SubDevice API**
+API for interacting with sub-devices (endpoints) through a parent Gateway `Device`. These objects are obtained via `device.sub(cid)`.
+
+### `sub_device.status()`
+- **Description**: Requests status for the sub-device via the gateway.
+
+### `sub_device.set_value(dp_id, value)`
+- **Description**: Sets a single DP value for the sub-device.
+
+### `sub_device.set_dps(dps_dict)`
+- **Description**: Sets multiple DP values for the sub-device.
+
+### **Advanced Usage**
+- **Note**: Sub-devices do not have a direct `request()` method. To send raw commands to a sub-device, use the parent `Device` handle's `request()` method and provide the sub-device's ID as the `cid` argument.
+- **Example**:
+  ```python
+  from rustuya import CommandType
+  # Use parent device to send request to sub-device
+  parent_dev.request(CommandType["DpQuery"], None, cid=sub_dev.id)
+  ```
+
+---
+
+## **4. Scanner API**
+Used for discovering Tuya devices on the local network via UDP broadcast.
+
+### `Scanner()`
+- **Description**: Creates a new scanner instance with default settings.
+
+### `scanner.with_timeout(timeout_ms)`
+- **Description**: Sets the scan duration in milliseconds. Returns a new configured `Scanner`.
+
+### `scanner.set_bind_address(address)`
+- **Description**: Sets the local IP address to bind to for discovery.
+
+### `scanner.scan()`
+- **Description**: Performs an active scan and returns a list of discovered devices.
+- **Example**: 
+  ```python
+  from rustuya import Scanner
+  results = Scanner().with_timeout(5000).scan()
+  for device in results:
+      print(f"Found: {device['id']} at {device['ip']}")
+  ```
