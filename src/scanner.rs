@@ -119,7 +119,7 @@ impl Default for Scanner {
 static GLOBAL_SCANNER: OnceLock<Scanner> = OnceLock::new();
 
 /// Returns the global scanner instance.
-pub fn get_global_scanner() -> &'static Scanner {
+pub fn get() -> &'static Scanner {
     GLOBAL_SCANNER.get_or_init(Scanner::new)
 }
 

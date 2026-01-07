@@ -11,7 +11,7 @@ use crate::protocol::{
     CommandType, DeviceType, PREFIX_55AA, PREFIX_6699, TuyaHeader, TuyaMessage, Version,
     get_protocol, pack_message, parse_header, unpack_message,
 };
-use crate::scanner::get_global_scanner;
+use crate::scanner::get as get_scanner;
 use futures_core::stream::Stream;
 use hex;
 use log::{debug, error, info, trace, warn};
@@ -835,7 +835,7 @@ impl Device {
                         match e {
                             TuyaError::KeyOrVersionError | TuyaError::Offline => {
                                 s.force_discovery = true;
-                                let _ = get_global_scanner().invalidate_cache(&self.id);
+                                let _ = get_scanner().invalidate_cache(&self.id);
                             }
                             _ => {}
                         }
@@ -853,17 +853,17 @@ impl Device {
         let sleep_fut = sleep(backoff);
         tokio::pin!(sleep_fut);
 
-        let discovery_notified = get_global_scanner().notified();
+        let discovery_notified = get_scanner().notified();
         tokio::pin!(discovery_notified);
 
         loop {
             tokio::select! {
                 () = &mut sleep_fut => return Some(()),
                 () = &mut discovery_notified => {
-                    if get_global_scanner().is_recently_discovered(&self.id, Duration::from_secs(10)) {
+                    if get_scanner().is_recently_discovered(&self.id, Duration::from_secs(10)) {
                         return Some(());
                     }
-                    discovery_notified.set(get_global_scanner().notified());
+                    discovery_notified.set(get_scanner().notified());
                 }
                 () = self.cancel_token.cancelled() => {
                     self.drain_rx(rx, TuyaError::Offline, true);
@@ -1030,7 +1030,7 @@ impl Device {
             return Ok(config_addr);
         }
 
-        if let Ok(Some(result)) = get_global_scanner()
+        if let Ok(Some(result)) = get_scanner()
             .discover_device_internal(&self.id, force_discovery)
             .await
         {
