@@ -1442,7 +1442,9 @@ impl Device {
         // Determine which key to use: session_key if available, otherwise local_key
         let key = state.session_key.as_deref().unwrap_or(&self.local_key);
 
-        if let Some(ref cipher) = state.cipher && cipher.key() == key {
+        if let Some(ref cipher) = state.cipher
+            && cipher.key() == key
+        {
             return Ok(Arc::clone(cipher));
         }
 
