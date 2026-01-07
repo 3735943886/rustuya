@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, Instant};
@@ -113,6 +114,13 @@ impl Default for Scanner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+static GLOBAL_SCANNER: OnceLock<Scanner> = OnceLock::new();
+
+/// Returns the global scanner instance.
+pub fn get_global_scanner() -> &'static Scanner {
+    GLOBAL_SCANNER.get_or_init(Scanner::new)
 }
 
 impl Scanner {
