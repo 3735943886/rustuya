@@ -5,7 +5,6 @@ authors = ["3735943886"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/3735943886/rustuya"
-documentation = "https://docs.rs/rustuya"
 homepage = "https://github.com/3735943886/rustuya"
 description = "A fast and concurrent Tuya Local API implementation in Rust"
 keywords = ["tuya", "iot", "smart-home", "automation"]

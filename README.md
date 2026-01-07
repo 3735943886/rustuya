@@ -6,8 +6,6 @@
 
 Rustuya is a Rust implementation of the Tuya Local API. It enables local control and monitoring of Tuya-compatible devices without cloud dependencies.
 
-[Guide](https://3735943886.github.io/rustuya/)
-
 ## License
 
 MIT
