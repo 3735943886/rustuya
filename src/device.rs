@@ -708,9 +708,7 @@ impl Device {
                     }
                     cmd_opt = rx.recv() => {
                         if let Some(cmd) = cmd_opt {
-                            if let Err(e) = self.process_command(&mut write_half, seqno, cmd).await {
-                                return Err(e);
-                            }
+                            self.process_command(&mut write_half, seqno, cmd).await?;
                         } else {
                             self.state.write().state = ConnectionState::Stopped;
                             return Ok(());
@@ -1444,10 +1442,8 @@ impl Device {
         // Determine which key to use: session_key if available, otherwise local_key
         let key = state.session_key.as_deref().unwrap_or(&self.local_key);
 
-        if let Some(ref cipher) = state.cipher {
-            if cipher.key() == key {
-                return Ok(Arc::clone(cipher));
-            }
+        if let Some(ref cipher) = state.cipher && cipher.key() == key {
+            return Ok(Arc::clone(cipher));
         }
 
         let new_cipher = Arc::new(TuyaCipher::new(key)?);
