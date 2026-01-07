@@ -93,7 +93,11 @@ impl SubDevice {
         }
     }
 
-    pub async fn request(&self, cmd: CommandType, data: Option<Value>) -> Result<Option<TuyaMessage>> {
+    pub async fn request(
+        &self,
+        cmd: CommandType,
+        data: Option<Value>,
+    ) -> Result<Option<TuyaMessage>> {
         self.parent.request(cmd, data, Some(self.cid.clone())).await
     }
 }
@@ -1110,7 +1114,6 @@ impl Device {
                 cid,
                 resp_tx,
             } => {
-                let has_data = data.is_some();
                 let nowait = self.nowait.load(Ordering::Relaxed);
                 let response_rx = if !nowait {
                     Some(self.broadcast_tx.subscribe())
@@ -1142,15 +1145,10 @@ impl Device {
                             match rx.recv().await {
                                 Ok(msg) => {
                                     // 1. Check command ID
-                                     let cmd_matches = msg.cmd == effective_cmd
-                                         || msg.cmd == CommandType::Status as u32;
-                                    
-                                    if !cmd_matches {
-                                        continue;
-                                    }
+                                    let cmd_matches = msg.cmd == effective_cmd
+                                        || msg.cmd == CommandType::Status as u32;
 
-                                    // 2. Check data requirement
-                                    if has_data && msg.payload.is_empty() {
+                                    if !cmd_matches {
                                         continue;
                                     }
 
@@ -1577,4 +1575,3 @@ impl Device {
         }
     }
 }
-

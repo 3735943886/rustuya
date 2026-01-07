@@ -36,7 +36,16 @@ async fn main() {
 
     // 4. Send initial status query to check seqno matching
     println!("Sending status query...");
-    device.status().await;
+    match device.status().await {
+        Ok(Some(msg)) => {
+            println!(
+                "Initial Status Response: {}",
+                msg.payload_as_string().unwrap_or_default()
+            );
+        }
+        Ok(None) => println!("Initial Status: No data"),
+        Err(e) => eprintln!("Initial Status Error: {e}"),
+    }
 
     // 5. Continuously read messages from the stream
     while let Some(msg) = stream.next().await {

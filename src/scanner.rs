@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, Instant};
@@ -100,7 +100,6 @@ impl Drop for ScannerState {
     }
 }
 
-
 /// Discovers Tuya devices on the local network using UDP broadcast.
 #[derive(Debug, Clone)]
 pub struct Scanner {
@@ -125,6 +124,11 @@ static GLOBAL_SCANNER: OnceLock<Scanner> = OnceLock::new();
 pub fn get() -> &'static Scanner {
     GLOBAL_SCANNER.get_or_init(Scanner::new)
 }
+
+type ReceiverResult = (
+    mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    Vec<tokio::task::JoinHandle<()>>,
+);
 
 impl Scanner {
     /// Creates a new Scanner with default settings.
@@ -238,10 +242,7 @@ impl Scanner {
     fn spawn_receiver_tasks(
         sockets: Vec<Arc<UdpSocket>>,
         cancel_token: tokio_util::sync::CancellationToken,
-    ) -> (
-        mpsc::Receiver<(Vec<u8>, SocketAddr)>,
-        Vec<tokio::task::JoinHandle<()>>,
-    ) {
+    ) -> ReceiverResult {
         let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100);
         let mut tasks = Vec::new();
 
