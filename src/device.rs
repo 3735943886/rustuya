@@ -71,24 +71,30 @@ impl SubDevice {
         &self.cid
     }
 
-    pub async fn status(&self) {
-        self.request(CommandType::DpQuery, None).await;
+    pub async fn status(&self) -> Result<Option<TuyaMessage>> {
+        self.request(CommandType::DpQuery, None).await
     }
 
-    pub async fn set_dps(&self, dps: Value) {
-        self.request(CommandType::Control, Some(dps)).await;
+    pub async fn set_dps(&self, dps: Value) -> Result<Option<TuyaMessage>> {
+        self.request(CommandType::Control, Some(dps)).await
     }
 
     /// Sets a single DP value.
-    pub async fn set_value<I: ToString, T: Serialize>(&self, index: I, value: T) {
+    pub async fn set_value<I: ToString, T: Serialize>(
+        &self,
+        index: I,
+        value: T,
+    ) -> Result<Option<TuyaMessage>> {
         if let Ok(val) = serde_json::to_value(value) {
             self.set_dps(serde_json::json!({ index.to_string(): val }))
-                .await;
+                .await
+        } else {
+            Err(TuyaError::InvalidPayload)
         }
     }
 
-    pub async fn request(&self, cmd: CommandType, data: Option<Value>) {
-        self.parent.request(cmd, data, Some(self.cid.clone())).await;
+    pub async fn request(&self, cmd: CommandType, data: Option<Value>) -> Result<Option<TuyaMessage>> {
+        self.parent.request(cmd, data, Some(self.cid.clone())).await
     }
 }
 
@@ -97,14 +103,14 @@ enum DeviceCommand {
         command: CommandType,
         data: Option<Value>,
         cid: Option<String>,
-        resp_tx: oneshot::Sender<Result<()>>,
+        resp_tx: oneshot::Sender<Result<Option<TuyaMessage>>>,
     },
     Disconnect,
     ConnectNow,
 }
 
 impl DeviceCommand {
-    fn respond(self, result: Result<()>) {
+    fn respond(self, result: Result<Option<TuyaMessage>>) {
         if let DeviceCommand::Request { resp_tx, .. } = self {
             let _ = resp_tx.send(result);
         }
@@ -410,33 +416,39 @@ impl Device {
         }
     }
 
-    pub async fn status(&self) {
-        self.request(CommandType::DpQuery, None, None).await;
+    pub async fn status(&self) -> Result<Option<TuyaMessage>> {
+        self.request(CommandType::DpQuery, None, None).await
     }
 
     /// Sets multiple DP values at once.
     /// The `dps` argument should be a `serde_json::Value` object where keys are DP IDs.
-    pub async fn set_dps(&self, dps: Value) {
-        self.request(CommandType::Control, Some(dps), None).await;
+    pub async fn set_dps(&self, dps: Value) -> Result<Option<TuyaMessage>> {
+        self.request(CommandType::Control, Some(dps), None).await
     }
 
     /// Sets a single DP value by its ID.
     /// The `dp_id` can be provided as any type that can be converted to a String (e.g., u32, &str).
     /// The `value` can be any type that implements `Serialize` (e.g., bool, i32, String, `serde_json::Value`).
-    pub async fn set_value<I: ToString, T: Serialize>(&self, dp_id: I, value: T) {
+    pub async fn set_value<I: ToString, T: Serialize>(
+        &self,
+        dp_id: I,
+        value: T,
+    ) -> Result<Option<TuyaMessage>> {
         if let Ok(val) = serde_json::to_value(value) {
             self.set_dps(serde_json::json!({ dp_id.to_string(): val }))
-                .await;
+                .await
+        } else {
+            Err(TuyaError::InvalidPayload)
         }
     }
 
-    pub async fn sub_discover(&self) {
+    pub async fn sub_discover(&self) -> Result<Option<TuyaMessage>> {
         let data = serde_json::json!({
             "cids": [],
             keys::REQ_TYPE: "subdev_online_stat_query"
         });
         self.request(CommandType::LanExtStream, Some(data), None)
-            .await;
+            .await
     }
 
     pub async fn receive(&self) -> Result<TuyaMessage> {
@@ -449,7 +461,12 @@ impl Device {
         SubDevice::new(self.clone(), cid)
     }
 
-    pub async fn request(&self, command: CommandType, data: Option<Value>, cid: Option<String>) {
+    pub async fn request(
+        &self,
+        command: CommandType,
+        data: Option<Value>,
+        cid: Option<String>,
+    ) -> Result<Option<TuyaMessage>> {
         debug!("request: cmd={command:?}, data={data:?}");
         self.send_command_to_task(|resp_tx| DeviceCommand::Request {
             command,
@@ -457,7 +474,7 @@ impl Device {
             cid,
             resp_tx,
         })
-        .await;
+        .await
     }
 }
 
@@ -540,12 +557,14 @@ impl Device {
 
     async fn send_command_to_task(
         &self,
-        cmd_generator: impl FnOnce(oneshot::Sender<Result<()>>) -> DeviceCommand,
-    ) {
+        cmd_generator: impl FnOnce(oneshot::Sender<Result<Option<TuyaMessage>>>) -> DeviceCommand,
+    ) -> Result<Option<TuyaMessage>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.send_to_task(cmd_generator(resp_tx)).await;
         if !self.nowait.load(Ordering::Relaxed) {
-            let _ = resp_rx.await;
+            resp_rx.await.map_err(|_| TuyaError::Offline)?
+        } else {
+            Ok(None)
         }
     }
 
@@ -1091,15 +1110,64 @@ impl Device {
                 cid,
                 resp_tx,
             } => {
+                let has_data = data.is_some();
+                let nowait = self.nowait.load(Ordering::Relaxed);
+                let response_rx = if !nowait {
+                    Some(self.broadcast_tx.subscribe())
+                } else {
+                    None
+                };
+
                 let res = self.generate_payload(command, data, cid.as_deref()).await;
-                let res = match res {
+                let send_res = match res {
                     Ok((cmd_id, payload)) => {
                         debug!("Sending command: cmd=0x{:02X}, seqno={}", cmd_id, *seqno);
                         self.send_json_msg(stream, seqno, cmd_id, &payload).await
                     }
                     Err(e) => Err(e),
                 };
-                let _ = resp_tx.send(res);
+
+                if let Err(e) = send_res {
+                    let _ = resp_tx.send(Err(e));
+                    return Ok(());
+                }
+
+                if let Some(mut rx) = response_rx {
+                    let protocol = self.with_state(|s| get_protocol(s.version, s.dev_type));
+                    let effective_cmd = protocol.get_effective_command(command);
+                    let timeout_dur = self.connection_timeout();
+
+                    let wait_res = timeout(timeout_dur, async {
+                        loop {
+                            match rx.recv().await {
+                                Ok(msg) => {
+                                    // 1. Check command ID
+                                     let cmd_matches = msg.cmd == effective_cmd
+                                         || msg.cmd == CommandType::Status as u32;
+                                    
+                                    if !cmd_matches {
+                                        continue;
+                                    }
+
+                                    // 2. Check data requirement
+                                    if has_data && msg.payload.is_empty() {
+                                        continue;
+                                    }
+
+                                    // Found matching response
+                                    return Ok(Some(msg));
+                                }
+                                Err(_) => return Err(TuyaError::Offline),
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or(Err(TuyaError::Timeout));
+
+                    let _ = resp_tx.send(wait_res);
+                } else {
+                    let _ = resp_tx.send(Ok(None));
+                }
             }
             DeviceCommand::Disconnect => {
                 debug!("Disconnect command received for device {}", self.id);

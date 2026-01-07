@@ -18,7 +18,6 @@ async fn main() {
     // Replace with actual device ID, IP address, local key, and protocol version.
     let device = DeviceBuilder::new(id2, key2)
         .address("Auto")
-        .version("3.5")
         .build();
     println!("--- Rustuya Control Example ---");
 
