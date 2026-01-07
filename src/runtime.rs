@@ -16,13 +16,13 @@ pub fn get_runtime() -> &'static Runtime {
     })
 }
 
-pub fn spawn<F>(future: F)
+pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(future);
+        handle.spawn(future)
     } else {
-        get_runtime().spawn(future);
+        get_runtime().spawn(future)
     }
 }

@@ -73,6 +73,7 @@ struct ScannerState {
     listener_started: AtomicBool,
     cancel_token: tokio_util::sync::CancellationToken,
     sockets: RwLock<HashMap<u16, Arc<UdpSocket>>>,
+    receiver_tasks: RwLock<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl ScannerState {
@@ -85,18 +86,20 @@ impl ScannerState {
             listener_started: AtomicBool::new(false),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             sockets: RwLock::new(HashMap::new()),
+            receiver_tasks: RwLock::new(Vec::new()),
         }
     }
 }
 
-impl Drop for Scanner {
+impl Drop for ScannerState {
     fn drop(&mut self) {
-        // Only stop if this is the last instance
-        if Arc::strong_count(&self.inner) <= 1 {
-            self.stop_passive_listener();
+        self.cancel_token.cancel();
+        for task in self.receiver_tasks.write().drain(..) {
+            task.abort();
         }
     }
 }
+
 
 /// Discovers Tuya devices on the local network using UDP broadcast.
 #[derive(Debug, Clone)]
@@ -186,10 +189,15 @@ impl Scanner {
             let cancel_token = state.cancel_token.clone();
             let state_weak = Arc::downgrade(&self.inner);
 
+            let (mut rx, tasks) = Self::spawn_receiver_tasks(new_sockets, cancel_token.clone());
+            {
+                let mut guard = state.receiver_tasks.write();
+                guard.extend(tasks);
+            }
+
             crate::runtime::spawn(async move {
                 debug!("Starting background passive listener task...");
 
-                let (mut rx, _ct) = Self::spawn_receiver_tasks(new_sockets, cancel_token.clone());
                 let scanner_temp = Scanner::new_silent();
                 loop {
                     tokio::select! {
@@ -232,16 +240,16 @@ impl Scanner {
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> (
         mpsc::Receiver<(Vec<u8>, SocketAddr)>,
-        Arc<tokio_util::sync::CancellationToken>,
+        Vec<tokio::task::JoinHandle<()>>,
     ) {
         let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100);
-        let ct = Arc::new(cancel_token);
+        let mut tasks = Vec::new();
 
         for socket in sockets {
             let tx = tx.clone();
             let socket = socket.clone();
-            let ct = ct.clone();
-            crate::runtime::spawn(async move {
+            let ct = cancel_token.clone();
+            let task = crate::runtime::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     tokio::select! {
@@ -259,8 +267,9 @@ impl Scanner {
                     }
                 }
             });
+            tasks.push(task);
         }
-        (rx, ct)
+        (rx, tasks)
     }
 
     fn create_udp_socket(bind_addr: &str, port: u16) -> Result<UdpSocket> {

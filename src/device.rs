@@ -224,6 +224,15 @@ pub struct Device {
     nowait: Arc<AtomicBool>,
 }
 
+impl Drop for Device {
+    fn drop(&mut self) {
+        // Only cancel if this is the last instance
+        if Arc::strong_count(&self.state) <= 1 {
+            self.cancel_token.cancel();
+        }
+    }
+}
+
 impl Device {
     pub(crate) fn with_builder(builder: DeviceBuilder) -> Self {
         let (addr, ip) = match builder.address.as_str() {
@@ -651,17 +660,14 @@ impl Device {
         }
 
         let device_clone = self.clone();
-        let connection_cancel_token = CancellationToken::new();
-        let reader_cancel_token = connection_cancel_token.clone();
         let parent_cancel_token = self.cancel_token.clone();
 
         // Reader Task
-        crate::runtime::spawn(async move {
+        let reader_task = crate::runtime::spawn(async move {
             let mut packets_received = 0;
             loop {
                 tokio::select! {
                     () = parent_cancel_token.cancelled() => break,
-                    () = reader_cancel_token.cancelled() => break,
                     res = timeout(SLEEP_INACTIVITY_TIMEOUT, read_half.read_u8()) => {
                         match res {
                             Ok(Ok(byte)) => {
@@ -732,7 +738,7 @@ impl Device {
             }
         }.await;
 
-        connection_cancel_token.cancel();
+        reader_task.abort();
         result
     }
 
@@ -1504,13 +1510,3 @@ impl Device {
     }
 }
 
-impl Drop for Device {
-    fn drop(&mut self) {
-        // If this is an external handle (has tx), and it's the last one,
-        // we signal the background task to stop.
-        // Note: The background task itself holds a clone but with tx = None.
-        if self.tx.is_some() && Arc::strong_count(&self.state) <= 2 {
-            self.cancel_token.cancel();
-        }
-    }
-}
