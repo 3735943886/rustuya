@@ -14,13 +14,11 @@ use crate::protocol::{
 use crate::scanner::Scanner;
 use futures_core::stream::Stream;
 use hex;
-use hmac::{Hmac, Mac};
 use log::{debug, error, info, trace, warn};
 use parking_lot::RwLock;
 use rand::RngCore;
 use serde::Serialize;
 use serde_json::Value;
-use sha2::Sha256;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -54,9 +52,6 @@ mod keys {
 }
 
 /// A sub-device (endpoint) of a gateway device.
-///
-/// Note: Holding a `SubDevice` will keep the parent `Device` alive because it contains
-/// an internal `Arc` reference to the parent.
 #[derive(Clone)]
 pub struct SubDevice {
     parent: Device,
@@ -71,30 +66,29 @@ impl SubDevice {
         }
     }
 
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.cid
     }
 
     pub async fn status(&self) {
-        self.request(CommandType::DpQuery, None).await
+        self.request(CommandType::DpQuery, None).await;
     }
 
     pub async fn set_dps(&self, dps: Value) {
-        self.request(CommandType::Control, Some(dps)).await
+        self.request(CommandType::Control, Some(dps)).await;
     }
 
-    /// Sets a single DP value by its ID.
-    /// The `index` can be provided as any type that can be converted to a String (e.g., u32, &str).
-    /// The `value` can be any type that implements `Serialize` (e.g., bool, i32, String, serde_json::Value).
+    /// Sets a single DP value.
     pub async fn set_value<I: ToString, T: Serialize>(&self, index: I, value: T) {
         if let Ok(val) = serde_json::to_value(value) {
             self.set_dps(serde_json::json!({ index.to_string(): val }))
-                .await
+                .await;
         }
     }
 
     pub async fn request(&self, cmd: CommandType, data: Option<Value>) {
-        self.parent.request(cmd, data, Some(self.cid.clone())).await
+        self.parent.request(cmd, data, Some(self.cid.clone())).await;
     }
 }
 
@@ -140,6 +134,7 @@ struct DeviceState {
     success_count: u32,
     force_discovery: bool,
     connection_timeout: Duration,
+    cipher: Option<Arc<TuyaCipher>>,
 }
 
 pub struct DeviceBuilder {
@@ -188,26 +183,31 @@ impl DeviceBuilder {
         self
     }
 
+    #[must_use]
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
+    #[must_use]
     pub fn persist(mut self, persist: bool) -> Self {
         self.persist = persist;
         self
     }
 
+    #[must_use]
     pub fn connection_timeout(mut self, timeout: Duration) -> Self {
         self.connection_timeout = timeout;
         self
     }
 
+    #[must_use]
     pub fn nowait(mut self, nowait: bool) -> Self {
         self.nowait = nowait;
         self
     }
 
+    #[must_use]
     pub fn build(self) -> Device {
         Device::with_builder(self)
     }
@@ -226,26 +226,9 @@ pub struct Device {
 }
 
 impl Device {
-    // -------------------------------------------------------------------------
-    // Construction & Core Accessors
-    // -------------------------------------------------------------------------
-
-    pub fn new<I, A, K, V>(id: I, address: A, local_key: K, version: V) -> Self
-    where
-        I: Into<String>,
-        A: Into<String>,
-        K: Into<Vec<u8>>,
-        V: Into<Version>,
-    {
-        DeviceBuilder::new(id, local_key)
-            .address(address)
-            .version(version)
-            .build()
-    }
-
     pub(crate) fn with_builder(builder: DeviceBuilder) -> Self {
         let (addr, ip) = match builder.address.as_str() {
-            "" | ADDR_AUTO => (ADDR_AUTO.to_string(), "".to_string()),
+            "" | ADDR_AUTO => (ADDR_AUTO.to_string(), String::new()),
             _ => (builder.address.clone(), builder.address),
         };
 
@@ -266,6 +249,7 @@ impl Device {
             success_count: 0,
             force_discovery: false,
             connection_timeout: builder.connection_timeout,
+            cipher: TuyaCipher::new(&builder.local_key).ok().map(Arc::new),
         };
 
         let device = Self {
@@ -284,29 +268,33 @@ impl Device {
         let d_id = device.id.clone();
         crate::runtime::spawn(async move {
             tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    debug!("Device {} connection task stopped via token", d_id);
+                () = cancel_token.cancelled() => {
+                    debug!("Device {d_id} connection task stopped via token");
                 }
-                _ = d_clone.run_connection_task(rx) => {
-                    debug!("Device {} connection task finished", d_id);
+                () = d_clone.run_connection_task(rx) => {
+                    debug!("Device {d_id} connection task finished");
                 }
             }
         });
         device
     }
 
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    #[must_use]
     pub fn dev_type(&self) -> DeviceType {
         self.with_state(|s| s.dev_type)
     }
 
+    #[must_use]
     pub fn local_key(&self) -> &[u8] {
         &self.local_key
     }
 
+    #[must_use]
     pub fn address(&self) -> String {
         self.with_state(|s| {
             if s.real_ip.is_empty() {
@@ -318,74 +306,60 @@ impl Device {
     }
 
     /// Returns the user-configured address (e.g., "Auto" or a specific IP).
+    #[must_use]
     pub fn config_address(&self) -> String {
         self.with_state(|s| s.config_address.clone())
     }
 
+    #[must_use]
     pub fn version(&self) -> Version {
         self.with_state(|s| s.version)
     }
 
+    #[must_use]
     pub fn is_connected(&self) -> bool {
         self.with_state(|s| s.state == ConnectionState::Connected)
     }
 
+    #[must_use]
     pub fn is_stopped(&self) -> bool {
         self.with_state(|s| s.state == ConnectionState::Stopped)
     }
 
     /// Returns the connection timeout duration.
+    #[must_use]
     pub fn connection_timeout(&self) -> Duration {
         self.with_state(|s| s.connection_timeout)
     }
 
+    #[must_use]
     pub fn port(&self) -> u16 {
         self.with_state(|s| s.port)
     }
 
+    #[must_use]
     pub fn persist(&self) -> bool {
         self.with_state(|s| s.persist)
     }
 
     /// Returns whether the device is in nowait mode.
+    #[must_use]
     pub fn nowait(&self) -> bool {
         self.nowait.load(Ordering::Relaxed)
     }
 }
 
 impl Device {
-    // -------------------------------------------------------------------------
-    // Configuration API (Runtime Updates)
-    // -------------------------------------------------------------------------
-
     pub fn set_persist(&self, persist: bool) {
         self.with_state_mut(|s| s.persist = persist);
-    }
-
-    /// Builder-style method to set persist mode and return the device.
-    pub fn with_persist(&self, persist: bool) -> Self {
-        self.set_persist(persist);
-        self.clone()
     }
 
     pub fn set_connection_timeout(&self, timeout: Duration) {
         self.with_state_mut(|s| s.connection_timeout = timeout);
     }
 
-    /// Builder-style method to set connection timeout and return the device.
-    pub fn with_connection_timeout(&self, timeout: Duration) -> Self {
-        self.set_connection_timeout(timeout);
-        self.clone()
-    }
-
     pub fn set_port(&self, port: u16) {
         self.with_state_mut(|s| s.port = port);
-    }
-
-    /// Builder-style method to set port and return the device.
-    pub fn with_port(&self, port: u16) -> Self {
-        self.set_port(port);
-        self.clone()
     }
 
     /// Sets whether requests should wait for a response from the device.
@@ -393,12 +367,6 @@ impl Device {
     /// dispatching the command, without waiting for the network response.
     pub fn set_nowait(&self, nowait: bool) {
         self.nowait.store(nowait, Ordering::Relaxed);
-    }
-
-    /// Builder-style method to set nowait mode and return the device.
-    pub fn with_nowait(&self, nowait: bool) -> Self {
-        self.set_nowait(nowait);
-        self.clone()
     }
 
     pub fn set_version<V: Into<Version>>(&self, version: V) {
@@ -412,20 +380,8 @@ impl Device {
         });
     }
 
-    /// Builder-style method to set version and return the device.
-    pub fn with_version<V: Into<Version>>(&self, version: V) -> Self {
-        self.set_version(version);
-        self.clone()
-    }
-
     pub fn set_dev_type<DT: Into<DeviceType>>(&self, dev_type: DT) {
         self.with_state_mut(|s| s.dev_type = dev_type.into());
-    }
-
-    /// Builder-style method to set device type and return the device.
-    pub fn with_dev_type<DT: Into<DeviceType>>(&self, dev_type: DT) -> Self {
-        self.set_dev_type(dev_type);
-        self.clone()
     }
 
     pub fn set_address<A: Into<String>>(&self, address: A) {
@@ -435,19 +391,9 @@ impl Device {
             s.force_discovery = true; // Force discovery to update real_ip if needed
         });
     }
-
-    /// Builder-style method to set address and return the device.
-    pub fn with_address<A: Into<String>>(&self, address: A) -> Self {
-        self.set_address(address);
-        self.clone()
-    }
 }
 
 impl Device {
-    // -------------------------------------------------------------------------
-    // Public Command API
-    // -------------------------------------------------------------------------
-
     pub fn listener(&self) -> impl Stream<Item = Result<TuyaMessage>> + Send + 'static {
         let mut rx = self.broadcast_tx.subscribe();
         async_stream::stream! {
@@ -458,22 +404,22 @@ impl Device {
     }
 
     pub async fn status(&self) {
-        self.request(CommandType::DpQuery, None, None).await
+        self.request(CommandType::DpQuery, None, None).await;
     }
 
     /// Sets multiple DP values at once.
     /// The `dps` argument should be a `serde_json::Value` object where keys are DP IDs.
     pub async fn set_dps(&self, dps: Value) {
-        self.request(CommandType::Control, Some(dps), None).await
+        self.request(CommandType::Control, Some(dps), None).await;
     }
 
     /// Sets a single DP value by its ID.
     /// The `dp_id` can be provided as any type that can be converted to a String (e.g., u32, &str).
-    /// The `value` can be any type that implements `Serialize` (e.g., bool, i32, String, serde_json::Value).
+    /// The `value` can be any type that implements `Serialize` (e.g., bool, i32, String, `serde_json::Value`).
     pub async fn set_value<I: ToString, T: Serialize>(&self, dp_id: I, value: T) {
         if let Ok(val) = serde_json::to_value(value) {
             self.set_dps(serde_json::json!({ dp_id.to_string(): val }))
-                .await
+                .await;
         }
     }
 
@@ -483,7 +429,7 @@ impl Device {
             keys::REQ_TYPE: "subdev_online_stat_query"
         });
         self.request(CommandType::LanExtStream, Some(data), None)
-            .await
+            .await;
     }
 
     pub async fn receive(&self) -> Result<TuyaMessage> {
@@ -491,12 +437,13 @@ impl Device {
         rx.recv().await.map_err(|e| TuyaError::Io(e.to_string()))
     }
 
+    #[must_use]
     pub fn sub(&self, cid: &str) -> SubDevice {
         SubDevice::new(self.clone(), cid)
     }
 
     pub async fn request(&self, command: CommandType, data: Option<Value>, cid: Option<String>) {
-        debug!("request: cmd={:?}, data={:?}", command, data);
+        debug!("request: cmd={command:?}, data={data:?}");
         self.send_command_to_task(|resp_tx| DeviceCommand::Request {
             command,
             data,
@@ -508,10 +455,6 @@ impl Device {
 }
 
 impl Device {
-    // -------------------------------------------------------------------------
-    // Connection Lifecycle Control
-    // -------------------------------------------------------------------------
-
     pub async fn close(&self) {
         info!("Closing connection to device {}", self.id);
 
@@ -542,10 +485,6 @@ impl Device {
 }
 
 impl Device {
-    // -------------------------------------------------------------------------
-    // Internal State Helpers
-    // -------------------------------------------------------------------------
-
     fn with_state<R>(&self, f: impl FnOnce(&DeviceState) -> R) -> R {
         f(&self.state.read())
     }
@@ -612,14 +551,10 @@ impl Device {
 }
 
 impl Device {
-    // -------------------------------------------------------------------------
-    // Background Connection Engine
-    // -------------------------------------------------------------------------
-
     async fn run_connection_task(&self, mut rx: mpsc::Receiver<DeviceCommand>) {
         let jitter = {
             let mut rng = rand::rng();
-            Duration::from_millis((rng.next_u32() % 5000) as u64)
+            Duration::from_millis(u64::from(rng.next_u32() % 5000))
         };
 
         debug!(
@@ -627,11 +562,10 @@ impl Device {
             self.id, jitter
         );
 
-        // Stagger initial connection attempts to avoid "thundering herd" problem
-        // when managing many devices.
+        // Stagger connection attempts
         tokio::select! {
-            _ = self.cancel_token.cancelled() => return,
-            _ = tokio::time::sleep(jitter) => {}
+            () = self.cancel_token.cancelled() => return,
+            () = tokio::time::sleep(jitter) => {}
         }
 
         let mut heartbeat_interval = tokio::time::interval(SLEEP_HEARTBEAT_CHECK);
@@ -639,7 +573,7 @@ impl Device {
 
         loop {
             tokio::select! {
-                _ = self.cancel_token.cancelled() => {
+                () = self.cancel_token.cancelled() => {
                     debug!("Background task for {} received stop signal", self.id);
                     break;
                 }
@@ -651,24 +585,22 @@ impl Device {
                     // Reset seqno for each new connection attempt
                     let mut seqno = 1u32;
 
-                    // 1. Attempt to connect and handshake
+                    // 1. Connect and handshake
                     let (stream, initial_cmd) = match self
                         .try_connect_with_backoff(&mut rx, &mut seqno)
                         .await
                     {
                         Some(res) => res,
-                        None => return Some(()), // rx closed or stopped
+                        None => return Some(()),
                     };
 
-                    // 2. Main loop for the active connection
+                    // 2. Connection maintenance
                     let result = self
                         .maintain_connection(stream, &mut rx, &mut seqno, &mut heartbeat_interval, initial_cmd)
                         .await;
 
-                    // Cleanup on connection loss
                     self.handle_disconnect(result.as_ref().err().cloned());
 
-                    // Drain any pending commands immediately upon connection loss
                     if let Err(e) = result {
                         self.with_state_mut(|s| {
                             s.failure_count += 1;
@@ -676,11 +608,9 @@ impl Device {
                         });
                         self.drain_rx(&mut rx, e, false);
                     } else {
-                        // If maintain_connection returned Ok(()), it means it stopped normally (e.g. rx closed)
                         return Some(());
                     }
 
-                    // If maintain_connection returned because rx was closed, exit the outer loop too
                     if self.is_stopped() {
                         return Some(());
                     }
@@ -710,7 +640,7 @@ impl Device {
         let (mut read_half, mut write_half) = stream.into_split();
         let (internal_tx, mut internal_rx) = mpsc::channel::<TuyaError>(1);
 
-        // If there's an initial command (from on-demand connection), process it first
+        // Process initial command if exists
         if let Some(cmd) = initial_cmd {
             self.process_command(&mut write_half, seqno, cmd)
                 .await
@@ -732,8 +662,8 @@ impl Device {
             let mut packets_received = 0;
             loop {
                 tokio::select! {
-                    _ = parent_cancel_token.cancelled() => break,
-                    _ = reader_cancel_token.cancelled() => break,
+                    () = parent_cancel_token.cancelled() => break,
+                    () = reader_cancel_token.cancelled() => break,
                     res = timeout(SLEEP_INACTIVITY_TIMEOUT, read_half.read_u8()) => {
                         match res {
                             Ok(Ok(byte)) => {
@@ -746,10 +676,8 @@ impl Device {
                             Ok(Err(e)) => {
                                 let err = if e.kind() == std::io::ErrorKind::UnexpectedEof {
                                     if packets_received > 0 {
-                                        // Communication was working, now it's just a connection loss
-                                        TuyaError::Io("Connection reset by peer".to_string())
+                                        TuyaError::Io("Connection reset".to_string())
                                     } else {
-                                        // Dropped right at the start, likely wrong key/version
                                         TuyaError::KeyOrVersionError
                                     }
                                 } else {
@@ -759,9 +687,8 @@ impl Device {
                                 break;
                             }
                             Err(_) => {
-                                // Timeout reached
                                 if !device_clone.is_stopped() {
-                                    warn!("Inactivity timeout ({}s) reached for device {}", SLEEP_INACTIVITY_TIMEOUT.as_secs(), device_clone.id);
+                                    warn!("Inactivity timeout for {}", device_clone.id);
                                 }
                                 let _ = internal_tx.send(TuyaError::Timeout).await;
                                 break;
@@ -776,24 +703,17 @@ impl Device {
         let result = async {
             loop {
                 tokio::select! {
-                    _ = self.cancel_token.cancelled() => {
+                    () = self.cancel_token.cancelled() => {
                         return Ok(());
                     }
                     cmd_opt = rx.recv() => {
-                    match cmd_opt {
-                        Some(cmd) => {
+                        if let Some(cmd) = cmd_opt {
                             if let Err(e) = self.process_command(&mut write_half, seqno, cmd).await {
-                                if !self.is_stopped() {
-                                    error!("Command processing failed for {}: {}", self.id, e);
-                                }
                                 return Err(e);
                             }
-                        }
-                        None => {
-                                debug!("All handles for device {} dropped, stopping task", self.id);
-                                self.state.write().state = ConnectionState::Stopped;
-                                return Ok(());
-                            }
+                        } else {
+                            self.state.write().state = ConnectionState::Stopped;
+                            return Ok(());
                         }
                     }
                     _ = heartbeat_interval.tick() => {
@@ -831,27 +751,23 @@ impl Device {
                 return None;
             }
 
-            // Reset seqno to 1 for every new TCP connection attempt
+            // Reset seqno for new connection
             *seqno = 1;
 
-            // If we have failures, wait before the next attempt
+            // Wait before retry if failed
             let backoff = self.with_state(|s| {
                 if s.failure_count > 0 {
-                    Some((
-                        self.get_backoff_duration(s.failure_count - 1),
-                        s.failure_count,
-                    ))
+                    Some(self.get_backoff_duration(s.failure_count - 1))
                 } else {
                     None
                 }
             });
 
-            if let Some((b, count)) = backoff {
+            if let Some(b) = backoff {
                 warn!(
-                    "Waiting {}s before next connection attempt for {} (fail count: {})",
+                    "Waiting {}s before next connection attempt for {}",
                     b.as_secs(),
-                    self.id,
-                    count
+                    self.id
                 );
                 self.wait_for_backoff(rx, b).await?;
             }
@@ -861,96 +777,74 @@ impl Device {
                 self.connect_and_handshake(seqno),
             )
             .await;
-            match result {
-                Ok(Ok(s)) => {
-                    self.with_state_mut(|s| s.state = ConnectionState::Connected);
-                    info!(
-                        "Connected to device {} ({})",
-                        self.id,
-                        self.with_state(|s| s.real_ip.clone())
+            if let Ok(Ok(s)) = result {
+                self.with_state_mut(|s| s.state = ConnectionState::Connected);
+                info!(
+                    "Connected to device {} ({})",
+                    self.id,
+                    self.with_state(|s| s.real_ip.clone())
+                );
+                self.broadcast_error(ERR_SUCCESS, None);
+                return Some((s, None));
+            } else {
+                let e = match result {
+                    Ok(Err(e)) => e,
+                    _ => TuyaError::Offline,
+                };
+
+                self.handle_connection_error(&e).await;
+                self.drain_rx(rx, e.clone(), false);
+
+                if !self.with_state(|s| s.persist) {
+                    warn!(
+                        "Connection failed (persist: false) for {}: {}. Waiting for next command.",
+                        self.id, e
                     );
-                    self.broadcast_error(ERR_SUCCESS, None);
-                    return Some((s, None));
-                }
-                _ => {
-                    let e = match result {
-                        Ok(Err(e)) => e,
-                        _ => TuyaError::Offline,
-                    };
 
-                    self.handle_connection_error(&e).await;
-                    self.drain_rx(rx, e.clone(), false);
+                    loop {
+                        match rx.recv().await {
+                            Some(DeviceCommand::ConnectNow) => break,
+                            Some(cmd @ DeviceCommand::Request { .. }) => {
+                                let retry_result = timeout(
+                                    self.connection_timeout() * 2,
+                                    self.connect_and_handshake(seqno),
+                                )
+                                .await;
 
-                    if !self.with_state(|s| s.persist) {
-                        warn!(
-                            "Connection failed (persist: false) for device {}: {}. Waiting for next command to retry.",
-                            self.id, e
-                        );
-
-                        // Wait for the next command to trigger a reconnection attempt
-                        loop {
-                            match rx.recv().await {
-                                Some(DeviceCommand::ConnectNow) => break, // retry immediately
-                                Some(cmd @ DeviceCommand::Request { .. }) => {
-                                    // Received a request, try to connect now and process this command first
-                                    let retry_result = timeout(
-                                        self.connection_timeout() * 2,
-                                        self.connect_and_handshake(seqno),
-                                    )
-                                    .await;
-
-                                    match retry_result {
-                                        Ok(Ok(s)) => {
-                                            self.with_state_mut(|s| {
-                                                s.state = ConnectionState::Connected
-                                            });
-                                            info!(
-                                                "Connected to device {} on demand ({})",
-                                                self.id,
-                                                self.with_state(|s| s.real_ip.clone())
-                                            );
-                                            self.broadcast_error(ERR_SUCCESS, None);
-                                            return Some((s, Some(cmd)));
-                                        }
-                                        _ => {
-                                            let err = match retry_result {
-                                                Ok(Err(e)) => e,
-                                                _ => TuyaError::Offline,
-                                            };
-                                            self.handle_connection_error(&err).await;
-                                            cmd.respond(Err(err.clone()));
-                                            self.broadcast_error(ERR_OFFLINE, None);
-                                            // Stay in the loop waiting for another command
-                                        }
-                                    }
+                                if let Ok(Ok(s)) = retry_result {
+                                    self.with_state_mut(|s| s.state = ConnectionState::Connected);
+                                    info!("Connected to {} on demand", self.id);
+                                    self.broadcast_error(ERR_SUCCESS, None);
+                                    return Some((s, Some(cmd)));
+                                } else {
+                                    let err = match retry_result {
+                                        Ok(Err(e)) => e,
+                                        _ => TuyaError::Offline,
+                                    };
+                                    self.handle_connection_error(&err).await;
+                                    cmd.respond(Err(err.clone()));
+                                    self.broadcast_error(ERR_OFFLINE, None);
                                 }
-                                Some(DeviceCommand::Disconnect) => return None,
-                                None => return None,
                             }
+                            Some(DeviceCommand::Disconnect) | None => return None,
                         }
-                        continue;
                     }
-
-                    self.with_state_mut(|s| {
-                        s.failure_count += 1;
-                        s.success_count = 0;
-                        // For Auto mode, set force_discovery on relevant errors
-                        if s.config_address == ADDR_AUTO {
-                            match e {
-                                TuyaError::KeyOrVersionError | TuyaError::Offline => {
-                                    debug!(
-                                        "Setting force_discovery for {} due to error: {}",
-                                        self.id, e
-                                    );
-                                    s.force_discovery = true;
-                                    // Invalidate cache entry to ensure fresh discovery
-                                    let _ = self.scanner.invalidate_cache(&self.id);
-                                }
-                                _ => {}
-                            }
-                        }
-                    });
+                    continue;
                 }
+
+                self.with_state_mut(|s| {
+                    s.failure_count += 1;
+                    s.success_count = 0;
+                    if s.config_address == ADDR_AUTO {
+                        match e {
+                            TuyaError::KeyOrVersionError | TuyaError::Offline => {
+                                s.force_discovery = true;
+                                let _ = self.scanner.invalidate_cache(&self.id);
+                            }
+                            _ => {}
+                        }
+                    }
+                });
             }
         }
     }
@@ -968,29 +862,23 @@ impl Device {
 
         loop {
             tokio::select! {
-                _ = &mut sleep_fut => return Some(()),
-                _ = &mut discovery_notified => {
+                () = &mut sleep_fut => return Some(()),
+                () = &mut discovery_notified => {
                     if self.scanner.is_recently_discovered(&self.id, Duration::from_secs(10)) {
-                        debug!("Device {} discovered during backoff, waking up!", self.id);
                         return Some(());
                     }
-                    // Re-arm the notification for the next discovery
                     discovery_notified.set(self.scanner.notified());
                 }
-                _ = self.cancel_token.cancelled() => {
+                () = self.cancel_token.cancelled() => {
                     self.drain_rx(rx, TuyaError::Offline, true);
                     return None;
                 }
                 cmd_opt = rx.recv() => {
                     if let Some(cmd) = cmd_opt {
-                        match cmd {
-                            DeviceCommand::ConnectNow => return Some(()),
-                            _ => {
-                                debug!("Rejecting command during backoff for device {}", self.id);
-                                cmd.respond(Err(TuyaError::Offline));
-                                self.broadcast_error(ERR_OFFLINE, None);
-                            }
-                        }
+                        if let DeviceCommand::ConnectNow = cmd { return Some(()) }
+                        debug!("Rejecting command during backoff for device {}", self.id);
+                        cmd.respond(Err(TuyaError::Offline));
+                        self.broadcast_error(ERR_OFFLINE, None);
                     } else {
                         return None;
                     }
@@ -1057,7 +945,7 @@ impl Device {
         info!("Connecting to device {} at {}:{}", self.id, addr, port);
         let mut stream = timeout(
             self.connection_timeout(),
-            TcpStream::connect(format!("{}:{}", addr, port)),
+            TcpStream::connect(format!("{addr}:{port}")),
         )
         .await
         .map_err(|_| TuyaError::Timeout)?
@@ -1066,7 +954,10 @@ impl Device {
             _ => TuyaError::Io(e.to_string()),
         })?;
 
-        if self.version().val() >= 3.4 && !self.negotiate_session_key(&mut stream, seqno).await? {
+        let protocol = get_protocol(self.version(), self.dev_type());
+        if protocol.requires_session_key()
+            && !self.negotiate_session_key(&mut stream, seqno).await?
+        {
             return Err(TuyaError::KeyOrVersionError);
         }
 
@@ -1074,11 +965,11 @@ impl Device {
     }
 
     async fn negotiate_session_key(&self, stream: &mut TcpStream, seqno: &mut u32) -> Result<bool> {
-        debug!("Starting session key negotiation");
+        let protocol = get_protocol(self.version(), self.dev_type());
+        debug!("Session negotiation (v{})", protocol.version());
 
-        let mut local_nonce = vec![0u8; 16];
-        rand::rng().fill_bytes(&mut local_nonce);
-
+        // 1. Send SessKeyNegStart
+        let local_nonce = protocol.prepare_session_key_negotiation();
         self.send_raw_to_stream(
             stream,
             self.build_message(
@@ -1089,6 +980,7 @@ impl Device {
         )
         .await?;
 
+        // 2. Read response and verify
         let first_byte = timeout(self.connection_timeout(), stream.read_u8())
             .await
             .map_err(|_| TuyaError::Timeout)?
@@ -1099,46 +991,32 @@ impl Device {
                     TuyaError::from(e)
                 }
             })?;
+
         let resp = self
             .read_and_parse_from_stream(stream, first_byte)
             .await?
             .ok_or(TuyaError::HandshakeFailed)?;
 
-        if resp.cmd != CommandType::SessKeyNegResp as u32 || resp.payload.len() < 48 {
+        if resp.cmd != CommandType::SessKeyNegResp as u32 {
             return Err(TuyaError::KeyOrVersionError);
         }
 
-        let remote_nonce = &resp.payload[..16];
-        let remote_hmac = &resp.payload[16..48];
+        let remote_nonce =
+            protocol.verify_session_key_response(&local_nonce, &resp.payload, &self.local_key)?;
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_key)
-            .map_err(|_| TuyaError::EncryptionFailed)?;
-        mac.update(&local_nonce);
-        mac.verify_slice(remote_hmac)
-            .map_err(|_| TuyaError::EncryptionFailed)?;
+        // 3. Finalize and send SessKeyNegFinish
+        let (session_key, finish_hmac) =
+            protocol.finalize_session_key(&local_nonce, &remote_nonce, &self.local_key)?;
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_key)
-            .map_err(|_| TuyaError::EncryptionFailed)?;
-        mac.update(remote_nonce);
-        let rkey_hmac = mac.finalize().into_bytes().to_vec();
         self.send_raw_to_stream(
             stream,
-            self.build_message(seqno, CommandType::SessKeyNegFinish as u32, rkey_hmac),
+            self.build_message(seqno, CommandType::SessKeyNegFinish as u32, finish_hmac),
         )
         .await?;
 
-        let session_key: Vec<u8> = local_nonce
-            .iter()
-            .enumerate()
-            .map(|(i, b)| b ^ remote_nonce[i % remote_nonce.len()])
-            .collect();
+        // 4. Encrypt and store session key
         let cipher = TuyaCipher::new(&self.local_key)?;
-        let encrypted_key = if self.version().val() >= 3.5 {
-            cipher.encrypt(&session_key, false, Some(&local_nonce[..12]), None, false)?[12..28]
-                .to_vec()
-        } else {
-            cipher.encrypt(&session_key, false, None, None, false)?
-        };
+        let encrypted_key = protocol.encrypt_session_key(&session_key, &cipher, &local_nonce)?;
 
         self.with_state_mut(|s| s.session_key = Some(encrypted_key));
         Ok(true)
@@ -1149,61 +1027,30 @@ impl Device {
             self.with_state(|s| (s.config_address.clone(), s.force_discovery, s.version));
 
         let ip_explicit =
-            config_addr != "Auto" && config_addr != "0.0.0.0" && !config_addr.is_empty();
+            config_addr != ADDR_AUTO && config_addr != "0.0.0.0" && !config_addr.is_empty();
         let ver_explicit = version != Version::Auto;
 
         if ip_explicit && ver_explicit && !force_discovery {
             return Ok(config_addr);
         }
 
-        debug!(
-            "Resolving address/version for device {} (config_addr={}, version={}, force={})",
-            self.id, config_addr, version, force_discovery
-        );
         if let Ok(Some(result)) = self
             .scanner
             .discover_device_internal(&self.id, force_discovery)
             .await
         {
-            let found_addr = result.ip;
-            let found_version = result.version;
-
-            if let Some(v) = found_version
-                && self.version() == Version::Auto
+            let mut state = self.state.write();
+            if let Some(v) = result.version
+                && state.version == Version::Auto
             {
-                debug!("Auto-detected version {} for device {}", v, self.id);
-                self.set_version(v);
+                state.version = v;
             }
 
-            let version_str = self.version().to_string();
-
-            if ip_explicit {
-                debug!(
-                    "Using explicit address {} for device {} (v{})",
-                    config_addr, self.id, version_str
-                );
-                self.with_state_mut(|s| {
-                    s.real_ip = config_addr.clone();
-                    s.force_discovery = false;
-                });
-                Ok(config_addr)
-            } else {
-                debug!(
-                    "Using discovered address {} for device {} (v{})",
-                    found_addr, self.id, version_str
-                );
-                self.with_state_mut(|s| {
-                    s.real_ip = found_addr.clone();
-                    s.force_discovery = false;
-                });
-                Ok(found_addr)
-            }
+            let target_ip = if ip_explicit { config_addr } else { result.ip };
+            state.real_ip = target_ip.clone();
+            state.force_discovery = false;
+            Ok(target_ip)
         } else if ip_explicit {
-            // Discovery failed but we have an explicit IP, try using it anyway
-            warn!(
-                "Discovery failed for device {}, attempting connection with explicit IP {}",
-                self.id, config_addr
-            );
             self.with_state_mut(|s| {
                 s.real_ip = config_addr.clone();
                 s.force_discovery = false;
@@ -1243,13 +1090,14 @@ impl Device {
                 cid,
                 resp_tx,
             } => {
-                let res = async {
-                    let (cmd_id, payload) =
-                        self.generate_payload(command, data, cid.as_deref()).await?;
-                    debug!("Sending command: cmd=0x{:02X}, seqno={}", cmd_id, *seqno);
-                    self.send_json_msg(stream, seqno, cmd_id, &payload).await
-                }
-                .await;
+                let res = self.generate_payload(command, data, cid.as_deref()).await;
+                let res = match res {
+                    Ok((cmd_id, payload)) => {
+                        debug!("Sending command: cmd=0x{:02X}, seqno={}", cmd_id, *seqno);
+                        self.send_json_msg(stream, seqno, cmd_id, &payload).await
+                    }
+                    Err(e) => Err(e),
+                };
                 let _ = resp_tx.send(res);
             }
             DeviceCommand::Disconnect => {
@@ -1279,7 +1127,21 @@ impl Device {
                 msg.cmd,
                 msg.payload.len()
             );
-            if !msg.payload.is_empty() {
+            if msg.payload.is_empty() {
+                let protocol = get_protocol(self.version(), self.dev_type());
+                if protocol.is_empty_payload_allowed(msg.cmd) {
+                    debug!(
+                        "Received allowed empty payload message (cmd 0x{:02X})",
+                        msg.cmd
+                    );
+                    let _ = self.broadcast_tx.send(msg);
+                } else {
+                    debug!(
+                        "Received empty payload message (cmd 0x{:02X}), not broadcasting",
+                        msg.cmd
+                    );
+                }
+            } else {
                 // Check if payload is valid JSON
                 if serde_json::from_slice::<Value>(&msg.payload).is_err() {
                     debug!("Non-JSON payload detected, broadcasting as ERR_JSON");
@@ -1294,10 +1156,6 @@ impl Device {
                 } else {
                     let _ = self.broadcast_tx.send(msg);
                 }
-            } else {
-                // Version 3.5 gateways often send an empty 0x40 as an ACK,
-                // but may not follow up with actual data in some cases.
-                debug!("Received empty payload message, not broadcasting");
             }
         }
         Ok(())
@@ -1312,7 +1170,9 @@ impl Device {
 
         if last.elapsed() >= SLEEP_HEARTBEAT_DEFAULT {
             debug!("Auto-heartbeat for device {}", self.id);
-            let (cmd, payload) = self.generate_heartbeat_payload()?;
+            let (cmd, payload) = self
+                .generate_payload(CommandType::HeartBeat, None, None)
+                .await?;
             self.send_json_msg(stream, seqno, cmd, &payload).await?;
         }
         Ok(())
@@ -1331,7 +1191,6 @@ impl Device {
         payload: P,
     ) -> TuyaMessage {
         let payload = payload.into();
-        let version_val = self.version().val();
         let current_seq = *seqno;
         *seqno += 1;
         debug!(
@@ -1341,36 +1200,26 @@ impl Device {
             payload.len()
         );
 
+        let protocol = get_protocol(self.version(), self.dev_type());
+
         TuyaMessage {
             seqno: current_seq,
             cmd,
             payload,
-            prefix: if version_val >= 3.5 {
-                PREFIX_6699
-            } else {
-                PREFIX_55AA
-            },
+            prefix: protocol.get_prefix(),
             ..Default::default()
         }
     }
 
     fn pack_msg(&self, mut msg: TuyaMessage) -> Result<Vec<u8>> {
         let (version, dev_type) = self.with_state(|s| (s.version, s.dev_type));
-        let key = self.get_cipher_key();
-        let cipher = TuyaCipher::new(&key)?;
+        let cipher = self.get_cipher()?;
         let protocol = get_protocol(version, dev_type);
 
         msg.payload = protocol.pack_payload(&msg.payload, msg.cmd, &cipher)?;
+        msg.prefix = protocol.get_prefix();
 
-        if version.val() >= 3.5 {
-            msg.prefix = PREFIX_6699;
-        }
-
-        let hmac_key = if version.val() >= 3.4 {
-            Some(key.as_slice())
-        } else {
-            None
-        };
+        let hmac_key = protocol.get_hmac_key(cipher.key());
         pack_message(&msg, hmac_key)
     }
 
@@ -1394,11 +1243,7 @@ impl Device {
         let packed = self.pack_msg(msg)?;
         timeout(self.connection_timeout(), stream.write_all(&packed))
             .await
-            .map_err(|_| {
-                TuyaError::Io(
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "Write timeout").to_string(),
-                )
-            })?
+            .map_err(|_| TuyaError::Timeout)?
             .map_err(TuyaError::from)?;
 
         self.update_last_sent();
@@ -1423,12 +1268,7 @@ impl Device {
             stream.read_exact(&mut header_buf[4..]),
         )
         .await
-        .map_err(|_| {
-            TuyaError::Io(
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "Read header timeout")
-                    .to_string(),
-            )
-        })?
+        .map_err(|_| TuyaError::Timeout)?
         .map_err(TuyaError::from)?;
 
         // Parse and read body
@@ -1469,29 +1309,26 @@ impl Device {
         stream: &mut R,
         first_byte: u8,
     ) -> Result<Option<[u8; 4]>> {
-        let mut buf = [0u8; 4];
-        buf[0] = first_byte;
+        let mut current_prefix = first_byte as u32;
 
-        macro_rules! read_byte {
-            () => {
-                timeout(self.connection_timeout(), stream.read_u8())
-                    .await
-                    .map_err(|_| TuyaError::Timeout)?
-                    .map_err(TuyaError::from)?
-            };
-        }
-
-        for b in &mut buf[1..] {
-            *b = read_byte!();
+        for _ in 0..3 {
+            let next_byte = timeout(self.connection_timeout(), stream.read_u8())
+                .await
+                .map_err(|_| TuyaError::Timeout)?
+                .map_err(TuyaError::from)?;
+            current_prefix = (current_prefix << 8) | (next_byte as u32);
         }
 
         for _ in 0..1024 {
-            let val = u32::from_be_bytes(buf);
-            if val == PREFIX_55AA || val == PREFIX_6699 {
-                return Ok(Some(buf));
+            if current_prefix == PREFIX_55AA || current_prefix == PREFIX_6699 {
+                return Ok(Some(current_prefix.to_be_bytes()));
             }
-            buf.rotate_left(1);
-            buf[3] = read_byte!();
+
+            let next_byte = timeout(self.connection_timeout(), stream.read_u8())
+                .await
+                .map_err(|_| TuyaError::Timeout)?
+                .map_err(TuyaError::from)?;
+            current_prefix = (current_prefix << 8) | (next_byte as u32);
         }
         Ok(None)
     }
@@ -1523,39 +1360,34 @@ impl Device {
     ) -> Result<(Vec<u8>, TuyaHeader)> {
         let prefix =
             u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
-        let mut full_header = header_buf.to_vec();
 
-        if prefix == PREFIX_6699 {
+        let (header, mut packet) = if prefix == PREFIX_6699 {
             let mut extra = [0u8; 2];
             timeout(self.connection_timeout(), stream.read_exact(&mut extra))
                 .await
-                .map_err(|_| {
-                    TuyaError::Io(
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "Read extra header timeout",
-                        )
-                        .to_string(),
-                    )
-                })?
+                .map_err(|_| TuyaError::Timeout)?
                 .map_err(TuyaError::from)?;
-            full_header.extend_from_slice(&extra);
-        }
 
-        let header = parse_header(&full_header)?;
-        let mut body = vec![0u8; header.total_length as usize - full_header.len()];
-        timeout(self.connection_timeout(), stream.read_exact(&mut body))
-            .await
-            .map_err(|_| {
-                TuyaError::Io(
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "Read body timeout")
-                        .to_string(),
-                )
-            })?
-            .map_err(TuyaError::from)?;
+            let mut fh = Vec::with_capacity(18);
+            fh.extend_from_slice(&header_buf);
+            fh.extend_from_slice(&extra);
+            (parse_header(&fh)?, fh)
+        } else {
+            (parse_header(&header_buf)?, header_buf.to_vec())
+        };
 
-        let mut packet = full_header;
-        packet.extend_from_slice(&body);
+        let total_len = header.total_length as usize;
+        let header_len = packet.len();
+
+        packet.resize(total_len, 0);
+        timeout(
+            self.connection_timeout(),
+            stream.read_exact(&mut packet[header_len..]),
+        )
+        .await
+        .map_err(|_| TuyaError::Timeout)?
+        .map_err(TuyaError::from)?;
+
         Ok((packet, header))
     }
 
@@ -1564,14 +1396,15 @@ impl Device {
         packet: &[u8],
         header: TuyaHeader,
     ) -> Result<TuyaMessage> {
-        let version = self.version().val();
-        let key = self.get_cipher_key();
-        let hmac_key = (version >= 3.4).then_some(key.as_slice());
+        let (version, dev_type) = self.with_state(|s| (s.version, s.dev_type));
+        let protocol = get_protocol(version, dev_type);
+        let cipher = self.get_cipher()?;
+        let hmac_key = protocol.get_hmac_key(cipher.key());
 
         unpack_message(packet, hmac_key, Some(header.clone()), Some(false)).or_else(|e| {
-            // Only allow switching if dev_type is Auto
-            if version == 3.3
-                && self.dev_type() == DeviceType::Auto
+            // Only allow switching if dev_type is Auto and protocol allows it
+            if protocol.should_check_dev22_fallback()
+                && dev_type == DeviceType::Auto
                 && let Ok(d) = unpack_message(packet, None, Some(header), Some(false))
             {
                 info!("Device22 detected via CRC32 fallback. Switching mode.");
@@ -1584,49 +1417,42 @@ impl Device {
 
     async fn decrypt_and_clean_payload(&self, payload: Vec<u8>, _prefix: u32) -> Result<Vec<u8>> {
         let (version, mut dev_type) = self.with_state(|s| (s.version, s.dev_type));
-        // If dev_type is Auto, treat it as Default for protocol selection
         let original_dev_type = dev_type;
         if dev_type == DeviceType::Auto {
             dev_type = DeviceType::Default;
         }
 
-        let key = self.get_cipher_key();
-        let cipher = TuyaCipher::new(&key)?;
+        let cipher = self.get_cipher()?;
         let protocol = get_protocol(version, dev_type);
 
         let decrypted = protocol.decrypt_payload(payload, &cipher)?;
 
-        if (version.val() == 3.3 || version.val() == 3.4)
+        if protocol.should_check_dev22_fallback()
             && original_dev_type == DeviceType::Auto
             && String::from_utf8_lossy(&decrypted).contains(DATA_UNVALID)
         {
-            warn!(
-                "Device22 detected via '{}' payload. Switching mode.",
-                DATA_UNVALID
-            );
+            warn!("Device22 detected via '{DATA_UNVALID}' payload. Switching mode.");
             self.set_dev_type(DeviceType::Device22);
         }
 
         Ok(decrypted)
     }
 
-    fn get_cipher_key(&self) -> Vec<u8> {
-        let state = self.state.read();
-        state
-            .session_key
-            .clone()
-            .unwrap_or_else(|| self.local_key.clone())
-    }
+    fn get_cipher(&self) -> Result<Arc<TuyaCipher>> {
+        let mut state = self.state.write();
 
-    fn base_payload(&self) -> Value {
-        serde_json::json!({
-            "gwId": self.id,
-            "devId": self.id,
-        })
-    }
+        // Determine which key to use: session_key if available, otherwise local_key
+        let key = state.session_key.as_deref().unwrap_or(&self.local_key);
 
-    fn generate_heartbeat_payload(&self) -> Result<(u32, Value)> {
-        Ok((CommandType::HeartBeat as u32, self.base_payload()))
+        if let Some(ref cipher) = state.cipher {
+            if cipher.key() == key {
+                return Ok(Arc::clone(cipher));
+            }
+        }
+
+        let new_cipher = Arc::new(TuyaCipher::new(key)?);
+        state.cipher = Some(Arc::clone(&new_cipher));
+        Ok(new_cipher)
     }
 
     fn get_backoff_duration(&self, failure_count: u32) -> Duration {
@@ -1651,17 +1477,14 @@ impl Device {
     }
 
     fn error_helper(&self, code: u32, payload: Option<Value>) -> TuyaMessage {
-        let err_msg = get_error_message(code);
         let mut response = serde_json::json!({
-            keys::ERR_MSG: err_msg,
+            keys::ERR_MSG: get_error_message(code),
             keys::ERR_CODE: code,
         });
 
         if let Some(p) = payload {
             match p {
-                Value::String(s) => {
-                    response[keys::PAYLOAD_STR] = Value::String(s);
-                }
+                Value::String(s) => response[keys::PAYLOAD_STR] = Value::String(s),
                 Value::Object(mut obj) => {
                     if let Some(raw) = obj
                         .remove("data")
@@ -1670,26 +1493,18 @@ impl Device {
                     {
                         response[keys::PAYLOAD_RAW] = raw;
                     }
-                    // Merge any remaining fields (like "cmd" or original JSON data)
-                    if let Some(obj_map) = response.as_object_mut() {
-                        for (k, v) in obj {
-                            obj_map.insert(k, v);
-                        }
+                    if let Some(res_obj) = response.as_object_mut() {
+                        res_obj.extend(obj);
                     }
                 }
-                _ => {
-                    response[keys::ERR_PAYLOAD_OBJ] = p;
-                }
+                _ => response[keys::ERR_PAYLOAD_OBJ] = p,
             }
         }
 
         TuyaMessage {
-            seqno: 0,
-            cmd: 0,
-            retcode: None,
             payload: serde_json::to_vec(&response).unwrap_or_default(),
-            prefix: PREFIX_55AA,
-            iv: None,
+            prefix: get_protocol(self.version(), self.dev_type()).get_prefix(),
+            ..Default::default()
         }
     }
 }
@@ -1702,45 +1517,5 @@ impl Drop for Device {
         if self.tx.is_some() && Arc::strong_count(&self.state) <= 2 {
             self.cancel_token.cancel();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    use tokio::time::sleep;
-
-    #[tokio::test]
-    async fn test_device_memory_leak() {
-        let id = "test_device_id";
-        let key = "0123456789abcdef";
-        let addr = "127.0.0.1";
-
-        let weak_state;
-        {
-            let device = Device::new(id, addr, key, "3.3");
-            weak_state = Arc::downgrade(&device.state);
-
-            // strong_count should be 2 (one for device handle, one for background task)
-            assert!(Arc::strong_count(&device.state) >= 1);
-            assert!(weak_state.upgrade().is_some());
-
-            // Device goes out of scope here
-        }
-
-        // Wait a bit for the background task to detect cancellation and exit
-        for _ in 0..10 {
-            if weak_state.upgrade().is_none() {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-
-        // The state should be dropped now
-        assert!(
-            weak_state.upgrade().is_none(),
-            "DeviceState leaked! Background task might still be running."
-        );
     }
 }

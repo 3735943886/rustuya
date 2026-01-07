@@ -70,6 +70,7 @@ impl From<serde_json::Error> for TuyaError {
 }
 
 impl TuyaError {
+    #[must_use]
     pub fn code(&self) -> u32 {
         match self {
             TuyaError::Io(_) => ERR_CONNECT,
@@ -91,6 +92,7 @@ impl TuyaError {
         }
     }
 
+    #[must_use]
     pub fn from_code(code: u32) -> Self {
         match code {
             ERR_JSON => TuyaError::Json("Generic JSON error".to_string()),
@@ -100,7 +102,7 @@ impl TuyaError {
             ERR_KEY_OR_VER => TuyaError::KeyOrVersionError,
             ERR_DUPLICATE => TuyaError::DuplicateDevice("Unknown ID".to_string()),
             ERR_PAYLOAD => TuyaError::InvalidPayload,
-            _ => TuyaError::Io(format!("Unknown error code: {}", code)),
+            _ => TuyaError::Io(format!("Unknown error code: {code}")),
         }
     }
 }

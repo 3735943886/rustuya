@@ -6,9 +6,12 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use rustuya::Device;
+//! use rustuya::DeviceBuilder;
 //!
-//! let device = Device::new("DEVICE_ID", "DEVICE_ADDRESS", "DEVICE_KEY", "DEVICE_VERSION");
+//! let device = DeviceBuilder::new("DEVICE_ID", "DEVICE_KEY")
+//!     .address("DEVICE_ADDRESS")
+//!     .version("DEVICE_VERSION")
+//!     .build();
 //! // device.set_value(1, true); // Asynchronous call
 //! ```
 //!
@@ -28,6 +31,7 @@ pub use scanner::Scanner;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[must_use]
 pub fn version() -> &'static str {
     VERSION
 }

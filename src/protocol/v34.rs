@@ -87,10 +87,7 @@ impl TuyaProtocol for ProtocolV34 {
         }
 
         let payload_obj = Value::Object(payload);
-        trace!(
-            "v3.4 generated payload (cmd {}): {}",
-            cmd_to_send, payload_obj
-        );
+        trace!("v3.4 generated payload (cmd {cmd_to_send}): {payload_obj}");
 
         Ok((cmd_to_send, payload_obj))
     }
@@ -120,5 +117,34 @@ impl TuyaProtocol for ProtocolV34 {
 
     fn has_version_header(&self, payload: &[u8]) -> bool {
         payload.len() >= 15 && &payload[..3] == Version::V3_4.as_bytes()
+    }
+
+    fn requires_session_key(&self) -> bool {
+        true
+    }
+
+    fn encrypt_session_key(
+        &self,
+        session_key: &[u8],
+        cipher: &TuyaCipher,
+        _nonce: &[u8],
+    ) -> Result<Vec<u8>> {
+        cipher.encrypt(session_key, false, None, None, false)
+    }
+
+    fn get_prefix(&self) -> u32 {
+        crate::protocol::PREFIX_55AA
+    }
+
+    fn get_hmac_key<'a>(&self, cipher_key: &'a [u8]) -> Option<&'a [u8]> {
+        Some(cipher_key)
+    }
+
+    fn is_empty_payload_allowed(&self, _cmd: u32) -> bool {
+        false
+    }
+
+    fn should_check_dev22_fallback(&self) -> bool {
+        true
     }
 }

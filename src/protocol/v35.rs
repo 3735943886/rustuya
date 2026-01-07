@@ -87,10 +87,7 @@ impl TuyaProtocol for ProtocolV35 {
         }
 
         let payload_obj = Value::Object(payload);
-        trace!(
-            "v3.5 generated payload (cmd {}): {}",
-            cmd_to_send, payload_obj
-        );
+        trace!("v3.5 generated payload (cmd {cmd_to_send}): {payload_obj}");
 
         Ok((cmd_to_send, payload_obj))
     }
@@ -117,5 +114,36 @@ impl TuyaProtocol for ProtocolV35 {
 
     fn has_version_header(&self, payload: &[u8]) -> bool {
         payload.len() >= 15 && &payload[..3] == Version::V3_5.as_bytes()
+    }
+
+    fn requires_session_key(&self) -> bool {
+        true
+    }
+
+    fn encrypt_session_key(
+        &self,
+        session_key: &[u8],
+        cipher: &TuyaCipher,
+        nonce: &[u8],
+    ) -> Result<Vec<u8>> {
+        let encrypted = cipher.encrypt(session_key, false, Some(&nonce[..12]), None, false)?;
+        Ok(encrypted[12..28].to_vec())
+    }
+
+    fn get_prefix(&self) -> u32 {
+        crate::protocol::PREFIX_6699
+    }
+
+    fn get_hmac_key<'a>(&self, cipher_key: &'a [u8]) -> Option<&'a [u8]> {
+        Some(cipher_key)
+    }
+
+    fn is_empty_payload_allowed(&self, cmd: u32) -> bool {
+        // v3.5 gateways often send empty 0x40 (LanExtStream) as an ACK
+        cmd == crate::protocol::CommandType::LanExtStream as u32
+    }
+
+    fn should_check_dev22_fallback(&self) -> bool {
+        false
     }
 }

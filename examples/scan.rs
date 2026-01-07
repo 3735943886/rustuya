@@ -32,5 +32,5 @@ async fn main() {
         );
     }
 
-    println!("Scan finished. Total devices found: {}", count);
+    println!("Scan finished. Total devices found: {count}");
 }

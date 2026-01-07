@@ -39,6 +39,7 @@ pub struct DiscoveryResult {
 impl DiscoveryResult {
     /// Checks if this result is substantially different from another,
     /// ignoring the discovery timestamp.
+    #[must_use]
     pub fn is_same_device(&self, other: &Self) -> bool {
         self.id == other.id
             && self.ip == other.ip
@@ -116,6 +117,7 @@ impl Default for Scanner {
 
 impl Scanner {
     /// Creates a new Scanner with default settings.
+    #[must_use]
     pub fn new() -> Self {
         let scanner = Self {
             inner: Arc::new(ScannerState::new()),
@@ -183,7 +185,7 @@ impl Scanner {
                 let scanner_temp = Scanner::new_silent();
                 loop {
                     tokio::select! {
-                        _ = cancel_token.cancelled() => break,
+                        () = cancel_token.cancelled() => break,
                         Some((data, _addr)) = rx.recv() => {
                             if let Some(res) = scanner_temp.parse_packet(&data) {
                                 let state = match state_weak.upgrade() {
@@ -202,7 +204,7 @@ impl Scanner {
 
                                 if should_log {
                                     let mode = if state.active_scanning.load(Ordering::SeqCst) { "A" } else { "P" };
-                                    let version = res.version.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string());
+                                    let version = res.version.map_or_else(|| "unknown".to_string(), |v| v.to_string());
                                     info!("Discovered device {}(v{}) at {} - {}", res.id, version, res.ip, mode);
                                 }
 
@@ -235,7 +237,7 @@ impl Scanner {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     tokio::select! {
-                        _ = ct.cancelled() => break,
+                        () = ct.cancelled() => break,
                         res = socket.recv_from(&mut buf) => {
                             match res {
                                 Ok((len, addr)) => {
@@ -254,7 +256,7 @@ impl Scanner {
     }
 
     fn create_udp_socket(bind_addr: &str, port: u16) -> Result<UdpSocket> {
-        let addr: SocketAddr = format!("{}:{}", bind_addr, port)
+        let addr: SocketAddr = format!("{bind_addr}:{port}")
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
@@ -308,18 +310,21 @@ impl Scanner {
         Ok(())
     }
 
+    #[must_use]
     pub fn with_timeout(&self, timeout: Duration) -> Self {
         let mut s = self.clone();
         s.set_timeout(timeout);
         s
     }
 
+    #[must_use]
     pub fn with_ports(&self, ports: Vec<u16>) -> Self {
         let mut s = self.clone();
         s.set_ports(ports);
         s
     }
 
+    #[must_use]
     pub fn with_bind_addr(&self, addr: String) -> Self {
         let mut s = self.clone();
         let _ = s.set_bind_address(&addr);
@@ -332,6 +337,7 @@ impl Scanner {
     }
 
     /// Checks if a device was discovered within the last `within` duration.
+    #[must_use]
     pub fn is_recently_discovered(&self, device_id: &str, within: Duration) -> bool {
         let guard = self.inner.cache.read();
         if let Some(res) = guard.get(device_id) {
@@ -348,10 +354,7 @@ impl Scanner {
 
     async fn send_discovery_broadcast(&self, socket: &UdpSocket, port: u16) -> Result<()> {
         let local_ip = self.get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
-        debug!(
-            "Sending discovery broadcast on port {} (local IP: {})",
-            port, local_ip
-        );
+        debug!("Sending discovery broadcast on port {port} (local IP: {local_ip})");
 
         let (payload, prefix) = if port == 7000 {
             (
@@ -386,19 +389,13 @@ impl Scanner {
 
         let packed =
             protocol::pack_message(&msg, if port == 7000 { Some(UDP_KEY_35) } else { None })?;
-        let broadcast_addr: SocketAddr = format!("255.255.255.255:{}", port)
+        let broadcast_addr: SocketAddr = format!("255.255.255.255:{port}")
             .parse()
             .map_err(|_| TuyaError::Offline)?;
 
         match socket.send_to(&packed, broadcast_addr).await {
-            Ok(len) => debug!(
-                "Sent discovery broadcast to {}: {} bytes",
-                broadcast_addr, len
-            ),
-            Err(e) => warn!(
-                "Failed to send discovery broadcast to {}: {}",
-                broadcast_addr, e
-            ),
+            Ok(len) => debug!("Sent discovery broadcast to {broadcast_addr}: {len} bytes"),
+            Err(e) => warn!("Failed to send discovery broadcast to {broadcast_addr}: {e}"),
         }
 
         Ok(())
@@ -459,8 +456,8 @@ impl Scanner {
 
                 // Wait for next discovery notification or timeout
                 tokio::select! {
-                    _ = tokio::time::sleep(remaining) => break,
-                    _ = state.notify.notified() => {
+                    () = tokio::time::sleep(remaining) => break,
+                    () = state.notify.notified() => {
                         let new_items: Vec<_> = {
                             let guard = state.cache.read();
                             guard.values()
@@ -546,7 +543,7 @@ impl Scanner {
             && !force_scan
             && res.discovered_at.elapsed() < GLOBAL_SCAN_COOLDOWN
         {
-            debug!("Found device {} in discovery cache", device_id);
+            debug!("Found device {device_id} in discovery cache");
             return Some(res);
         }
 
@@ -555,10 +552,7 @@ impl Scanner {
             && last.elapsed() < GLOBAL_SCAN_COOLDOWN
             && let Some(res) = guard.get(device_id).cloned()
         {
-            debug!(
-                "Global scan cooldown active (30m). Returning cached result for {}.",
-                device_id
-            );
+            debug!("Global scan cooldown active (30m). Returning cached result for {device_id}.");
             return Some(res);
         }
         None
@@ -575,7 +569,7 @@ impl Scanner {
         };
 
         if can_scan {
-            info!("Initiating background scan for device ID: {}...", device_id);
+            info!("Initiating background scan for device ID: {device_id}...");
             *state.last_scan_time.write() = Some(Instant::now());
 
             let scanner = self.clone();
@@ -646,11 +640,11 @@ impl Scanner {
             }
 
             tokio::select! {
-                _ = tokio::time::sleep(remaining) => break,
+                () = tokio::time::sleep(remaining) => break,
                 _ = broadcast_interval.tick() => {
                     if broadcast_count < 3 {
                         broadcast_count += 1;
-                        debug!("Sent broadcast {}/3", broadcast_count);
+                        debug!("Sent broadcast {broadcast_count}/3");
                         for (socket, port) in &target_sockets {
                             let _ = self.send_discovery_broadcast(socket, *port).await;
                         }
@@ -763,6 +757,7 @@ impl Scanner {
     }
 
     /// Invalidates the cache entry for a specific device.
+    #[must_use]
     pub fn invalidate_cache(&self, id: &str) -> bool {
         let mut guard = self.inner.cache.write();
         guard.remove(id).is_some()
@@ -785,7 +780,7 @@ impl Scanner {
                 id: id.to_string(),
                 ip: ip.to_string(),
                 version: ver_s.and_then(|s| Version::from_str(s).ok()),
-                product_key: pk.map(|s| s.to_string()),
+                product_key: pk.map(std::string::ToString::to_string),
                 discovered_at: Instant::now(),
             })
         } else {
