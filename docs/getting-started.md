@@ -1,5 +1,7 @@
 # Getting Started
 
+---
+
 ## **Rust Installation**
 
 Add the following to the `Cargo.toml` file:
