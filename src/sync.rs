@@ -4,11 +4,14 @@
 //! This allows using the library in non-async environments without manually managing a runtime.
 
 use crate::device::SubDevice as AsyncSubDevice;
-use crate::device::{Device as AsyncDevice, DeviceBuilder as AsyncDeviceBuilder};
+use crate::device::{
+    Device as AsyncDevice, DeviceBuilder as AsyncDeviceBuilder, DeviceEvent,
+    unified_listener as async_unified_listener,
+};
 use crate::error::Result;
 use crate::protocol::{TuyaMessage, Version};
 use crate::runtime::{self, get_runtime};
-use crate::scanner::{DiscoveryResult, get as get_async_scanner};
+use crate::scanner::{DiscoveryResult, Scanner as AsyncScanner, get as get_async_scanner};
 use serde::Serialize;
 use serde_json::Value;
 use std::ops::Deref;
@@ -91,6 +94,8 @@ impl Device {
         let (tx, mut rx) = mpsc::channel::<SyncRequest<DeviceCommand>>(32);
         let inner_clone = device.clone();
 
+        // Background worker for the sync device.
+        // Automatically stops when all Device handles are dropped.
         runtime::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let res = match req.command {
@@ -231,6 +236,11 @@ impl DeviceBuilder {
         self
     }
 
+    pub fn dev_type<D: Into<crate::protocol::DeviceType>>(mut self, dev_type: D) -> Self {
+        self.inner = self.inner.dev_type(dev_type);
+        self
+    }
+
     pub fn port(mut self, port: u16) -> Self {
         self.inner = self.inner.port(port);
         self
@@ -353,6 +363,7 @@ enum ScannerCommand {
 
 #[derive(Clone)]
 pub struct Scanner {
+    inner: AsyncScanner,
     cmd_tx: mpsc::Sender<ScannerCommand>,
 }
 
@@ -364,26 +375,41 @@ impl Scanner {
         SYNC_SCANNER.get_or_init(Self::new)
     }
 
-    fn new() -> Self {
-        let (tx, mut rx) = mpsc::channel::<ScannerCommand>(32);
-        let async_scanner = get_async_scanner();
+    /// Creates a new Scanner builder.
+    pub fn builder() -> ScannerBuilder {
+        ScannerBuilder::new()
+    }
 
+    fn new() -> Self {
+        Self::from_async(get_async_scanner().clone())
+    }
+
+    pub(crate) fn from_async(async_scanner: AsyncScanner) -> Self {
+        let (tx, mut rx) = mpsc::channel::<ScannerCommand>(32);
+        let scanner_inner = async_scanner.clone();
+
+        // Background worker for the sync scanner.
+        // It will automatically stop when all Sender (cmd_tx) handles are dropped,
+        // as rx.recv() will return None. This ensures proper RAII and resource cleanup.
         runtime::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     ScannerCommand::Scan(resp_tx) => {
-                        let res = async_scanner.scan().await;
+                        let res = scanner_inner.scan().await;
                         let _ = resp_tx.send(res);
                     }
                     ScannerCommand::Discover(id, resp_tx) => {
-                        let res = async_scanner.discover_device(&id).await.ok().flatten();
+                        let res = scanner_inner.discover_device(&id).await.ok().flatten();
                         let _ = resp_tx.send(res);
                     }
                 }
             }
         });
 
-        Self { cmd_tx: tx }
+        Self {
+            inner: async_scanner,
+            cmd_tx: tx,
+        }
     }
 
     pub fn scan(&self) -> Result<Vec<DiscoveryResult>> {
@@ -398,4 +424,79 @@ impl Scanner {
         .ok()
         .flatten()
     }
+
+    /// Returns a synchronous iterator (Receiver) that yields discovery results in real-time.
+    pub fn scan_stream(&self) -> std::sync::mpsc::Receiver<DiscoveryResult> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let async_scanner = self.inner.clone();
+
+        runtime::spawn(async move {
+            use futures_util::StreamExt;
+            let stream = async_scanner.scan_stream();
+            tokio::pin!(stream);
+            while let Some(device) = stream.next().await {
+                if tx.send(device).is_err() {
+                    break;
+                }
+            }
+        });
+
+        rx
+    }
+}
+
+/// Builder for creating a custom synchronous `Scanner`.
+pub struct ScannerBuilder {
+    inner: crate::scanner::ScannerBuilder,
+}
+
+impl Default for ScannerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScannerBuilder {
+    pub fn new() -> Self {
+        Self {
+            inner: crate::scanner::ScannerBuilder::new(),
+        }
+    }
+
+    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner = self.inner.timeout(timeout);
+        self
+    }
+
+    pub fn bind_addr<S: Into<String>>(mut self, addr: S) -> Self {
+        self.inner = self.inner.bind_addr(addr);
+        self
+    }
+
+    pub fn ports(mut self, ports: Vec<u16>) -> Self {
+        self.inner = self.inner.ports(ports);
+        self
+    }
+
+    pub fn build(self) -> Scanner {
+        Scanner::from_async(self.inner.build())
+    }
+}
+
+/// Merges multiple sync device listeners into a single synchronous receiver.
+pub fn unified_listener(devices: Vec<Device>) -> std::sync::mpsc::Receiver<Result<DeviceEvent>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let async_devices: Vec<AsyncDevice> = devices.into_iter().map(|d| d.inner.clone()).collect();
+
+    runtime::spawn(async move {
+        use futures_util::StreamExt;
+        let mut stream = async_unified_listener(async_devices);
+        while let Some(event) = stream.next().await {
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    rx
 }

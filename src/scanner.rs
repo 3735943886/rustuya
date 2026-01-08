@@ -125,6 +125,11 @@ pub fn get() -> &'static Scanner {
     GLOBAL_SCANNER.get_or_init(Scanner::new)
 }
 
+/// Creates a new Scanner builder.
+pub fn builder() -> ScannerBuilder {
+    ScannerBuilder::new()
+}
+
 type ReceiverResult = (
     mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     Vec<tokio::task::JoinHandle<()>>,
@@ -192,7 +197,6 @@ impl Scanner {
         if !state.listener_started.swap(true, Ordering::SeqCst) {
             let cancel_token = state.cancel_token.clone();
             let state_weak = Arc::downgrade(&self.inner);
-            let scanner_clone = self.clone();
 
             let (mut rx, tasks) = Self::spawn_receiver_tasks(new_sockets, cancel_token.clone());
             {
@@ -207,11 +211,22 @@ impl Scanner {
                     tokio::select! {
                         () = cancel_token.cancelled() => break,
                         Some((data, _addr)) = rx.recv() => {
-                            if let Some(res) = scanner_clone.parse_packet(&data) {
-                                let state = match state_weak.upgrade() {
-                                    Some(s) => s,
-                                    None => break,
-                                };
+                            let state = match state_weak.upgrade() {
+                                Some(s) => s,
+                                None => break,
+                            };
+
+                            // We need to parse the packet. Since parse_packet is a method of Scanner,
+                            // but we want to avoid holding a Scanner (which holds an Arc),
+                            // we use a temporary Scanner instance for parsing.
+                            let temp_scanner = Scanner {
+                                inner: state.clone(),
+                                timeout: Duration::from_secs(0),
+                                bind_addr: String::new(),
+                                ports: Vec::new(),
+                            };
+
+                            if let Some(res) = temp_scanner.parse_packet(&data) {
                                 let mut guard = state.cache.write();
 
                                 // Keep memory clean by removing expired entries on every update.
@@ -795,5 +810,50 @@ impl Scanner {
         } else {
             None
         }
+    }
+}
+
+/// Builder for creating a custom `Scanner`.
+#[derive(Debug, Default)]
+pub struct ScannerBuilder {
+    timeout: Option<Duration>,
+    bind_addr: Option<String>,
+    ports: Option<Vec<u16>>,
+}
+
+impl ScannerBuilder {
+    /// Creates a new `ScannerBuilder` with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the timeout for discovery.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the local address to bind to.
+    pub fn bind_addr<S: Into<String>>(mut self, addr: S) -> Self {
+        self.bind_addr = Some(addr.into());
+        self
+    }
+
+    /// Sets the UDP ports to scan.
+    pub fn ports(mut self, ports: Vec<u16>) -> Self {
+        self.ports = Some(ports);
+        self
+    }
+
+    /// Builds and returns a new `Scanner`.
+    pub fn build(self) -> Scanner {
+        let scanner = Scanner {
+            inner: Arc::new(ScannerState::new()),
+            timeout: self.timeout.unwrap_or(DEFAULT_SCAN_TIMEOUT),
+            bind_addr: self.bind_addr.unwrap_or_else(|| "0.0.0.0".to_string()),
+            ports: self.ports.unwrap_or_else(|| vec![6666, 6667, 7000]),
+        };
+        scanner.ensure_passive_listener();
+        scanner
     }
 }
