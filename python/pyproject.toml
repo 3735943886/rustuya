@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustuya"
+dynamic = ["version"]
+readme = "README-PYTHON.md"
+description = "A fast and concurrent Tuya Local API implementation in Rust"
+authors = [
+    { name = "3735943886" }
+]
+requires-python = ">=3.7"
+license = { text = "MIT" }
+keywords = ["tuya", "iot", "smart-home", "automation"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/3735943886/rustuya"
+Repository = "https://github.com/3735943886/rustuya"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "rustuya"

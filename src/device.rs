@@ -607,7 +607,7 @@ impl Device {
 }
 
 /// Represents an event from a specific device.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceEvent {
     /// The ID of the device that generated the event.
     pub device_id: String,
