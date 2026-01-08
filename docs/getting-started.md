@@ -1,9 +1,5 @@
 # Getting Started
 
-Rustuya is a fast, concurrency-friendly library for controlling and monitoring Tuya devices on a local network. This guide provides instructions for both Rust and Python.
-
----
-
 ## **Rust Installation**
 
 Add the following to the `Cargo.toml` file:
