@@ -556,6 +556,13 @@ pub fn unified_listener(devices: Vec<Bound<'_, Device>>) -> PyResult<UnifiedEven
     })
 }
 
+#[pyfunction]
+pub fn maximize_fd_limit() -> PyResult<()> {
+    ::rustuya::maximize_fd_limit().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to maximize FD limit: {}", e))
+    })
+}
+
 #[pyclass]
 pub struct DeviceEventReceiver {
     inner: Arc<Mutex<std::sync::mpsc::Receiver<::rustuya::protocol::TuyaMessage>>>,
@@ -629,6 +636,7 @@ fn rustuya(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(get_scanner, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(unified_listener, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(maximize_fd_limit, m)?)?;
 
     let atexit = py.import("atexit")?;
     atexit.call_method1("register", (m.getattr("_rustuya_atexit")?,))?;

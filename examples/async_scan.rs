@@ -6,13 +6,15 @@
  */
 use futures_util::StreamExt;
 
+use rustuya::Scanner;
+
 #[tokio::main]
 async fn main() {
     println!("--- Rustuya - Scanner (Async) ---");
     println!("[INFO] Scanning the network for Tuya devices in real-time...");
 
     // 1. Get the global scanner instance
-    let scanner = rustuya::scanner::get();
+    let scanner = Scanner::get();
 
     // 2. Get a stream of discovery results
     let stream = scanner.scan_stream();

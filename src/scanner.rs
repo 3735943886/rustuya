@@ -136,6 +136,11 @@ type ReceiverResult = (
 );
 
 impl Scanner {
+    /// Returns the global scanner instance.
+    pub fn get() -> &'static Self {
+        get()
+    }
+
     /// Creates a new Scanner with default settings.
     #[must_use]
     pub(crate) fn new() -> Self {
