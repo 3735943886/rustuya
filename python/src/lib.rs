@@ -7,16 +7,44 @@
 use ::rustuya::Version;
 use ::rustuya::protocol::DeviceType;
 use ::rustuya::sync::{
-    Device as SyncDevice, Scanner as SyncScanner,
-    SubDevice as SyncSubDevice,
+    Device as SyncDevice, DeviceCommand, Scanner as SyncScanner, SubDevice as SyncSubDevice,
+    SubDeviceCommand, SyncRequest,
 };
 use log::LevelFilter;
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyDictMethods, PyList, PyListMethods};
 use serde_json::Value;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::mpsc;
+
+fn interruptible_call<'py, C, R: Send>(
+    py: Python<'py>,
+    tx: &mpsc::Sender<SyncRequest<C, R>>,
+    cmd: C,
+) -> PyResult<R> {
+    let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+    let req = SyncRequest {
+        command: cmd,
+        resp_tx,
+    };
+
+    // Use blocking_send as we are in a sync context (Python thread)
+    tx.blocking_send(req)
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Failed to send command"))?;
+
+    let res = py.detach(move || recv_with_signals(&resp_rx));
+    match res {
+        Ok(Some(res)) => res.map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Command failed: {}", e))
+        }),
+        Ok(None) | Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Command worker died",
+        )),
+    }
+}
 
 fn set_payload<'py>(py: Python<'py>, dict: &Bound<'py, PyDict>, payload_str: &str) -> PyResult<()> {
     if let Ok(val) = serde_json::from_str::<Value>(payload_str) {
@@ -27,7 +55,20 @@ fn set_payload<'py>(py: Python<'py>, dict: &Bound<'py, PyDict>, payload_str: &st
     Ok(())
 }
 
-fn recv_with_signals<T>(receiver: &std::sync::mpsc::Receiver<T>) -> PyResult<Option<T>> {
+fn to_py_result<'py>(py: Python<'py>, res: Option<String>) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match res {
+        Some(s) => {
+            if let Ok(val) = serde_json::from_str::<Value>(&s) {
+                Ok(Some(pythonize::pythonize(py, &val)?))
+            } else {
+                Ok(Some(s.into_bound_py_any(py)?))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn recv_with_signals<T: Send>(receiver: &std::sync::mpsc::Receiver<T>) -> PyResult<Option<T>> {
     loop {
         match receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(msg) => return Ok(Some(msg)),
@@ -60,18 +101,18 @@ impl Scanner {
             let res = scanner.scan();
             let _ = tx.send(res);
         });
-        let results = py.detach(
-            move || -> PyResult<Vec<::rustuya::scanner::DiscoveryResult>> {
-                match recv_with_signals(&rx)? {
-                    Some(res) => res.map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!("Scan failed: {}", e))
-                    }),
-                    None => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "Scan worker disconnected",
-                    )),
-                }
-            },
-        )?;
+
+        let results = match py.detach(move || recv_with_signals(&rx))? {
+            Some(res) => res.map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Scan failed: {}", e))
+            })?,
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Scan worker disconnected",
+                ));
+            }
+        };
+
         let list = PyList::empty(py);
         for r in results {
             list.append(pythonize::pythonize(py, &r)?)?;
@@ -81,10 +122,17 @@ impl Scanner {
 
     /// Discovers a specific device by ID.
     pub fn discover<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let result = py.detach(|| SyncScanner::get().discover(id));
-        match result {
-            Some(r) => Ok(Some(pythonize::pythonize(py, &r)?)),
-            None => Ok(None),
+        let (tx, rx) = std::sync::mpsc::channel();
+        let scanner = SyncScanner::get();
+        let id_owned = id.to_string();
+        std::thread::spawn(move || {
+            let res = scanner.discover(&id_owned);
+            let _ = tx.send(res);
+        });
+
+        match py.detach(move || recv_with_signals(&rx))? {
+            Some(Some(r)) => Ok(Some(pythonize::pythonize(py, &r)?)),
+            _ => Ok(None),
         }
     }
 }
@@ -136,8 +184,9 @@ impl SubDevice {
     }
 
     /// Requests the device status.
-    pub fn status(&self, py: Python<'_>) {
-        py.detach(|| self.inner.status());
+    pub fn status<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let res = interruptible_call(py, &self.inner.cmd_tx, SubDeviceCommand::Status)?;
+        to_py_result(py, res)
     }
 
     pub fn __repr__(&self) -> String {
@@ -145,12 +194,16 @@ impl SubDevice {
     }
 
     /// Sets multiple DP values.
-    pub fn set_dps<'py>(&self, py: Python<'py>, dps: Bound<'py, PyAny>) -> PyResult<()> {
+    pub fn set_dps<'py>(
+        &self,
+        py: Python<'py>,
+        dps: Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let val: Value = pythonize::depythonize(&dps).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid Python object: {}", e))
         })?;
-        py.detach(|| self.inner.set_dps(val));
-        Ok(())
+        let res = interruptible_call(py, &self.inner.cmd_tx, SubDeviceCommand::SetDps(val))?;
+        to_py_result(py, res)
     }
 
     /// Sets a single DP value.
@@ -159,7 +212,7 @@ impl SubDevice {
         py: Python<'py>,
         dp_id: Bound<'py, PyAny>,
         value: Bound<'py, PyAny>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let id_str = if let Ok(id) = dp_id.extract::<u32>() {
             id.to_string()
         } else if let Ok(id) = dp_id.extract::<String>() {
@@ -173,8 +226,41 @@ impl SubDevice {
         let val: Value = pythonize::depythonize(&value).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid Python object: {}", e))
         })?;
-        py.detach(|| self.inner.set_value(id_str, val));
-        Ok(())
+        let res = interruptible_call(
+            py,
+            &self.inner.cmd_tx,
+            SubDeviceCommand::SetValue(id_str, val),
+        )?;
+        to_py_result(py, res)
+    }
+
+    /// Sends a direct request to the sub-device.
+    #[pyo3(signature = (command, data=None))]
+    pub fn request<'py>(
+        &self,
+        py: Python<'py>,
+        command: u32,
+        data: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let cmd = ::rustuya::protocol::CommandType::from_u32(command).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid command type: {}", command))
+        })?;
+        let val: Option<Value> = if let Some(d) = data {
+            Some(pythonize::depythonize(&d).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid Python object: {}", e))
+            })?)
+        } else {
+            None
+        };
+        let res = interruptible_call(
+            py,
+            &self.inner.cmd_tx,
+            SubDeviceCommand::Request {
+                command: cmd,
+                data: val,
+            },
+        )?;
+        to_py_result(py, res)
     }
 }
 
@@ -189,7 +275,9 @@ pub struct Device {
 impl Device {
     #[new]
     #[pyo3(signature = (id, local_key, address="Auto", version="Auto", dev_type=None, persist=true, timeout_ms=None, nowait=false))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        py: Python<'_>,
         id: &str,
         local_key: &str,
         address: &str,
@@ -220,9 +308,8 @@ impl Device {
             builder = builder.connection_timeout(Duration::from_millis(ms));
         }
 
-        Ok(Device {
-            inner: builder.run(),
-        })
+        let inner = py.detach(|| builder.run());
+        Ok(Device { inner })
     }
 
     /// Returns the device ID.
@@ -295,8 +382,9 @@ impl Device {
     }
 
     /// Requests the device status.
-    pub fn status(&self, py: Python<'_>) {
-        py.detach(|| self.inner.status());
+    pub fn status<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let res = interruptible_call(py, &self.inner.cmd_tx, DeviceCommand::Status)?;
+        to_py_result(py, res)
     }
 
     /// Returns whether the device is in nowait mode.
@@ -306,12 +394,16 @@ impl Device {
     }
 
     /// Sets multiple DP values.
-    pub fn set_dps<'py>(&self, py: Python<'py>, dps: Bound<'py, PyAny>) -> PyResult<()> {
+    pub fn set_dps<'py>(
+        &self,
+        py: Python<'py>,
+        dps: Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let val: Value = pythonize::depythonize(&dps).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid Python object: {}", e))
         })?;
-        py.detach(|| self.inner.set_dps(val));
-        Ok(())
+        let res = interruptible_call(py, &self.inner.cmd_tx, DeviceCommand::SetDps(val))?;
+        to_py_result(py, res)
     }
 
     /// Sets a single DP value.
@@ -320,7 +412,7 @@ impl Device {
         py: Python<'py>,
         dp_id: Bound<'py, PyAny>,
         value: Bound<'py, PyAny>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let id_str = if let Ok(id) = dp_id.extract::<u32>() {
             id.to_string()
         } else if let Ok(id) = dp_id.extract::<String>() {
@@ -334,8 +426,8 @@ impl Device {
         let val: Value = pythonize::depythonize(&value).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid Python object: {}", e))
         })?;
-        py.detach(|| self.inner.set_value(id_str, val));
-        Ok(())
+        let res = interruptible_call(py, &self.inner.cmd_tx, DeviceCommand::SetValue(id_str, val))?;
+        to_py_result(py, res)
     }
 
     /// Sends a direct request to the device.
@@ -346,7 +438,7 @@ impl Device {
         command: u32,
         data: Option<Bound<'py, PyAny>>,
         cid: Option<String>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let cmd = ::rustuya::protocol::CommandType::from_u32(command).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid command type: {}", command))
         })?;
@@ -357,13 +449,22 @@ impl Device {
         } else {
             None
         };
-        py.detach(|| self.inner.request(cmd, val, cid));
-        Ok(())
+        let res = interruptible_call(
+            py,
+            &self.inner.cmd_tx,
+            DeviceCommand::Request {
+                command: cmd,
+                data: val,
+                cid,
+            },
+        )?;
+        to_py_result(py, res)
     }
 
     /// Discovers sub-devices (for gateways).
-    pub fn sub_discover(&self, py: Python<'_>) {
-        py.detach(|| self.inner.sub_discover());
+    pub fn sub_discover<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let res = interruptible_call(py, &self.inner.cmd_tx, DeviceCommand::SubDiscover)?;
+        to_py_result(py, res)
     }
 
     /// Returns a sub-device handle.
@@ -374,13 +475,15 @@ impl Device {
     }
 
     /// Closes the device connection.
-    pub fn close(&self, py: Python<'_>) {
-        py.detach(|| self.inner.close());
+    pub fn close(&self, py: Python<'_>) -> PyResult<()> {
+        interruptible_call(py, &self.inner.cmd_tx, DeviceCommand::Close)?;
+        Ok(())
     }
 
     /// Stops the device and its internal tasks.
-    pub fn stop(&self, py: Python<'_>) {
-        py.detach(|| self.inner.stop());
+    pub fn stop(&self, py: Python<'_>) -> PyResult<()> {
+        interruptible_call(py, &self.inner.cmd_tx, DeviceCommand::Stop)?;
+        Ok(())
     }
 
     /// Returns an event receiver for the device.

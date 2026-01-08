@@ -26,9 +26,9 @@ pub mod internal {
     }
 }
 
-struct SyncRequest<C, R = Option<String>> {
-    command: C,
-    resp_tx: std::sync::mpsc::Sender<Result<R>>,
+pub struct SyncRequest<C, R = Option<String>> {
+    pub command: C,
+    pub resp_tx: std::sync::mpsc::Sender<Result<R>>,
 }
 
 fn send_sync<C, R>(tx: &mpsc::Sender<SyncRequest<C, R>>, command: C) -> Result<R> {
@@ -51,7 +51,8 @@ macro_rules! wait_for_response {
 
 // --- Device ---
 
-enum DeviceCommand {
+#[derive(Debug)]
+pub enum DeviceCommand {
     Status,
     SetDps(Value),
     SetValue(String, Value),
@@ -67,8 +68,8 @@ enum DeviceCommand {
 
 #[derive(Clone)]
 pub struct Device {
-    inner: AsyncDevice,
-    cmd_tx: mpsc::Sender<SyncRequest<DeviceCommand>>,
+    pub inner: AsyncDevice,
+    pub cmd_tx: mpsc::Sender<SyncRequest<DeviceCommand>>,
 }
 
 impl Device {
@@ -268,7 +269,8 @@ impl DeviceBuilder {
 
 // --- SubDevice ---
 
-enum SubDeviceCommand {
+#[derive(Debug)]
+pub enum SubDeviceCommand {
     Status,
     SetDps(Value),
     SetValue(String, Value),
@@ -280,8 +282,8 @@ enum SubDeviceCommand {
 
 #[derive(Clone)]
 pub struct SubDevice {
-    inner: AsyncSubDevice,
-    cmd_tx: mpsc::Sender<SyncRequest<SubDeviceCommand>>,
+    pub inner: AsyncSubDevice,
+    pub cmd_tx: mpsc::Sender<SyncRequest<SubDeviceCommand>>,
 }
 
 impl SubDevice {
