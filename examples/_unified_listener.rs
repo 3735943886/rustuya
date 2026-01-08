@@ -5,7 +5,7 @@
  * into a single unified stream for centralized management.
  */
 use futures_util::StreamExt;
-use rustuya::device::{DeviceBuilder, unified_listener};
+use rustuya::device::{Device, unified_listener};
 
 #[tokio::main]
 async fn main() {
@@ -13,10 +13,10 @@ async fn main() {
 
     // 1. Create multiple devices using provided credentials
     let devices = vec![
-        DeviceBuilder::new("ebc8dc02c02761c44e1iho", "W:tqKTs?g)agP62S").build(), // AUBESS 20A
-        DeviceBuilder::new("eb7ba8427911a8ccbda92w", "GyFSITk>TL8?EBRK").build(), // Office Light
-        DeviceBuilder::new("eb3ff73bef776e4a1aay8r", "c)H+2(TY@sY)e&5L").build(), // Wired Gateway
-        DeviceBuilder::new("eb5176f91956a97b165dc5", "FGhe;!?GLh$vv9<c").build(), // Lab Wired Gateway
+        Device::new("ebc8dc02c02761c44e1iho", "W:tqKTs?g)agP62S"), // AUBESS 20A
+        Device::new("eb7ba8427911a8ccbda92w", "GyFSITk>TL8?EBRK"), // Office Light
+        Device::new("eb3ff73bef776e4a1aay8r", "c)H+2(TY@sY)e&5L"), // Wired Gateway
+        Device::new("eb5176f91956a97b165dc5", "FGhe;!?GLh$vv9<c"), // Lab Wired Gateway
     ];
 
     println!(

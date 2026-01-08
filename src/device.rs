@@ -214,7 +214,7 @@ impl DeviceBuilder {
     }
 
     #[must_use]
-    pub fn build(self) -> Device {
+    pub fn run(self) -> Device {
         Device::with_builder(self)
     }
 }
@@ -240,6 +240,24 @@ impl Drop for Device {
 }
 
 impl Device {
+    /// Creates a new device with default settings and starts the connection task.
+    pub fn new<I, K>(id: I, local_key: K) -> Self
+    where
+        I: Into<String>,
+        K: Into<Vec<u8>>,
+    {
+        DeviceBuilder::new(id, local_key).run()
+    }
+
+    /// Returns a builder to configure device settings before running.
+    pub fn builder<I, K>(id: I, local_key: K) -> DeviceBuilder
+    where
+        I: Into<String>,
+        K: Into<Vec<u8>>,
+    {
+        DeviceBuilder::new(id, local_key)
+    }
+
     pub(crate) fn with_builder(builder: DeviceBuilder) -> Self {
         let (addr, ip) = match builder.address.as_str() {
             "" | ADDR_AUTO => (ADDR_AUTO.to_string(), String::new()),

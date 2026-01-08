@@ -5,7 +5,7 @@
  * from a single Tuya device.
  */
 use futures_util::StreamExt;
-use rustuya::DeviceBuilder;
+use rustuya::Device;
 use std::time::Duration;
 
 #[tokio::main]
@@ -15,7 +15,7 @@ async fn main() {
     // 1. Initialize Device (Using Office Light as an example)
     let id = "eb7ba8427911a8ccbda92w";
     let key = "GyFSITk>TL8?EBRK";
-    let device = DeviceBuilder::new(id, key).address("Auto").build();
+    let device = Device::new(id, key);
 
     println!("[INFO] Starting listener for device: {}", id);
 

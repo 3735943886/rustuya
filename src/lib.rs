@@ -6,13 +6,10 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use rustuya::DeviceBuilder;
+//! use rustuya::sync::Device;
 //!
-//! let device = DeviceBuilder::new("DEVICE_ID", "DEVICE_KEY")
-//!     .address("DEVICE_ADDRESS")
-//!     .version("DEVICE_VERSION")
-//!     .build();
-//! // device.set_value(1, true); // Asynchronous call
+//! let device = Device::new("DEVICE_ID", "DEVICE_KEY");
+//! device.set_value(1, true);
 //! ```
 //!
 #[macro_use]
@@ -23,6 +20,7 @@ pub mod error;
 pub mod protocol;
 pub mod runtime;
 pub mod scanner;
+pub mod sync;
 
 pub use device::{Device, DeviceBuilder};
 pub use error::TuyaError;

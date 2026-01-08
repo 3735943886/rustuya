@@ -1,4 +1,4 @@
-use rustuya::DeviceBuilder;
+use rustuya::Device;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = "c)H+2(TY@sY)e&5L";
 
     // 1. 디바이스 설정 및 빌드
-    let device = DeviceBuilder::new(id, key).build();
+    let device = Device::new(id, key);
 
     println!("[INFO] Target Device: {}", id);
 
