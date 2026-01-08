@@ -27,7 +27,7 @@ The Local Key is required for encryption. It can be obtained by:
 ---
 
 ### **4. Is it possible to use Rustuya in synchronous code?**
-Yes. While the core is asynchronous (`tokio`), a synchronous wrapper is provided in `rustuya::sync` for Rust and Python.
+Yes. While the core is asynchronous, a synchronous wrapper is provided in `rustuya::sync` for Rust and Python.
 
 ---
 
