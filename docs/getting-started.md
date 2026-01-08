@@ -1,5 +1,7 @@
 # Getting Started
 
+A lightweight and efficient Rust library for controlling Tuya-compatible smart devices.
+
 ---
 
 ## **Rust Installation**
