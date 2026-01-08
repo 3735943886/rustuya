@@ -1148,7 +1148,8 @@ impl Device {
                 resp_tx,
             } => {
                 let nowait = self.nowait.load(Ordering::Relaxed);
-                let response_rx = if !nowait {
+                let cmd_code = command as u32;
+                let response_rx = if !nowait && ![3, 4, 5, 9].contains(&cmd_code) {
                     Some(self.broadcast_tx.subscribe())
                 } else {
                     None
@@ -1177,6 +1178,12 @@ impl Device {
                         loop {
                             match rx.recv().await {
                                 Ok(msg) => {
+                                    // 0. Check for error response from device (cmd 0)
+                                    if msg.cmd == 0 {
+                                        debug!("Device returned error response (cmd 0), returning as valid response");
+                                        return Ok(Some(msg));
+                                    }
+
                                     // 1. Check command ID
                                     let cmd_matches = msg.cmd == effective_cmd
                                         || msg.cmd == CommandType::Status as u32;
