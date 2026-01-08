@@ -252,8 +252,8 @@ impl DeviceBuilder {
         self
     }
 
-    pub fn connection_timeout(mut self, timeout: Duration) -> Self {
-        self.inner = self.inner.connection_timeout(timeout);
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.timeout(timeout);
         self
     }
 

@@ -274,7 +274,7 @@ pub struct Device {
 #[pymethods]
 impl Device {
     #[new]
-    #[pyo3(signature = (id, local_key, address="Auto", version="Auto", dev_type=None, persist=true, timeout_ms=None, nowait=false))]
+    #[pyo3(signature = (id, local_key, address="Auto", version="Auto", dev_type=None, persist=true, timeout=None, nowait=false))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         py: Python<'_>,
@@ -284,7 +284,7 @@ impl Device {
         version: &str,
         dev_type: Option<&str>,
         persist: bool,
-        timeout_ms: Option<u64>,
+        timeout: Option<f64>,
         nowait: bool,
     ) -> PyResult<Self> {
         let v = Version::from_str(version).map_err(|_| {
@@ -304,8 +304,8 @@ impl Device {
             builder = builder.dev_type(dt);
         }
 
-        if let Some(ms) = timeout_ms {
-            builder = builder.connection_timeout(Duration::from_millis(ms));
+        if let Some(secs) = timeout {
+            builder = builder.timeout(Duration::from_secs_f64(secs));
         }
 
         let inner = py.detach(|| builder.run());
@@ -360,10 +360,10 @@ impl Device {
         self.inner.persist()
     }
 
-    /// Returns the connection timeout in milliseconds.
+    /// Returns the connection timeout in seconds.
     #[getter]
-    pub fn connection_timeout(&self) -> u64 {
-        self.inner.connection_timeout().as_millis() as u64
+    pub fn timeout(&self) -> f64 {
+        self.inner.timeout().as_secs_f64()
     }
 
     /// Checks if the device is connected.
@@ -649,16 +649,107 @@ fn rustuya(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScannerIterator>()?;
 
     let cmd_type = PyDict::new(py);
-    cmd_type.set_item("DpQuery", ::rustuya::protocol::CommandType::DpQuery as u32)?;
+    cmd_type.set_item(
+        "ApConfig",
+        ::rustuya::protocol::CommandType::ApConfig as u32,
+    )?;
+    cmd_type.set_item("Active", ::rustuya::protocol::CommandType::Active as u32)?;
+    cmd_type.set_item(
+        "SessKeyNegStart",
+        ::rustuya::protocol::CommandType::SessKeyNegStart as u32,
+    )?;
+    cmd_type.set_item(
+        "SessKeyNegResp",
+        ::rustuya::protocol::CommandType::SessKeyNegResp as u32,
+    )?;
+    cmd_type.set_item(
+        "SessKeyNegFinish",
+        ::rustuya::protocol::CommandType::SessKeyNegFinish as u32,
+    )?;
+    cmd_type.set_item("Unbind", ::rustuya::protocol::CommandType::Unbind as u32)?;
     cmd_type.set_item("Control", ::rustuya::protocol::CommandType::Control as u32)?;
+    cmd_type.set_item("Status", ::rustuya::protocol::CommandType::Status as u32)?;
     cmd_type.set_item(
         "HeartBeat",
         ::rustuya::protocol::CommandType::HeartBeat as u32,
     )?;
-    cmd_type.set_item("Status", ::rustuya::protocol::CommandType::Status as u32)?;
+    cmd_type.set_item("DpQuery", ::rustuya::protocol::CommandType::DpQuery as u32)?;
     cmd_type.set_item(
         "QueryWifi",
         ::rustuya::protocol::CommandType::QueryWifi as u32,
+    )?;
+    cmd_type.set_item(
+        "TokenBind",
+        ::rustuya::protocol::CommandType::TokenBind as u32,
+    )?;
+    cmd_type.set_item(
+        "ControlNew",
+        ::rustuya::protocol::CommandType::ControlNew as u32,
+    )?;
+    cmd_type.set_item(
+        "EnableWifi",
+        ::rustuya::protocol::CommandType::EnableWifi as u32,
+    )?;
+    cmd_type.set_item(
+        "WifiInfo",
+        ::rustuya::protocol::CommandType::WifiInfo as u32,
+    )?;
+    cmd_type.set_item(
+        "DpQueryNew",
+        ::rustuya::protocol::CommandType::DpQueryNew as u32,
+    )?;
+    cmd_type.set_item(
+        "SceneExecute",
+        ::rustuya::protocol::CommandType::SceneExecute as u32,
+    )?;
+    cmd_type.set_item(
+        "UpdateDps",
+        ::rustuya::protocol::CommandType::UpdateDps as u32,
+    )?;
+    cmd_type.set_item("UdpNew", ::rustuya::protocol::CommandType::UdpNew as u32)?;
+    cmd_type.set_item(
+        "ApConfigNew",
+        ::rustuya::protocol::CommandType::ApConfigNew as u32,
+    )?;
+    cmd_type.set_item(
+        "LanGwActive",
+        ::rustuya::protocol::CommandType::LanGwActive as u32,
+    )?;
+    cmd_type.set_item(
+        "LanSubDevRequest",
+        ::rustuya::protocol::CommandType::LanSubDevRequest as u32,
+    )?;
+    cmd_type.set_item(
+        "LanDeleteSubDev",
+        ::rustuya::protocol::CommandType::LanDeleteSubDev as u32,
+    )?;
+    cmd_type.set_item(
+        "LanReportSubDev",
+        ::rustuya::protocol::CommandType::LanReportSubDev as u32,
+    )?;
+    cmd_type.set_item(
+        "LanScene",
+        ::rustuya::protocol::CommandType::LanScene as u32,
+    )?;
+    cmd_type.set_item(
+        "LanPublishCloudConfig",
+        ::rustuya::protocol::CommandType::LanPublishCloudConfig as u32,
+    )?;
+    cmd_type.set_item(
+        "LanExportAppConfig",
+        ::rustuya::protocol::CommandType::LanExportAppConfig as u32,
+    )?;
+    cmd_type.set_item(
+        "LanPublishAppConfig",
+        ::rustuya::protocol::CommandType::LanPublishAppConfig as u32,
+    )?;
+    cmd_type.set_item(
+        "ReqDevInfo",
+        ::rustuya::protocol::CommandType::ReqDevInfo as u32,
+    )?;
+    cmd_type.set_item(
+        "LanExtStream",
+        ::rustuya::protocol::CommandType::LanExtStream as u32,
     )?;
     m.add("CommandType", cmd_type)?;
 

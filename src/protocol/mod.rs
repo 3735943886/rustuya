@@ -258,6 +258,7 @@ pub fn get_protocol(version: Version, dev_type: DeviceType) -> Box<dyn TuyaProto
         Version::V3_3 => Box::new(v33::ProtocolV33),
         Version::V3_4 => Box::new(v34::ProtocolV34),
         Version::V3_5 => Box::new(v35::ProtocolV35),
+        // Fallback to v3.3 if version is Auto or unknown
         _ => Box::new(v33::ProtocolV33),
     };
 

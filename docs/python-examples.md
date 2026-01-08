@@ -15,8 +15,8 @@ import time
 # IP address and version can be "Auto" for automatic discovery if the device is on the same subnet
 dev = Device(
     id="DEVICE_ID",
-    address="DEVICE_IP", # Or "Auto"
     local_key="LOCAL_KEY",
+    address="DEVICE_IP", # Or "Auto"
     version="DEVICE_VER" # Or "Auto"
 )
 
@@ -45,7 +45,8 @@ Tuya devices are push-based. Use the `listener()` to receive real-time updates.
 ```python
 from rustuya import Device
 
-dev = Device("DEVICE_ID", "DEVICE_IP", "LOCAL_KEY", "DEVICE_VER")
+# Using positional arguments: (id, local_key, address, version)
+dev = Device("DEVICE_ID", "LOCAL_KEY", "DEVICE_IP", "DEVICE_VER")
 
 print("Starting listener... (Press Ctrl+C to stop)")
 try:
@@ -62,12 +63,12 @@ except KeyboardInterrupt:
 Search for Tuya devices on the local network.
 
 ```python
-from rustuya import Scanner
+from rustuya import get_scanner
 
 print("Scanning for devices...")
 
 # Create scanner and set timeout to 5 seconds
-results = Scanner().scan()
+results = get_scanner().scan()
 
 print(f"Found {len(results)} devices:")
 for dev in results:
@@ -76,18 +77,42 @@ for dev in results:
     print(f"  Ver: {dev['version']}")
     print(f"  Product ID: {dev['product_id']}")
     print("-" * 20)
+
+# Alternative: Real-time scan stream
+print("Streaming discovered devices...")
+for dev in get_scanner().scan_stream():
+    print(f"Found: {dev['id']} at {dev['ip']}")
 ```
 
 ---
 
-## **4. Gateway & Sub-devices**
+## **4. Unified Listener (Multiple Devices)**
+Monitor multiple devices simultaneously using a single event loop.
+
+```python
+from rustuya import Device, unified_listener
+
+dev1 = Device("ID1", "KEY1")
+dev2 = Device("ID2", "KEY2")
+
+print("Monitoring multiple devices...")
+
+# unified_listener takes a list of Device objects
+for event in unified_listener([dev1, dev2]):
+    # Events include device information
+    print(f"Device {event['id']} sent: {event['data']}")
+```
+
+---
+
+## **6. Gateway & Sub-devices**
 Control Zigbee or Bluetooth devices connected via a Tuya Gateway.
 
 ```python
 from rustuya import Device
 
-# 1. Connect to the Gateway itself
-gateway = Device("GATEWAY_ID", "GATEWAY_IP", "GATEWAY_KEY", "GATEWAY_VER")
+# 1. Connect to the Gateway itself (id, key, address, version)
+gateway = Device("GATEWAY_ID", "GATEWAY_KEY", "GATEWAY_IP", "GATEWAY_VER")
 
 # 2. Get a handle for a sub-device using its CID
 sub_dev = gateway.sub("SUB_DEVICE_CID")
@@ -106,18 +131,31 @@ gateway.sub_discover()
 
 ---
 
-## **5. Advanced Raw Requests**
+## **7. Advanced Raw Requests**
 Send custom commands using `CommandType`.
 
 ```python
 from rustuya import Device, CommandType
 
-dev = Device("id", "addr", "key", "ver")
+# Using positional arguments: id, key, address, version
+dev = Device("DEVICE_ID", "LOCAL_KEY", "DEVICE_IP", "DEVICE_VER")
 
 # Send a DpQuery (Status) request manually
-# CommandType keys match the Rust CommandType enum
+# CommandType provides common command codes
 dev.request(CommandType["DpQuery"], None)
 
-# Send with custom JSON data
-# dev.request(CommandType["DpControl"], {"1": True})
+# Send with custom JSON data (e.g., Control)
+# dev.request(CommandType["Control"], {"1": True})
+```
+
+---
+
+## **8. System Optimization**
+For high-performance applications managing many devices.
+
+```python
+import rustuya
+
+# Increase open file descriptor limits (especially for Linux)
+rustuya.maximize_fd_limit()
 ```

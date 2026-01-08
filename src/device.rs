@@ -139,7 +139,7 @@ struct DeviceState {
     failure_count: u32,
     success_count: u32,
     force_discovery: bool,
-    connection_timeout: Duration,
+    timeout: Duration,
     cipher: Option<Arc<TuyaCipher>>,
 }
 
@@ -151,7 +151,7 @@ pub struct DeviceBuilder {
     dev_type: DeviceType,
     port: u16,
     persist: bool,
-    connection_timeout: Duration,
+    timeout: Duration,
     nowait: bool,
 }
 
@@ -169,7 +169,7 @@ impl DeviceBuilder {
             dev_type: DeviceType::Auto,
             port: 6668,
             persist: true,
-            connection_timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(10),
             nowait: false,
         }
     }
@@ -202,8 +202,8 @@ impl DeviceBuilder {
     }
 
     #[must_use]
-    pub fn connection_timeout(mut self, timeout: Duration) -> Self {
-        self.connection_timeout = timeout;
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -280,7 +280,7 @@ impl Device {
             failure_count: 0,
             success_count: 0,
             force_discovery: false,
-            connection_timeout: builder.connection_timeout,
+            timeout: builder.timeout,
             cipher: TuyaCipher::new(&builder.local_key).ok().map(Arc::new),
         };
 
@@ -357,10 +357,10 @@ impl Device {
         self.with_state(|s| s.state == ConnectionState::Stopped)
     }
 
-    /// Returns the connection timeout duration.
+    /// Returns the timeout duration for network operations and responses.
     #[must_use]
-    pub fn connection_timeout(&self) -> Duration {
-        self.with_state(|s| s.connection_timeout)
+    pub fn timeout(&self) -> Duration {
+        self.with_state(|s| s.timeout)
     }
 
     #[must_use]
@@ -385,8 +385,8 @@ impl Device {
         self.with_state_mut(|s| s.persist = persist);
     }
 
-    pub fn set_connection_timeout(&self, timeout: Duration) {
-        self.with_state_mut(|s| s.connection_timeout = timeout);
+    pub fn set_timeout(&self, timeout: Duration) {
+        self.with_state_mut(|s| s.timeout = timeout);
     }
 
     pub fn set_port(&self, port: u16) {
@@ -856,11 +856,7 @@ impl Device {
                 self.wait_for_backoff(rx, b).await?;
             }
 
-            let result = timeout(
-                self.connection_timeout() * 2,
-                self.connect_and_handshake(seqno),
-            )
-            .await;
+            let result = timeout(self.timeout() * 2, self.connect_and_handshake(seqno)).await;
             if let Ok(Ok(s)) = result {
                 self.with_state_mut(|s| s.state = ConnectionState::Connected);
                 info!(
@@ -889,11 +885,9 @@ impl Device {
                         match rx.recv().await {
                             Some(DeviceCommand::ConnectNow) => break,
                             Some(cmd @ DeviceCommand::Request { .. }) => {
-                                let retry_result = timeout(
-                                    self.connection_timeout() * 2,
-                                    self.connect_and_handshake(seqno),
-                                )
-                                .await;
+                                let retry_result =
+                                    timeout(self.timeout() * 2, self.connect_and_handshake(seqno))
+                                        .await;
 
                                 if let Ok(Ok(s)) = retry_result {
                                     self.with_state_mut(|s| s.state = ConnectionState::Connected);
@@ -1027,16 +1021,13 @@ impl Device {
         let port = self.with_state(|s| s.port);
 
         info!("Connecting to device {} at {}:{}", self.id, addr, port);
-        let mut stream = timeout(
-            self.connection_timeout(),
-            TcpStream::connect(format!("{addr}:{port}")),
-        )
-        .await
-        .map_err(|_| TuyaError::Timeout)?
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::ConnectionRefused => TuyaError::ConnectionFailed,
-            _ => TuyaError::Io(e.to_string()),
-        })?;
+        let mut stream = timeout(self.timeout(), TcpStream::connect(format!("{addr}:{port}")))
+            .await
+            .map_err(|_| TuyaError::Timeout)?
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::ConnectionRefused => TuyaError::ConnectionFailed,
+                _ => TuyaError::Io(e.to_string()),
+            })?;
 
         let protocol = get_protocol(self.version(), self.dev_type());
         if protocol.requires_session_key()
@@ -1065,7 +1056,7 @@ impl Device {
         .await?;
 
         // 2. Read response and verify
-        let first_byte = timeout(self.connection_timeout(), stream.read_u8())
+        let first_byte = timeout(self.timeout(), stream.read_u8())
             .await
             .map_err(|_| TuyaError::Timeout)?
             .map_err(|e| {
@@ -1200,7 +1191,7 @@ impl Device {
                 if let Some(mut rx) = response_rx {
                     let protocol = self.with_state(|s| get_protocol(s.version, s.dev_type));
                     let effective_cmd = protocol.get_effective_command(command);
-                    let timeout_dur = self.connection_timeout();
+                    let timeout_dur = self.timeout();
 
                     let wait_res = timeout(timeout_dur, async {
                         loop {
@@ -1382,7 +1373,7 @@ impl Device {
         msg: TuyaMessage,
     ) -> Result<()> {
         let packed = self.pack_msg(msg)?;
-        timeout(self.connection_timeout(), stream.write_all(&packed))
+        timeout(self.timeout(), stream.write_all(&packed))
             .await
             .map_err(|_| TuyaError::Timeout)?
             .map_err(TuyaError::from)?;
@@ -1404,13 +1395,10 @@ impl Device {
         // Read remaining 12 bytes of header (16 bytes total)
         let mut header_buf = [0u8; 16];
         header_buf[0..4].copy_from_slice(&prefix);
-        timeout(
-            self.connection_timeout(),
-            stream.read_exact(&mut header_buf[4..]),
-        )
-        .await
-        .map_err(|_| TuyaError::Timeout)?
-        .map_err(TuyaError::from)?;
+        timeout(self.timeout(), stream.read_exact(&mut header_buf[4..]))
+            .await
+            .map_err(|_| TuyaError::Timeout)?
+            .map_err(TuyaError::from)?;
 
         // Parse and read body
         let dev_type_before = self.dev_type();
@@ -1453,7 +1441,7 @@ impl Device {
         let mut current_prefix = first_byte as u32;
 
         for _ in 0..3 {
-            let next_byte = timeout(self.connection_timeout(), stream.read_u8())
+            let next_byte = timeout(self.timeout(), stream.read_u8())
                 .await
                 .map_err(|_| TuyaError::Timeout)?
                 .map_err(TuyaError::from)?;
@@ -1465,7 +1453,7 @@ impl Device {
                 return Ok(Some(current_prefix.to_be_bytes()));
             }
 
-            let next_byte = timeout(self.connection_timeout(), stream.read_u8())
+            let next_byte = timeout(self.timeout(), stream.read_u8())
                 .await
                 .map_err(|_| TuyaError::Timeout)?
                 .map_err(TuyaError::from)?;
@@ -1504,7 +1492,7 @@ impl Device {
 
         let (header, mut packet) = if prefix == PREFIX_6699 {
             let mut extra = [0u8; 2];
-            timeout(self.connection_timeout(), stream.read_exact(&mut extra))
+            timeout(self.timeout(), stream.read_exact(&mut extra))
                 .await
                 .map_err(|_| TuyaError::Timeout)?
                 .map_err(TuyaError::from)?;
@@ -1521,13 +1509,10 @@ impl Device {
         let header_len = packet.len();
 
         packet.resize(total_len, 0);
-        timeout(
-            self.connection_timeout(),
-            stream.read_exact(&mut packet[header_len..]),
-        )
-        .await
-        .map_err(|_| TuyaError::Timeout)?
-        .map_err(TuyaError::from)?;
+        timeout(self.timeout(), stream.read_exact(&mut packet[header_len..]))
+            .await
+            .map_err(|_| TuyaError::Timeout)?
+            .map_err(TuyaError::from)?;
 
         Ok((packet, header))
     }

@@ -35,7 +35,7 @@ Direct interaction with individual Tuya devices.
 
 ### `Device::new()`
 - **Definition**: `pub fn new<I, K>(id: I, local_key: K) -> Device`
-- **Description**: Creates a new device handle with default settings (auto-discovery, version 3.3).
+- **Description**: Creates a new device handle with default settings (auto-discovery).
 - **Arguments**: 
   - `id`: Device ID (String or &str)
   - `local_key`: Local Key (String, &str, or Vec<u8>)
@@ -49,10 +49,12 @@ Direct interaction with individual Tuya devices.
 - **Definition**: `pub fn builder<I, K>(id: I, local_key: K) -> DeviceBuilder`
 - **Description**: Returns a builder to configure advanced settings before starting the connection.
 - **Settings available in Builder**:
-  - `.address(addr)`: Specific IP address (default: auto-discovery).
-  - `.version(ver)`: Tuya protocol version (default: 3.3).
-  - `.nowait(bool)`: Global `nowait` setting for this device instance.
-  - `.persist(bool)`: Keep connection alive (default: true).
+    - `.address(addr)`: Specific IP address (default: auto-discovery).
+    - `.version(ver)`: Tuya protocol version (default: auto).
+    - `.dev_type(type)`: Device type (default: auto). Values: auto, default, device22.
+    - `.persist(bool)`: Keep connection alive (default: true).
+    - `.timeout(Duration)`: Global timeout for network operations and responses (default: 10s).
+    - `.nowait(bool)`: Do not wait for response (default: false).
 - **Example**:
   ```rust
   let device = Device::builder("id", "key")

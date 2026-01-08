@@ -23,13 +23,16 @@ To handle high-concurrency environments with many device connections, use this u
 Direct interaction and control for individual Tuya devices.
 
 ### `Device()`
-- **Definition**: `Device(id, local_key, address="Auto", version="Auto", dev_type=None, persist=True, timeout_ms=None, nowait=False)`
+- **Definition**: `Device(id, local_key, address="Auto", version="Auto", dev_type=None, persist=True, timeout=None, nowait=False)`
 - **Description**: Creates a new device handle.
 - **Arguments**:
   - `id`: Device ID (str)
   - `local_key`: Local Key (str)
   - `address`: IP address (default: "Auto" for discovery)
   - `version`: Protocol version (default: "Auto" for discovery)
+  - `dev_type`: Device type (default: `None` / "auto"). Values: "auto", "default", "device22".
+  - `persist`: If `True`, keeps the TCP connection alive (default: True).
+  - `timeout`: Global timeout for network operations and responses in seconds (default: 10.0)
   - `nowait`: If `True`, commands return immediately after queuing (default: False).
 - **Example**:
   ```python
@@ -73,10 +76,15 @@ Direct interaction and control for individual Tuya devices.
 
 ### `unified_listener()`
 - **Description**: Aggregates event streams from multiple devices into a single receiver.
+- **Arguments**: `devices` (list of `Device` objects)
+- **Returns**: `UnifiedEventReceiver`
 - **Example**:
   ```python
   from rustuya import unified_listener
   listener = unified_listener([dev1, dev2])
+  for event in listener:
+      # event is a dict containing 'id' and 'data' (the message)
+      print(f"Device {event['id']} updated: {event['data']}")
   ```
 
 ---
