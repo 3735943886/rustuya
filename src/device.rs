@@ -580,6 +580,39 @@ impl Device {
     }
 }
 
+/// Represents an event from a specific device.
+#[derive(Debug, Clone)]
+pub struct DeviceEvent {
+    /// The ID of the device that generated the event.
+    pub device_id: String,
+    /// The message received from the device.
+    pub message: TuyaMessage,
+}
+
+/// Merges multiple device listeners into a single stream of events.
+pub fn unified_listener(
+    devices: Vec<Device>,
+) -> impl Stream<Item = Result<DeviceEvent>> + Send + 'static {
+    use futures_util::StreamExt;
+    use futures_util::stream::select_all;
+
+    let streams = devices.into_iter().map(|device| {
+        let device_id = device.id().to_string();
+        device
+            .listener()
+            .map(move |res| match res {
+                Ok(message) => Ok(DeviceEvent {
+                    device_id: device_id.clone(),
+                    message,
+                }),
+                Err(e) => Err(e),
+            })
+            .boxed()
+    });
+
+    select_all(streams)
+}
+
 impl Device {
     async fn run_connection_task(&self, mut rx: mpsc::Receiver<DeviceCommand>) {
         let jitter = {

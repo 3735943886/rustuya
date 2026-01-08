@@ -133,7 +133,7 @@ type ReceiverResult = (
 impl Scanner {
     /// Creates a new Scanner with default settings.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let scanner = Self {
             inner: Arc::new(ScannerState::new()),
             timeout: DEFAULT_SCAN_TIMEOUT,
@@ -192,6 +192,7 @@ impl Scanner {
         if !state.listener_started.swap(true, Ordering::SeqCst) {
             let cancel_token = state.cancel_token.clone();
             let state_weak = Arc::downgrade(&self.inner);
+            let scanner_clone = self.clone();
 
             let (mut rx, tasks) = Self::spawn_receiver_tasks(new_sockets, cancel_token.clone());
             {
@@ -202,12 +203,11 @@ impl Scanner {
             crate::runtime::spawn(async move {
                 debug!("Starting background passive listener task...");
 
-                let scanner_temp = Scanner::new_silent();
                 loop {
                     tokio::select! {
                         () = cancel_token.cancelled() => break,
                         Some((data, _addr)) = rx.recv() => {
-                            if let Some(res) = scanner_temp.parse_packet(&data) {
+                            if let Some(res) = scanner_clone.parse_packet(&data) {
                                 let state = match state_weak.upgrade() {
                                     Some(s) => s,
                                     None => break,
@@ -292,15 +292,6 @@ impl Scanner {
         // we must enter the global background runtime.
         let _guard = crate::runtime::get_runtime().enter();
         Ok(UdpSocket::from_std(std_socket)?)
-    }
-
-    fn new_silent() -> Self {
-        Self {
-            inner: Arc::new(ScannerState::new()),
-            timeout: DEFAULT_SCAN_TIMEOUT,
-            bind_addr: "0.0.0.0".to_string(),
-            ports: vec![6666, 6667, 7000],
-        }
     }
 
     /// Stops background passive listener.

@@ -3,19 +3,16 @@
  *
  * This example demonstrates how to use the asynchronous UDP scanner to find
  * Tuya devices on the local network in real-time using a Stream.
- *
- * Author: 3735943886
  */
 use futures_util::StreamExt;
-use rustuya::scanner::Scanner;
 
 #[tokio::main]
 async fn main() {
     println!("--- Rustuya - Scanner (Async) ---");
-    println!("Scanning the network for Tuya devices in real-time...");
+    println!("[INFO] Scanning the network for Tuya devices in real-time...");
 
-    // 1. Create a new scanner with a custom timeout
-    let scanner = Scanner::new();
+    // 1. Get the global scanner instance
+    let scanner = rustuya::scanner::get();
 
     // 2. Get a stream of discovery results
     let stream = scanner.scan_stream();
@@ -32,5 +29,5 @@ async fn main() {
         );
     }
 
-    println!("Scan finished. Total devices found: {count}");
+    println!("[INFO] Scan finished. Total devices found: {count}");
 }
