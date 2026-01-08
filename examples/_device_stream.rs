@@ -25,7 +25,7 @@ async fn main() {
 
     // 3. Process events in real-time
     println!("[INFO] Waiting for events (Press Ctrl+C to stop)...");
-    
+
     let timeout = tokio::time::sleep(Duration::from_secs(60));
     tokio::pin!(timeout);
 

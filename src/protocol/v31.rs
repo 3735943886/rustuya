@@ -45,14 +45,16 @@ impl TuyaProtocol for ProtocolV31 {
                 payload.remove("gwId");
             }
             CommandType::LanExtStream => {
-                payload = data
-                    .unwrap_or_else(|| serde_json::json!({}))
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default();
-                if let Some(c) = cid {
-                    payload.insert("cid".into(), c.into());
-                    payload.insert("ctype".into(), 0.into());
+                // For LanExtStream in v3.1 and below, we keep everything at root
+                payload.clear();
+                if let Some(Value::Object(mut data_obj)) = data {
+                    if let Some(req_type) = data_obj.remove("reqType") {
+                        payload.insert("reqType".into(), req_type);
+                    }
+                    // Move remaining fields from data_obj to payload root
+                    for (k, v) in data_obj {
+                        payload.insert(k, v);
+                    }
                 }
             }
             CommandType::Status | CommandType::HeartBeat => {

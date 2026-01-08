@@ -6,7 +6,6 @@
  */
 use futures_util::StreamExt;
 use rustuya::device::{DeviceBuilder, unified_listener};
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -20,7 +19,10 @@ async fn main() {
         DeviceBuilder::new("eb5176f91956a97b165dc5", "FGhe;!?GLh$vv9<c").build(), // Lab Wired Gateway
     ];
 
-    println!("[INFO] Created {} devices. Starting unified listener...", devices.len());
+    println!(
+        "[INFO] Created {} devices. Starting unified listener...",
+        devices.len()
+    );
 
     // 2. Create a unified listener stream
     let stream = unified_listener(devices);
@@ -28,10 +30,6 @@ async fn main() {
 
     // 3. Process events from any of the devices in a single loop
     println!("[INFO] Waiting for events (Press Ctrl+C to stop)...");
-    
-    // Add a simple timeout for example safety
-    let timeout = tokio::time::sleep(Duration::from_secs(60));
-    tokio::pin!(timeout);
 
     loop {
         tokio::select! {
@@ -49,10 +47,6 @@ async fn main() {
                         eprintln!("[ERROR] Error receiving event: {}", e);
                     }
                 }
-            }
-            _ = &mut timeout => {
-                println!("[INFO] Example timeout reached. Exiting.");
-                break;
             }
         }
     }

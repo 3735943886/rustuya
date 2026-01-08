@@ -71,11 +71,11 @@ impl SubDevice {
         &self.cid
     }
 
-    pub async fn status(&self) -> Result<Option<TuyaMessage>> {
+    pub async fn status(&self) -> Result<Option<String>> {
         self.request(CommandType::DpQuery, None).await
     }
 
-    pub async fn set_dps(&self, dps: Value) -> Result<Option<TuyaMessage>> {
+    pub async fn set_dps(&self, dps: Value) -> Result<Option<String>> {
         self.request(CommandType::Control, Some(dps)).await
     }
 
@@ -84,7 +84,7 @@ impl SubDevice {
         &self,
         index: I,
         value: T,
-    ) -> Result<Option<TuyaMessage>> {
+    ) -> Result<Option<String>> {
         if let Ok(val) = serde_json::to_value(value) {
             self.set_dps(serde_json::json!({ index.to_string(): val }))
                 .await
@@ -93,11 +93,7 @@ impl SubDevice {
         }
     }
 
-    pub async fn request(
-        &self,
-        cmd: CommandType,
-        data: Option<Value>,
-    ) -> Result<Option<TuyaMessage>> {
+    pub async fn request(&self, cmd: CommandType, data: Option<Value>) -> Result<Option<String>> {
         self.parent.request(cmd, data, Some(self.cid.clone())).await
     }
 }
@@ -420,13 +416,13 @@ impl Device {
         }
     }
 
-    pub async fn status(&self) -> Result<Option<TuyaMessage>> {
+    pub async fn status(&self) -> Result<Option<String>> {
         self.request(CommandType::DpQuery, None, None).await
     }
 
     /// Sets multiple DP values at once.
     /// The `dps` argument should be a `serde_json::Value` object where keys are DP IDs.
-    pub async fn set_dps(&self, dps: Value) -> Result<Option<TuyaMessage>> {
+    pub async fn set_dps(&self, dps: Value) -> Result<Option<String>> {
         self.request(CommandType::Control, Some(dps), None).await
     }
 
@@ -437,7 +433,7 @@ impl Device {
         &self,
         dp_id: I,
         value: T,
-    ) -> Result<Option<TuyaMessage>> {
+    ) -> Result<Option<String>> {
         if let Ok(val) = serde_json::to_value(value) {
             self.set_dps(serde_json::json!({ dp_id.to_string(): val }))
                 .await
@@ -446,7 +442,7 @@ impl Device {
         }
     }
 
-    pub async fn sub_discover(&self) -> Result<Option<TuyaMessage>> {
+    pub async fn sub_discover(&self) -> Result<Option<String>> {
         let data = serde_json::json!({
             "cids": [],
             keys::REQ_TYPE: "subdev_online_stat_query"
@@ -470,15 +466,27 @@ impl Device {
         command: CommandType,
         data: Option<Value>,
         cid: Option<String>,
-    ) -> Result<Option<TuyaMessage>> {
+    ) -> Result<Option<String>> {
         debug!("request: cmd={command:?}, data={data:?}");
-        self.send_command_to_task(|resp_tx| DeviceCommand::Request {
-            command,
-            data,
-            cid,
-            resp_tx,
-        })
-        .await
+        let resp = self
+            .send_command_to_task(|resp_tx| DeviceCommand::Request {
+                command,
+                data,
+                cid,
+                resp_tx,
+            })
+            .await?;
+
+        match resp {
+            Some(msg) => {
+                if let Some(s) = msg.payload_as_string() {
+                    Ok(Some(s))
+                } else {
+                    Ok(Some(hex::encode(&msg.payload)))
+                }
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -1155,7 +1163,9 @@ impl Device {
                     None
                 };
 
-                let res = self.generate_payload(command, data, cid.as_deref()).await;
+                let res = self
+                    .generate_payload(command, data.clone(), cid.as_deref())
+                    .await;
                 let send_res = match res {
                     Ok((cmd_id, payload)) => {
                         debug!("Sending command: cmd=0x{:02X}, seqno={}", cmd_id, *seqno);
@@ -1189,6 +1199,12 @@ impl Device {
                                         || msg.cmd == CommandType::Status as u32;
 
                                     if !cmd_matches {
+                                        continue;
+                                    }
+
+                                    // 2. If we sent data, but got an empty response (ACK), keep waiting for the real data
+                                    if data.is_some() && msg.payload.is_empty() {
+                                        debug!("Received empty response (ACK) for request with data, continuing to wait for actual response...");
                                         continue;
                                     }
 
