@@ -133,7 +133,7 @@ Interaction with sub-devices (endpoints) through a parent Gateway `Device`. Obta
 - **Returns**: `Result<Option<String>>`
 - **Example**:
   ```rust
-  sub.set_value(1, "on").await?;
+  sub.set_value(1, true).await?;
   ```
 
 ---
@@ -161,7 +161,7 @@ UDP-based device discovery on the local network.
   ```rust
   let mut stream = Scanner::scan_stream();
   while let Some(device) = stream.next().await {
-      println!("Discovered: {} ({})", device.id, device.ip);
+      println!("Found device: {} at {}", device.id, device.ip);
   }
   ```
 

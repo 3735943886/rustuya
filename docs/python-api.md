@@ -103,7 +103,7 @@ Interaction with sub-devices (endpoints) through a parent Gateway `Device`. Obta
 - **Description**: These methods mirror the `Device` API but target the specific sub-device via the parent gateway.
 - **Example**:
   ```python
-  sub.set_value(1, "on")
+  sub.set_value(1, True)
   ```
 
 ---
@@ -126,8 +126,9 @@ Search for devices on the local network.
 - **Example**:
   ```python
   from rustuya import Scanner
-  for dev in Scanner.scan_stream():
-      print(f"Discovered: {dev['id']}")
+  stream = Scanner.scan_stream()
+  for dev in stream:
+      print(f"Found: {dev['id']} at {dev['ip']}")
   ```
 
 ### `Scanner.discover()`
