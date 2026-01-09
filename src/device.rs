@@ -40,6 +40,9 @@ const DATA_UNVALID: &str = "data unvalid";
 const CHAN_BROADCAST_CAPACITY: usize = 128;
 const CHAN_MPSC_CAPACITY: usize = 64;
 
+/// Commands that must return data (payload) and should not return on empty ACK.
+const MANDATORY_DATA_CMDS: &[u32] = &[CommandType::LanExtStream as u32];
+
 mod keys {
     pub const REQ_TYPE: &str = "reqType";
 
@@ -1211,10 +1214,17 @@ impl Device {
                                         continue;
                                     }
 
+                                    // 1.1 Check if this command requires data (must wait if payload is empty)
+                                    let needs_data = MANDATORY_DATA_CMDS.contains(&msg.cmd);
+
                                     // Found matching response
                                     // 2. If we sent a request with a specific CID, verify the response CID matches
                                     if let Some(ref target_cid) = cid {
                                         if msg.payload.is_empty() {
+                                            if needs_data {
+                                                trace!("Received empty ACK for command requiring data (0x{:02X}), continuing wait", msg.cmd);
+                                                continue;
+                                            }
                                             // Empty payload for CID request is considered a valid ACK
                                             debug!("Received empty ACK for CID request ({}), accepting", target_cid);
                                             return Ok(Some(msg));
@@ -1234,6 +1244,10 @@ impl Device {
                                     } else {
                                         // Request without CID (parent device request)
                                         if msg.payload.is_empty() {
+                                            if needs_data {
+                                                trace!("Received empty ACK for parent command requiring data (0x{:02X}), continuing wait", msg.cmd);
+                                                continue;
+                                            }
                                             return Ok(Some(msg));
                                         }
 
