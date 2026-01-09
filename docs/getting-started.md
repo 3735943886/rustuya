@@ -10,7 +10,7 @@ Add the following to the `Cargo.toml` file:
 
 ```toml
 [dependencies]
-rustuya = "0.1"
+rustuya = "0.2"
 ```
 
 ### **Quick Start (Rust)**
