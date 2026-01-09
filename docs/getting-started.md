@@ -57,14 +57,6 @@ print(device.set_value(1, True))
 
 ---
 
-## **System Optimization**
-When managing a large number of concurrent device connections on Unix-like systems, it is recommended to maximize the file descriptor limit at the start of the application:
-
-- **Rust**: `rustuya::maximize_fd_limit().ok();`
-- **Python**: `rustuya.maximize_fd_limit()`
-
----
-
 ## **Next Steps**
 - Read the [Design Philosophy](./philosophy.md) to understand the connection management model.
 - Check the [Rust API Reference](./rust-api.md) for detailed Rust documentation.

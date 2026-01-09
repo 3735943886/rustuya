@@ -12,10 +12,11 @@ from rustuya import Device
 import time
 
 # Initialize device
-# IP address and version can be "Auto" for automatic discovery if the device is on the same subnet
+# id and local_key are required (positional)
+# address and version are optional (keyword)
 dev = Device(
-    id="DEVICE_ID",
-    local_key="LOCAL_KEY",
+    "DEVICE_ID", 
+    "LOCAL_KEY", 
     address="DEVICE_IP", # Or "Auto"
     version="DEVICE_VER" # Or "Auto"
 )
@@ -75,7 +76,6 @@ for dev in results:
     print(f"- ID: {dev['id']}")
     print(f"  IP: {dev['ip']}")
     print(f"  Ver: {dev['version']}")
-    print(f"  Product ID: {dev['product_id']}")
     print("-" * 20)
 
 # Alternative: Real-time scan stream directly from Scanner class
@@ -87,42 +87,41 @@ for dev in Scanner.scan_stream():
 ---
 
 ## **4. Unified Listener (Multiple Devices)**
-Monitor multiple devices simultaneously using a single event loop.
+Monitor events from multiple devices in a single loop.
 
 ```python
 from rustuya import Device, unified_listener
 
-dev1 = Device("ID1", "KEY1")
-dev2 = Device("ID2", "KEY2")
+dev1 = Device("id1", "key1")
+dev2 = Device("id2", "key2")
 
-print("Monitoring multiple devices...")
+# Aggregates events from all provided devices
+listener = unified_listener([dev1, dev2])
 
-# unified_listener takes a list of Device objects
-for event in unified_listener([dev1, dev2]):
-    # Events include device information
-    print(f"Device {event['id']} sent: {event['data']}")
+print("Listening for events from all devices...")
+for event in listener:
+    print(f"Event from {event['id']}: {event['payload']}")
 ```
 
 ---
 
 ## **6. Gateway & Sub-devices**
-Control Zigbee or Bluetooth devices connected via a Tuya Gateway.
+To control sub-devices connected via a Zigbee/Bluetooth gateway.
 
 ```python
 from rustuya import Device
 
-# 1. Connect to the Gateway itself (id, key, address, version)
-gateway = Device("GATEWAY_ID", "GATEWAY_KEY", "GATEWAY_IP", "GATEWAY_VER")
+# 1. Connect to the Gateway (id and local_key are positional)
+gateway = Device("GATEWAY_ID", "GATEWAY_KEY", address="GATEWAY_IP")
 
-# 2. Get a handle for a sub-device using its CID
+# 2. Get a handle for a sub-device using its Child ID (cid)
 sub_dev = gateway.sub("SUB_DEVICE_CID")
 
-# 3. Control the sub-device
+# 3. Control sub-device (same API as Device)
 print("Turning sub-device ON...")
 sub_dev.set_value(1, True)
-
-# 4. Request sub-device status
-sub_dev.status()
+status = sub_dev.status()
+print(f"Sub-device status: {status}")
 
 # 5. Discover all sub-devices connected to the gateway
 print("Requesting sub-device discovery...")

@@ -1211,13 +1211,43 @@ impl Device {
                                         continue;
                                     }
 
-                                    // 2. If we sent data, but got an empty response (ACK), keep waiting for the real data
-                                    if data.is_some() && msg.payload.is_empty() {
-                                        debug!("Received empty response (ACK) for request with data, continuing to wait for actual response...");
-                                        continue;
+                                    // Found matching response
+                                    // 2. If we sent a request with a specific CID, verify the response CID matches
+                                    if let Some(ref target_cid) = cid {
+                                        if msg.payload.is_empty() {
+                                            // Empty payload for CID request is considered a valid ACK
+                                            debug!("Received empty ACK for CID request ({}), accepting", target_cid);
+                                            return Ok(Some(msg));
+                                        }
+
+                                        if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
+                                            let resp_cid = val.get("cid").and_then(|c| c.as_str());
+                                            if resp_cid == Some(target_cid) {
+                                                debug!("Received matching response for CID: {}", target_cid);
+                                                return Ok(Some(msg));
+                                            } else {
+                                                // Response for a different CID, ignore and keep waiting
+                                                trace!("Ignoring response for CID: {:?} (expected {})", resp_cid, target_cid);
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        // Request without CID (parent device request)
+                                        if msg.payload.is_empty() {
+                                            return Ok(Some(msg));
+                                        }
+
+                                        if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
+                                            if val.get("cid").is_none() {
+                                                return Ok(Some(msg));
+                                            } else {
+                                                // Response with CID for a non-CID request, ignore
+                                                trace!("Ignoring response with CID for parent request");
+                                                continue;
+                                            }
+                                        }
                                     }
 
-                                    // Found matching response
                                     return Ok(Some(msg));
                                 }
                                 Err(_) => return Err(TuyaError::Offline),
@@ -1260,19 +1290,11 @@ impl Device {
                 msg.payload.len()
             );
             if msg.payload.is_empty() {
-                let protocol = get_protocol(self.version(), self.dev_type());
-                if protocol.is_empty_payload_allowed(msg.cmd) {
-                    debug!(
-                        "Received allowed empty payload message (cmd 0x{:02X})",
-                        msg.cmd
-                    );
-                    let _ = self.broadcast_tx.send(msg);
-                } else {
-                    debug!(
-                        "Received empty payload message (cmd 0x{:02X}), not broadcasting",
-                        msg.cmd
-                    );
-                }
+                debug!(
+                    "Received empty payload message (cmd 0x{:02X}), broadcasting as ACK",
+                    msg.cmd
+                );
+                let _ = self.broadcast_tx.send(msg);
             } else {
                 // Check if payload is valid JSON
                 if serde_json::from_slice::<Value>(&msg.payload).is_err() {

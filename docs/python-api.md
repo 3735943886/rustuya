@@ -26,14 +26,17 @@ Direct interaction and control for individual Tuya devices.
 - **Definition**: `Device(id, local_key, address="Auto", version="Auto", dev_type=None, persist=True, timeout=None, nowait=False)`
 - **Description**: Creates a new device handle.
 - **Arguments**:
-  - `id`: Device ID (str)
-  - `local_key`: Local Key (str)
-  - `address`: IP address (default: "Auto" for discovery)
-  - `version`: Protocol version (default: "Auto" for discovery)
-  - `dev_type`: Device type (default: `None` / "auto"). Values: "auto", "default", "device22".
-  - `persist`: If `True`, keeps the TCP connection alive (default: True).
-  - `timeout`: Global timeout for network operations and responses in seconds (default: 10.0)
-  - `nowait`: If `True`, commands return immediately after queuing (default: False).
+  - `id` (str, **Required**): The unique device ID.
+  - `local_key` (str, **Required**): The 16-character local key.
+  - `address` (str, *Optional*): IP address. Default is `"Auto"` (uses UDP discovery).
+  - `version` (str, *Optional*): Protocol version. Default is `"Auto"`.
+  - `dev_type` (str, *Optional*): Device architecture type.
+    - `None` (default): **Automatic detection**. Switches to `"device22"` if ID length is 22.
+    - `"default"`: Force standard Tuya device architecture (disables auto-detection).
+    - `"device22"`: Force specialized 22-character ID architecture.
+  - `persist` (bool, *Optional*): Whether to keep the TCP connection alive. Default is `True`.
+  - `timeout` (float, *Optional*): Global timeout for network operations and responses in seconds (default: 10.0)
+  - `nowait` (bool, *Optional*): If `True`, command methods return immediately after queuing. Default is `False`.
 - **Example**:
   ```python
   from rustuya import Device
@@ -65,6 +68,18 @@ Direct interaction and control for individual Tuya devices.
   dev.set_dps({"1": True, "2": 50})
   ```
 
+### `device.request()`
+- **Description**: Sends a low-level Tuya command.
+- **Arguments**:
+  - `command` (int, **Required**): Command ID (use `CommandType`).
+  - `data` (dict, *Optional*): Payload data. Default is `None`.
+  - `cid` (str, *Optional*): Child ID for sub-devices. Default is `None`.
+- **Example**:
+  ```python
+  from rustuya import CommandType
+  dev.request(CommandType["DpQuery"], data=None)
+  ```
+
 ### `device.listener()`
 - **Description**: Returns a `DeviceEventReceiver` for real-time messages.
 - **Example**:
@@ -83,8 +98,7 @@ Direct interaction and control for individual Tuya devices.
   from rustuya import unified_listener
   listener = unified_listener([dev1, dev2])
   for event in listener:
-      # event is a dict containing 'id' and 'data' (the message)
-      print(f"Device {event['id']} updated: {event['data']}")
+      print(f"Device {event['id']} updated: {event['payload']}")
   ```
 
 ---
