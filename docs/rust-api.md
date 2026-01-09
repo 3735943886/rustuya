@@ -141,28 +141,37 @@ Interaction with sub-devices (endpoints) through a parent Gateway `Device`. Obta
 ## **4. Scanner API**
 UDP-based device discovery on the local network.
 
-### `scanner.scan()`
-- **Definition**: `pub async fn scan(&self) -> Result<Vec<DiscoveryResult>>`
-- **Description**: Performs a one-time scan and returns all found devices.
+### `Scanner::scan()`
+- **Definition**: `pub async fn scan() -> Result<Vec<DiscoveryResult>>`
+- **Description**: Performs a one-time scan using the global scanner instance and returns all found devices.
 - **Returns**: `Result<Vec<DiscoveryResult>>`
 - **Example**:
   ```rust
-  let scanner = Scanner::get();
-  let devices = scanner.scan().await?;
+  let devices = Scanner::scan().await?;
   for device in devices {
       println!("Found device: {} at {}", device.id, device.ip);
   }
   ```
 
-### `scanner.scan_stream()`
-- **Definition**: `pub fn scan_stream(&self) -> impl Stream<Item = DiscoveryResult>`
-- **Description**: Returns a stream that yields devices as they are discovered in real-time.
+### `Scanner::scan_stream()`
+- **Definition**: `pub fn scan_stream() -> impl Stream<Item = DiscoveryResult>`
+- **Description**: Returns a stream from the global scanner instance that yields devices as they are discovered in real-time.
 - **Returns**: `impl Stream<Item = DiscoveryResult>`
 - **Example**:
   ```rust
-  let scanner = Scanner::get();
-  let mut stream = scanner.scan_stream();
+  let mut stream = Scanner::scan_stream();
   while let Some(device) = stream.next().await {
       println!("Discovered: {} ({})", device.id, device.ip);
+  }
+  ```
+
+### `Scanner::discover_device()`
+- **Definition**: `pub async fn discover_device(device_id: &str) -> Result<Option<DiscoveryResult>>`
+- **Description**: Discovers a specific device by its ID using the global scanner instance.
+- **Returns**: `Result<Option<DiscoveryResult>>`
+- **Example**:
+  ```rust
+  if let Some(device) = Scanner::discover_device("your_device_id").await? {
+      println!("Found device: {}", device.ip);
   }
   ```

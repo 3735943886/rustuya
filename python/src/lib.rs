@@ -115,19 +115,26 @@ pub struct Scanner {}
 
 #[pymethods]
 impl Scanner {
+    /// Returns the global scanner instance.
+    #[staticmethod]
+    pub fn get() -> Self {
+        Self {}
+    }
+
     /// Returns a real-time scan iterator.
-    pub fn scan_stream(&self) -> ScannerIterator {
+    #[staticmethod]
+    pub fn scan_stream() -> ScannerIterator {
         ScannerIterator {
-            inner: Arc::new(Mutex::new(SyncScanner::get().scan_stream())),
+            inner: Arc::new(Mutex::new(SyncScanner::scan_stream())),
         }
     }
 
     /// Scans the local network for Tuya devices.
-    pub fn scan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    #[staticmethod]
+    pub fn scan<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let scanner = SyncScanner::get();
         std::thread::spawn(move || {
-            let res = scanner.scan();
+            let res = SyncScanner::scan();
             let _ = tx.send(res);
         });
 
@@ -150,12 +157,12 @@ impl Scanner {
     }
 
     /// Discovers a specific device by ID.
-    pub fn discover<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
+    #[staticmethod]
+    pub fn discover<'py>(py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let scanner = SyncScanner::get();
         let id_owned = id.to_string();
         std::thread::spawn(move || {
-            let res = scanner.discover(&id_owned);
+            let res = SyncScanner::discover(&id_owned);
             let _ = tx.send(res);
         });
 
@@ -190,11 +197,6 @@ impl ScannerIterator {
             None => Ok(None),
         }
     }
-}
-
-#[pyfunction]
-pub fn get_scanner() -> Scanner {
-    Scanner {}
 }
 
 /// Sub-device handle for gateways in Python.
@@ -630,7 +632,6 @@ fn rustuya(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(pyo3::wrap_pyfunction!(_rustuya_atexit, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(version, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(get_scanner, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(unified_listener, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(maximize_fd_limit, m)?)?;
 

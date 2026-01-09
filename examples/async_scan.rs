@@ -13,11 +13,8 @@ async fn main() {
     println!("--- Rustuya - Scanner (Async) ---");
     println!("[INFO] Scanning the network for Tuya devices in real-time...");
 
-    // 1. Get the global scanner instance
-    let scanner = Scanner::get();
-
-    // 2. Get a stream of discovery results
-    let stream = scanner.scan_stream();
+    // 1. Get a stream of discovery results directly from Scanner
+    let stream = Scanner::scan_stream();
     tokio::pin!(stream);
 
     let mut count = 0;

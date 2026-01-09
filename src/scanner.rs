@@ -435,7 +435,12 @@ impl Scanner {
     /// This will yield currently cached devices first, then any newly discovered devices
     /// until the scan timeout is reached. If a scan is already in progress, it will
     /// join the existing scan instead of starting a new one.
-    pub fn scan_stream(
+    pub fn scan_stream() -> impl futures_util::Stream<Item = DiscoveryResult> + Send + 'static {
+        Self::get().scan_stream_instance()
+    }
+
+    /// Instance version of `scan_stream`.
+    pub fn scan_stream_instance(
         &self,
     ) -> impl futures_util::Stream<Item = DiscoveryResult> + Send + 'static {
         let state = self.inner.clone();
@@ -525,7 +530,12 @@ impl Scanner {
     ///
     /// If a scan is already in progress, it will join that scan and return the results
     /// once it finishes.
-    pub async fn scan(&self) -> Result<Vec<DiscoveryResult>> {
+    pub async fn scan() -> Result<Vec<DiscoveryResult>> {
+        Self::get().scan_instance().await
+    }
+
+    /// Instance version of `scan`.
+    pub async fn scan_instance(&self) -> Result<Vec<DiscoveryResult>> {
         use futures_util::StreamExt;
 
         info!(
@@ -533,13 +543,22 @@ impl Scanner {
             self.bind_addr, self.ports
         );
 
-        let results: Vec<_> = self.scan_stream().collect().await;
+        let results: Vec<_> = self.scan_stream_instance().collect().await;
 
         info!("Scan finished. Found {} devices.", results.len());
         Ok(results)
     }
 
-    pub async fn discover_device(&self, device_id: &str) -> Result<Option<DiscoveryResult>> {
+    /// Discovers a specific device by ID.
+    pub async fn discover_device(device_id: &str) -> Result<Option<DiscoveryResult>> {
+        Self::get().discover_device_instance(device_id).await
+    }
+
+    /// Instance version of `discover_device`.
+    pub async fn discover_device_instance(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<DiscoveryResult>> {
         self.discover_device_internal(device_id, false).await
     }
 

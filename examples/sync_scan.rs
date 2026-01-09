@@ -10,11 +10,8 @@ fn main() {
     println!("--- Rustuya - Scanner (Sync) ---");
     println!("[INFO] Scanning the network for Tuya devices in real-time...");
 
-    // 1. Get the global sync scanner instance
-    let scanner = Scanner::get();
-
-    // 2. Get a scan_stream (mpsc::Receiver) which acts as a synchronous iterator
-    let stream = scanner.scan_stream();
+    // 1. Get a scan_stream (mpsc::Receiver) directly from Scanner
+    let stream = Scanner::scan_stream();
 
     let mut count = 0;
 

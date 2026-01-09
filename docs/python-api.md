@@ -108,32 +108,36 @@ Interaction with sub-devices (endpoints) through a parent Gateway `Device`. Obta
 
 ---
 
-## **4. Scanner API**
-UDP-based device discovery on the local network.
+## **4. Discovery (Scanner)**
+Search for devices on the local network.
 
-### `get_scanner()`
-- **Description**: Returns the global scanner instance.
-- **Example**:
-  ```python
-  from rustuya import get_scanner
-  scanner = get_scanner()
-  ```
-
-### `scanner.scan()`
+### `Scanner.scan()`
 - **Description**: Performs a one-time scan and returns a list of discovered devices.
 - **Example**:
   ```python
-  devices = scanner.scan()
+  from rustuya import Scanner
+  devices = Scanner.scan()
   for dev in devices:
       print(f"Found: {dev['id']} at {dev['ip']}")
   ```
 
-### `scanner.scan_stream()`
+### `Scanner.scan_stream()`
 - **Description**: Returns an iterator that yields devices as they are discovered in real-time.
 - **Example**:
   ```python
-  for dev in scanner.scan_stream():
+  from rustuya import Scanner
+  for dev in Scanner.scan_stream():
       print(f"Discovered: {dev['id']}")
+  ```
+
+### `Scanner.discover()`
+- **Description**: Discovers a specific device by its ID.
+- **Example**:
+  ```python
+  from rustuya import Scanner
+  dev = Scanner.discover("your_device_id")
+  if dev:
+      print(f"Found device at {dev['ip']}")
   ```
 
 ---

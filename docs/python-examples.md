@@ -63,12 +63,12 @@ except KeyboardInterrupt:
 Search for Tuya devices on the local network.
 
 ```python
-from rustuya import get_scanner
+from rustuya import Scanner
 
 print("Scanning for devices...")
 
-# Create scanner and set timeout to 5 seconds
-results = get_scanner().scan()
+# One-time scan directly from Scanner class
+results = Scanner.scan()
 
 print(f"Found {len(results)} devices:")
 for dev in results:
@@ -78,9 +78,9 @@ for dev in results:
     print(f"  Product ID: {dev['product_id']}")
     print("-" * 20)
 
-# Alternative: Real-time scan stream
+# Alternative: Real-time scan stream directly from Scanner class
 print("Streaming discovered devices...")
-for dev in get_scanner().scan_stream():
+for dev in Scanner.scan_stream():
     print(f"Found: {dev['id']} at {dev['ip']}")
 ```
 

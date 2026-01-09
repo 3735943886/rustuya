@@ -397,11 +397,15 @@ impl Scanner {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     ScannerCommand::Scan(resp_tx) => {
-                        let res = scanner_inner.scan().await;
+                        let res = scanner_inner.scan_instance().await;
                         let _ = resp_tx.send(res);
                     }
                     ScannerCommand::Discover(id, resp_tx) => {
-                        let res = scanner_inner.discover_device(&id).await.ok().flatten();
+                        let res = scanner_inner
+                            .discover_device_instance(&id)
+                            .await
+                            .ok()
+                            .flatten();
                         let _ = resp_tx.send(res);
                     }
                 }
@@ -414,11 +418,23 @@ impl Scanner {
         }
     }
 
-    pub fn scan(&self) -> Result<Vec<DiscoveryResult>> {
+    /// Scans the local network for all Tuya devices and returns a list of results.
+    pub fn scan() -> Result<Vec<DiscoveryResult>> {
+        Self::get().scan_instance()
+    }
+
+    /// Instance version of `scan`.
+    pub fn scan_instance(&self) -> Result<Vec<DiscoveryResult>> {
         wait_for_response!(self.cmd_tx, ScannerCommand::Scan)?
     }
 
-    pub fn discover(&self, id: &str) -> Option<DiscoveryResult> {
+    /// Discovers a specific device by ID.
+    pub fn discover(id: &str) -> Option<DiscoveryResult> {
+        Self::get().discover_instance(id)
+    }
+
+    /// Instance version of `discover`.
+    pub fn discover_instance(&self, id: &str) -> Option<DiscoveryResult> {
         wait_for_response!(self.cmd_tx, |resp_tx| ScannerCommand::Discover(
             id.to_string(),
             resp_tx
@@ -428,13 +444,18 @@ impl Scanner {
     }
 
     /// Returns a synchronous iterator (Receiver) that yields discovery results in real-time.
-    pub fn scan_stream(&self) -> std::sync::mpsc::Receiver<DiscoveryResult> {
+    pub fn scan_stream() -> std::sync::mpsc::Receiver<DiscoveryResult> {
+        Self::get().scan_stream_instance()
+    }
+
+    /// Instance version of `scan_stream`.
+    pub fn scan_stream_instance(&self) -> std::sync::mpsc::Receiver<DiscoveryResult> {
         let (tx, rx) = std::sync::mpsc::channel();
         let async_scanner = self.inner.clone();
 
         runtime::spawn(async move {
             use futures_util::StreamExt;
-            let stream = async_scanner.scan_stream();
+            let stream = async_scanner.scan_stream_instance();
             tokio::pin!(stream);
             while let Some(device) = stream.next().await {
                 if tx.send(device).is_err() {
