@@ -19,6 +19,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Default capacity for synchronous event channels to prevent memory buildup.
+const CHAN_SYNC_CAPACITY: usize = 128;
+
 pub mod internal {
     use super::*;
     pub fn get_sync_runtime() -> &'static tokio::runtime::Runtime {
@@ -188,12 +191,13 @@ impl Device {
     }
 
     pub fn listener(&self) -> std::sync::mpsc::Receiver<TuyaMessage> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_SYNC_CAPACITY);
         let mut broadcast_rx = self.inner.broadcast_tx.subscribe();
 
         runtime::spawn(async move {
             while let Ok(msg) = broadcast_rx.recv().await {
-                if tx.send(msg).is_err() {
+                if tx.try_send(msg).is_err() {
+                    // Buffer full or receiver dropped
                     break;
                 }
             }
@@ -450,7 +454,7 @@ impl Scanner {
 
     /// Instance version of `scan_stream`.
     pub fn scan_stream_instance(&self) -> std::sync::mpsc::Receiver<DiscoveryResult> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_SYNC_CAPACITY);
         let async_scanner = self.inner.clone();
 
         runtime::spawn(async move {
@@ -458,7 +462,7 @@ impl Scanner {
             let stream = async_scanner.scan_stream_instance();
             tokio::pin!(stream);
             while let Some(device) = stream.next().await {
-                if tx.send(device).is_err() {
+                if tx.try_send(device).is_err() {
                     break;
                 }
             }
@@ -508,14 +512,14 @@ impl ScannerBuilder {
 
 /// Merges multiple sync device listeners into a single synchronous receiver.
 pub fn unified_listener(devices: Vec<Device>) -> std::sync::mpsc::Receiver<Result<DeviceEvent>> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_SYNC_CAPACITY);
     let async_devices: Vec<AsyncDevice> = devices.into_iter().map(|d| d.inner.clone()).collect();
 
     runtime::spawn(async move {
         use futures_util::StreamExt;
         let mut stream = async_unified_listener(async_devices);
         while let Some(event) = stream.next().await {
-            if tx.send(event).is_err() {
+            if tx.try_send(event).is_err() {
                 break;
             }
         }
