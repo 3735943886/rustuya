@@ -48,9 +48,6 @@ pub enum TuyaError {
     #[error("Check device key or version (Error 914)")]
     KeyOrVersionError,
 
-    #[error("Device ID '{0}' already exists")]
-    DuplicateDevice(String),
-
     #[error("Device ID '{0}' not found")]
     DeviceNotFound(String),
 }
@@ -70,6 +67,7 @@ impl From<serde_json::Error> for TuyaError {
 }
 
 impl TuyaError {
+    #[must_use]
     pub fn code(&self) -> u32 {
         match self {
             TuyaError::Io(_) => ERR_CONNECT,
@@ -85,12 +83,12 @@ impl TuyaError {
             TuyaError::Offline => ERR_OFFLINE,
             TuyaError::HandshakeFailed => ERR_KEY_OR_VER,
             TuyaError::KeyOrVersionError => ERR_KEY_OR_VER,
-            TuyaError::DuplicateDevice(_) => ERR_DUPLICATE,
             TuyaError::DeviceNotFound(_) => ERR_JSON,
             TuyaError::Timeout => ERR_TIMEOUT,
         }
     }
 
+    #[must_use]
     pub fn from_code(code: u32) -> Self {
         match code {
             ERR_JSON => TuyaError::Json("Generic JSON error".to_string()),
@@ -98,9 +96,8 @@ impl TuyaError {
             ERR_TIMEOUT => TuyaError::Timeout,
             ERR_OFFLINE => TuyaError::Offline,
             ERR_KEY_OR_VER => TuyaError::KeyOrVersionError,
-            ERR_DUPLICATE => TuyaError::DuplicateDevice("Unknown ID".to_string()),
             ERR_PAYLOAD => TuyaError::InvalidPayload,
-            _ => TuyaError::Io(format!("Unknown error code: {}", code)),
+            _ => TuyaError::Io(format!("Unknown error code: {code}")),
         }
     }
 }
@@ -122,5 +119,4 @@ define_error_codes! {
     ERR_PARAMS = 912 => "Missing Function Parameters",
     ERR_CLOUD = 913 => "Error Response from Tuya Cloud",
     ERR_KEY_OR_VER = 914 => "Check device key or version",
-    ERR_DUPLICATE = 915 => "Device ID already exists",
 }

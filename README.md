@@ -1,6 +1,7 @@
 # Rustuya
 
 [![Crates.io](https://img.shields.io/crates/v/rustuya.svg)](https://crates.io/crates/rustuya)
+[![Pypi.org](https://badge.fury.io/py/rustuya.svg)](https://badge.fury.io/py/rustuya)
 [![Documentation](https://docs.rs/rustuya/badge.svg)](https://docs.rs/rustuya)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 

@@ -4,37 +4,54 @@ Rustuya is engineered with a specific architectural pattern to ensure a balance 
 
 ## **1. Asynchronous Device Initialization**
 
-Core initialization methods, such as `Device::new()` and `Manager::add()`, are designed to be **non-blocking** and return control to the caller immediately.
+Core initialization methods, such as `Device::new()`, are designed to be **non-blocking** and return control to the caller immediately.
 
 - **Rationale**: In large-scale deployments involving dozens or hundreds of devices, blocking the main execution thread for individual TCP handshakes would result in significant latency and performance degradation.
 - **Implementation Details**: 
-  - Invoking `new` or `add` registers the device within the internal registry and initializes a dedicated background worker.
+  - Invoking `new` registers the device within the internal registry and initializes a dedicated background worker.
   - Actual TCP connection establishment and protocol handshakes are performed asynchronously.
   - Connection attempts are intelligently staggered using randomized jitter to mitigate "thundering herd" effects on the network.
   - Resilience is maintained even if a device is offline; initialization completes successfully, and the background worker manages reconnection logic using an exponential backoff strategy.
 
-## **2. Synchronous Command Dispatch & `nowait` Configuration**
+## **2. Command Dispatch & `nowait` Configuration**
 
-Methods responsible for device interaction, including `set_value()`, `set_dps()`, `status()`, and `sub_discover()`, operate in a **synchronous** manner by default.
+Methods like `set_value()`, `status()`, and `sub_discover()` provide a configurable execution model via the `nowait` parameter. This allows the application to balance between strict reliability and high-throughput performance.
 
-- **Rationale**: This ensures strict command serialization and provides immediate confirmation that the command has been successfully dispatched to the network interface.
-- **The `nowait` Setting**:
-  - **`nowait = false` (Default)**: The calling thread is suspended until the command packet is successfully written to the underlying TCP socket. This ensures the command has at least left the host machine.
-  - **`nowait = true`**: The method returns immediately after the command is placed in the device's internal queue. This is useful for high-throughput scenarios where waiting for TCP confirmation for every command is undesirable.
-- **Important Considerations**:
-  - **Non-Guarantee of Execution**: A successful return from a command method (regardless of `nowait` setting) signifies that the command has been **dispatched to the network stack**, not that the device has completed the physical execution of the request.
-  - **Response Handling**: Results for commands like `status()` or `sub_discover()` are **never returned directly** by the method. Instead, they are always delivered asynchronously via the `listener()`.
-  - **Automation Risks**: When using `nowait = true`, the method may return while the device is still connecting. If your logic relies on precise timing (e.g., `set_value()` -> `sleep(1)` -> `set_value()`), the sleep might occur before the first command is even sent, leading to unexpected behavior. 
-  - **Best Practice**: Always monitor the `listener()` to confirm the device's actual state transitions and command responses.
+### **`nowait = false` (Default: Strong Consistency)**
+Blocks the calling thread until a physical response (acknowledgment or data) is received from the device.
 
-## **3. Decoupled Event-Driven Feedback**
+- **Pros**:
+  - **Deterministic**: The return value contains the actual execution result (e.g., a JSON response string).
+  - **Reliable**: If the device is disconnected, the method waits for a successful reconnection before sending the command and returning the response.
+  - **Error-Aware**: Network failures or protocol errors are caught immediately and returned as a `TuyaError`.
+- **Cons**:
+  - **Latency**: The calling thread is suspended for the duration of the network round-trip and device processing time.
+  - **Throughput Limit**: Limited by the device's processing speed and network latency.
 
-Given the push-based nature of the Tuya protocol, state transitions and updates are managed through a decoupled event listener mechanism.
+### **`nowait = true` (Fire-and-Forget)**
+Returns control to the caller immediately after the command packet is committed to the local TCP stack.
 
-- **Rationale**: Devices may emit status updates spontaneously (e.g., manual physical interaction or sensor triggers) or as a delayed response to a previously issued command.
+- **Pros**:
+  - **High Throughput**: Allows sending multiple commands in rapid succession without waiting for individual network round-trips.
+  - **Minimal Latency**: The calling thread is never blocked by device processing or network delays.
+- **Cons**:
+  - **Indeterministic**: The method always returns `Ok(None)` / `None`. The actual execution result must be monitored via the `listener()`.
+  - **Deferred Error Reporting**: If the device is disconnected or a network error occurs, the method call still returns success. The failure is reported later as an error message through the `listener()`.
+  - **Execution Uncertainty**: There is no direct link between a specific `nowait=true` method call and its eventual success or failure reporting in the listener.
+
+---
+
+> [!TIP]
+> **Error Handling with `nowait=true`**: When using `nowait=true`, network-level failures (like `Offline` or `ConnectionFailed`) are **broadcast to the `listener()`**. While the method call itself won't throw an error, your application can still detect and handle these issues by monitoring the event stream. For critical operations, `nowait=false` remains the recommended choice for immediate, synchronous error handling.
+
+## **3. Event-Driven Feedback**
+
+Regardless of the `nowait` setting, Rustuya employs a decoupled event listener mechanism to handle the push-based nature of the Tuya protocol.
+
+- **Rationale**: Tuya devices emit status updates for various reasons, including manual physical interaction, sensor triggers, or as responses to commands.
 - **Implementation Details**:
-  - Real-time telemetry and state changes are accessed via `device.listener()` or `manager.listener()`.
-  - This architecture decouples command issuance from state monitoring, facilitating a more robust and responsive integration model.
+  - **All** protocol messages (including responses to every command, whether `nowait` is true or false) are accessible via `device.listener()`.
+  - This architecture ensures that no state change is missed, providing a complete telemetry stream for the device.
 
 ---
 
@@ -42,26 +59,17 @@ Given the push-based nature of the Tuya protocol, state transitions and updates 
 
 Rustuya provides two distinct APIs to suit different application architectures:
 
-- **Full Asynchronous (Tokio)**: The primary API is built on top of `tokio`. If the application is already using an async runtime, the core `rustuya` types (`Device`, `Manager`, etc.) should be used. This offers the best performance and scalability.
-- **Synchronous (Blocking)**: For simple scripts or applications where an async event loop is not desired, Rustuya provides a synchronous wrapper under `rustuya::sync`. These types provide the same functionality but block the current thread until operations complete, internally managing the async bridge.
+- **Full Asynchronous (Tokio)**: The primary API built on top of `tokio`. If the application already uses an async runtime, the core `rustuya` types (`Device`, etc.) offer the best performance and scalability.
+- **Synchronous (Blocking)**: For environments where an async event loop is not desired (e.g., simple scripts, standard Python applications), Rustuya provides a synchronous wrapper under `rustuya::sync`. These types manage the async bridge internally and block the calling thread until the requested operation completes.
 
 > [!NOTE]
-> For Python users, this synchronous wrapper allows for high-performance applications without the complexity of `asyncio`. Since the Rust core manages all network I/O in its own background thread pool and releases the GIL during blocking calls, standard Python threads provide excellent efficiency with minimal overhead.
+> For Python users, the synchronous wrapper provides high-performance interaction without the complexity of `asyncio`. The Rust core manages all network I/O in dedicated background threads and releases the GIL during blocking calls, allowing Python's standard `threading` module to operate with high efficiency.
 
 ### **Thread-Safety & Concurrency**
 
-All core types and the synchronous wrappers are **thread-safe**.
+All core types and synchronous wrappers are designed for concurrent use.
 
-- **Internal Architecture**: Rustuya uses a background worker model. `Device` and `Manager` instances (including sync wrappers) are handles to these workers, communicating via message-passing (`mpsc`).
-- **Concurrent Access**: Multiple threads can safely share a single `Device` or `Manager` instance. Cloning an instance creates a new handle to the same background worker, allowing for efficient and safe concurrent control.
-- **Python GIL Release**: The Python bindings are designed to release the Global Interpreter Lock (GIL) during blocking network operations. This allows Python's standard `threading` module to achieve true parallel execution for background tasks.
-- **Event Listeners**: Listeners (via `listener()`) provide a thread-safe channel to receive real-time updates across different parts of an application.
-
-### **Execution Model Summary**
-
-| Action | Blocking | Description |
-| :--- | :--- | :--- |
-| `Device.new()` / `Manager.add()` | No | Registers the device; connection is established in the background. |
-| `device.set_value()` / `status()` | Optional | Blocks until the command packet is committed to TCP (if `nowait=false`). |
-| `device.listener()` | No | Provides a stream/iterator for real-time protocol events. |
-| `scanner.scan()` | Yes | Suspends execution for the duration of the discovery timeout. |
+- **Internal Architecture**: Rustuya uses a background worker model. `Device` instances act as thread-safe handles to these workers, communicating via internal message-passing.
+- **Concurrent Access**: Multiple threads can safely share a single `Device` instance. Cloning an instance creates a new handle to the same background worker.
+- **Python GIL Release**: Python bindings release the Global Interpreter Lock (GIL) during blocking network operations, enabling true parallel execution when using Python's `threading` module.
+- **Event Listeners**: `listener()` provides a thread-safe channel to receive real-time updates across different parts of an application simultaneously.

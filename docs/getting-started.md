@@ -1,6 +1,6 @@
 # Getting Started
 
-Rustuya is a fast, concurrency-friendly library to control and monitor Tuya devices on the local network. This guide provides instructions for both Rust and Python.
+A lightweight and efficient Rust library for controlling Tuya-compatible smart devices.
 
 ---
 
@@ -10,32 +10,27 @@ Add the following to the `Cargo.toml` file:
 
 ```toml
 [dependencies]
-rustuya = "0.1"
+rustuya = "0.2"
 ```
 
 ### **Quick Start (Rust)**
-Minimal example to set a value on a device using the synchronous wrapper:
+Minimal example to control a device from Rust:
 
 ```rust
 use rustuya::sync::Device;
 
 fn main() {
     // Create a device handle
-    let device = Device::new(
-        "DEVICE_ID", 
-        "DEVICE_IP", // Or "Auto"
-        "LOCAL_KEY", 
-        "DEVICE_VER" // Or "Auto"
-    );
-    
+    let device = Device::new("DEVICE_ID", "DEVICE_KEY");
+
     // Set a DP value (e.g., DP 1 to true)
-    device.set_value(1, true);
-    
-    println!("Command dispatched!");
+    match device.set_value(1, true) {
+        Ok(Some(res)) => println!("[SUCCESS] SetValue result: {}", res),
+        Ok(None) => println!("[SUCCESS] SetValue sent (no response yet)"),
+        Err(e) => println!("[ERROR] SetValue failed: {:?}", e),
+    }
 }
 ```
-
-For full asynchronous usage with `tokio`, refer to the [Rust API Reference](./rust-api).
 
 ---
 
@@ -54,23 +49,24 @@ Minimal example to control a device from Python:
 from rustuya import Device
 
 # Create a device handle
-device = Device(
-    id="DEVICE_ID",
-    address="DEVICE_IP", # Or "Auto"
-    local_key="LOCAL_KEY",
-    version="DEVICE_VER" # Or "Auto"
-)
+device = Device("DEVICE_ID", "LOCAL_KEY")
 
 # Set a DP value
-device.set_value(1, True)
-
-print("Command dispatched!")
+print(device.set_value(1, True))
 ```
 
 ---
 
-## **What's Next?**
-- Read the [Design Philosophy](./philosophy) to understand how Rustuya manages connections.
-- Check out the [Rust API Reference](./rust-api) for advanced Rust features.
-- Explore the [Python API Guide](./python-api) and [Python Examples](./python-examples) for more Python information.
+## **System Optimization**
+When managing a large number of concurrent device connections on Unix-like systems, it is recommended to maximize the file descriptor limit at the start of the application:
+
+- **Rust**: `rustuya::maximize_fd_limit().ok();`
+- **Python**: `rustuya.maximize_fd_limit()`
+
+---
+
+## **Next Steps**
+- Read the [Design Philosophy](./philosophy.md) to understand the connection management model.
+- Check the [Rust API Reference](./rust-api.md) for detailed Rust documentation.
+- Explore the [Python API Guide](./python-api.md) and [Python Examples](./python-examples.md) for more Python information.
 - See the [examples]({{ site.github_url }}/tree/master/examples) directory in the repository for more complex use cases.

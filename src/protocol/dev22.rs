@@ -9,6 +9,7 @@ pub struct ProtocolDev22 {
 }
 
 impl ProtocolDev22 {
+    #[must_use]
     pub fn new(base: Box<dyn TuyaProtocol>) -> Self {
         Self { base }
     }
@@ -77,10 +78,7 @@ impl TuyaProtocol for ProtocolDev22 {
         }
 
         let payload_obj = Value::Object(payload);
-        trace!(
-            "dev22 generated payload (cmd {}): {}",
-            cmd_to_send, payload_obj
-        );
+        trace!("dev22 generated payload (cmd {cmd_to_send}): {payload_obj}");
 
         Ok((cmd_to_send, payload_obj))
     }
@@ -95,5 +93,34 @@ impl TuyaProtocol for ProtocolDev22 {
 
     fn has_version_header(&self, payload: &[u8]) -> bool {
         self.base.has_version_header(payload)
+    }
+
+    fn requires_session_key(&self) -> bool {
+        self.base.requires_session_key()
+    }
+
+    fn encrypt_session_key(
+        &self,
+        session_key: &[u8],
+        cipher: &TuyaCipher,
+        nonce: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.base.encrypt_session_key(session_key, cipher, nonce)
+    }
+
+    fn get_prefix(&self) -> u32 {
+        self.base.get_prefix()
+    }
+
+    fn get_hmac_key<'a>(&self, cipher_key: &'a [u8]) -> Option<&'a [u8]> {
+        self.base.get_hmac_key(cipher_key)
+    }
+
+    fn is_empty_payload_allowed(&self, cmd: u32) -> bool {
+        self.base.is_empty_payload_allowed(cmd)
+    }
+
+    fn should_check_dev22_fallback(&self) -> bool {
+        false
     }
 }
