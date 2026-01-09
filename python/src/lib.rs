@@ -46,15 +46,6 @@ fn interruptible_call<'py, C, R: Send>(
     }
 }
 
-fn set_payload<'py>(py: Python<'py>, dict: &Bound<'py, PyDict>, payload_str: &str) -> PyResult<()> {
-    if let Ok(val) = serde_json::from_str::<Value>(payload_str) {
-        dict.set_item("payload", pythonize::pythonize(py, &val)?)?;
-    } else {
-        dict.set_item("payload", payload_str)?;
-    }
-    Ok(())
-}
-
 fn to_py_result<'py>(py: Python<'py>, res: Option<String>) -> PyResult<Option<Bound<'py, PyAny>>> {
     match res {
         Some(s) => {
@@ -78,6 +69,44 @@ fn recv_with_signals<T: Send>(receiver: &std::sync::mpsc::Receiver<T>) -> PyResu
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
         }
     }
+}
+
+fn message_to_dict<'py>(
+    py: Python<'py>,
+    id: &str,
+    msg: &::rustuya::protocol::TuyaMessage,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", id)?;
+    dict.set_item("cmd", msg.cmd)?;
+    dict.set_item("seqno", msg.seqno)?;
+
+    if let Some(payload_str) = msg.payload_as_string() {
+        if let Ok(val) = serde_json::from_str::<Value>(&payload_str) {
+            dict.set_item("payload", pythonize::pythonize(py, &val)?)?;
+        } else {
+            dict.set_item("payload", payload_str)?;
+        }
+    }
+    Ok(dict.into_any())
+}
+
+fn receive_event<'py, T: Send>(
+    py: Python<'py>,
+    inner: &Arc<Mutex<std::sync::mpsc::Receiver<T>>>,
+    timeout_ms: Option<u64>,
+) -> PyResult<Option<T>> {
+    py.detach(|| -> PyResult<_> {
+        let receiver = inner
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("receiver mutex poisoned"))?;
+
+        if let Some(ms) = timeout_ms {
+            Ok(receiver.recv_timeout(Duration::from_millis(ms)).ok())
+        } else {
+            recv_with_signals(&receiver)
+        }
+    })
 }
 
 /// Scanner for Tuya devices in Python.
@@ -489,6 +518,7 @@ impl Device {
     /// Returns an event receiver for the device.
     pub fn listener(&self) -> DeviceEventReceiver {
         DeviceEventReceiver {
+            id: self.inner.id().to_string(),
             inner: Arc::new(Mutex::new(self.inner.listener())),
         }
     }
@@ -521,20 +551,8 @@ impl UnifiedEventReceiver {
         py: Python<'py>,
         timeout_ms: Option<u64>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let result = py.detach(|| -> PyResult<_> {
-            let receiver = self.inner.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("receiver mutex poisoned")
-            })?;
-
-            if let Some(ms) = timeout_ms {
-                Ok(receiver.recv_timeout(Duration::from_millis(ms)).ok())
-            } else {
-                recv_with_signals(&receiver)
-            }
-        })?;
-
-        match result {
-            Some(Ok(event)) => Ok(Some(pythonize::pythonize(py, &event)?)),
+        match receive_event(py, &self.inner, timeout_ms)? {
+            Some(Ok(event)) => Ok(Some(message_to_dict(py, &event.device_id, &event.message)?)),
             Some(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Event error: {}",
                 e
@@ -565,6 +583,7 @@ pub fn maximize_fd_limit() -> PyResult<()> {
 
 #[pyclass]
 pub struct DeviceEventReceiver {
+    id: String,
     inner: Arc<Mutex<std::sync::mpsc::Receiver<::rustuya::protocol::TuyaMessage>>>,
 }
 
@@ -584,31 +603,8 @@ impl DeviceEventReceiver {
         py: Python<'py>,
         timeout_ms: Option<u64>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let result = py.detach(|| -> PyResult<_> {
-            let receiver = self.inner.lock().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("receiver mutex poisoned")
-            })?;
-
-            // Check for signals periodically if no timeout is specified
-            // This allows Python to handle Ctrl+C
-            if let Some(ms) = timeout_ms {
-                Ok(receiver.recv_timeout(Duration::from_millis(ms)).ok())
-            } else {
-                recv_with_signals(&receiver)
-            }
-        })?;
-
-        match result {
-            Some(msg) => {
-                let dict = PyDict::new(py);
-                dict.set_item("cmd", msg.cmd)?;
-                dict.set_item("seqno", msg.seqno)?;
-
-                if let Some(payload_str) = msg.payload_as_string() {
-                    set_payload(py, &dict, &payload_str)?;
-                }
-                Ok(Some(dict.into_any()))
-            }
+        match receive_event(py, &self.inner, timeout_ms)? {
+            Some(msg) => Ok(Some(message_to_dict(py, &self.id, &msg)?)),
             None => Ok(None),
         }
     }
