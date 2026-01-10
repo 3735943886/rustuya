@@ -42,7 +42,7 @@ Returns control to the caller immediately after the command packet is committed 
 ---
 
 > [!TIP]
-> **Error Handling with `nowait=true`**: When using `nowait=true`, network-level failures (like `Offline` or `ConnectionFailed`) are **broadcast to the `listener()`**. While the method call itself won't throw an error, your application can still detect and handle these issues by monitoring the event stream. For critical operations, `nowait=false` remains the recommended choice for immediate, synchronous error handling.
+> **Error Handling with `nowait=true`**: When using `nowait=true`, network-level failures (like `Offline` or `ConnectionFailed`) are **broadcast to the `listener()`**. While the method call itself does not return an error, the application can detect and handle these issues by monitoring the event stream. For critical operations, `nowait=false` remains the recommended choice for immediate, synchronous error handling.
 
 ## **3. Event-Driven Feedback**
 

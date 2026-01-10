@@ -21,7 +21,7 @@ use rustuya::sync::Device;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a device handle
-    let device = Device::new("DEVICE_ID", "DEVICE_KEY");
+    let device = Device::new("DEVICE_ID", "LOCAL_KEY");
 
     // Set a DP value (e.g., DP 1 to true)
     let res = device.set_value(1, true)?;

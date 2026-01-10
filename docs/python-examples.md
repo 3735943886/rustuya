@@ -23,7 +23,8 @@ dev = Device(
 
 # 1. Get current status
 print("Requesting status...")
-dev.status()
+status = dev.status()
+print(f"Status: {status}")
 
 # 2. Set a value (DP ID 1 is usually a Switch)
 print("Turning ON...")
@@ -92,8 +93,8 @@ Monitor events from multiple devices in a single loop.
 ```python
 from rustuya import Device, unified_listener
 
-dev1 = Device("id1", "key1")
-dev2 = Device("id2", "key2")
+dev1 = Device("DEVICE_ID_1", "LOCAL_KEY_1")
+dev2 = Device("DEVICE_ID_2", "LOCAL_KEY_2")
 
 # Aggregates events from all provided devices
 listener = unified_listener([dev1, dev2])
@@ -125,7 +126,8 @@ print(f"Sub-device status: {status}")
 
 # 5. Discover all sub-devices connected to the gateway
 print("Requesting sub-device discovery...")
-gateway.sub_discover()
+sub_devices = gateway.sub_discover()
+print(f"Found sub-devices: {sub_devices}")
 ```
 
 ---

@@ -4,7 +4,7 @@ This document provides a detailed reference for the core components of Rustuya: 
 
 ### **Importing the Library**
 
-Depending on your application architecture, choose the appropriate import path:
+Depending on the application architecture, select the appropriate import path:
 
 - **Asynchronous (Tokio)**:
   ```rust
@@ -22,7 +22,6 @@ Depending on your application architecture, choose the appropriate import path:
 ### `maximize_fd_limit()`
 - **Definition**: `pub fn maximize_fd_limit() -> Result<()>`
 - **Description**: Maximizes the file descriptor limit for the current process. Essential for managing hundreds of concurrent device connections on Unix-like systems.
-- **Returns**: `Result<()>`
 - **Example**:
   ```rust
   rustuya::maximize_fd_limit().expect("Failed to optimize system limits");
@@ -39,10 +38,9 @@ Direct interaction with individual Tuya devices.
 - **Arguments**: 
   - `id`: Device ID (String or &str)
   - `local_key`: Local Key (String, &str, or Vec<u8>)
-- **Returns**: `Device`
 - **Example**:
   ```rust
-  let device = Device::new("id", "key");
+  let device = Device::new("DEVICE_ID", "LOCAL_KEY");
   ```
 
 ### `Device::builder()`
@@ -57,7 +55,7 @@ Direct interaction with individual Tuya devices.
     - `.nowait(bool)`: Do not wait for response (default: false).
 - **Example**:
   ```rust
-  let device = Device::builder("id", "key")
+  let device = Device::builder("DEVICE_ID", "LOCAL_KEY")
       .address("192.168.1.100")
       .version("3.4")
       .nowait(true)
@@ -67,7 +65,6 @@ Direct interaction with individual Tuya devices.
 ### `device.status()`
 - **Definition**: `pub async fn status(&self) -> Result<Option<String>>`
 - **Description**: Requests current status (DPS values) from the device.
-- **Returns**: `Result<Option<String>>` If `nowait=false`
 - **Example**:
   ```rust
   let status = device.status().await?;
@@ -77,7 +74,6 @@ Direct interaction with individual Tuya devices.
 - **Definition**: `pub async fn set_value<I: ToString, T: Serialize>(&self, dp_id: I, value: T) -> Result<Option<String>>`
 - **Description**: Sets a single DP value.
 - **Arguments**: `dp_id` (e.g., "1"), `value` (e.g., `true`)
-- **Returns**: `Result<Option<String>>` If `nowait=false`
 - **Example**:
   ```rust
   device.set_value(1, true).await?;
@@ -87,7 +83,6 @@ Direct interaction with individual Tuya devices.
 - **Definition**: `pub async fn set_dps(&self, dps: Value) -> Result<Option<String>>`
 - **Description**: Sends a command to set multiple DPS values at once.
 - **Arguments**: `dps`: A `serde_json::Value` object (e.g., `json!({"1": true, "2": 50})`)
-- **Returns**: `Result<Option<String>>` If `nowait=false`
 - **Example**:
   ```rust
   device.set_dps(json!({"1": true})).await?;
@@ -96,7 +91,6 @@ Direct interaction with individual Tuya devices.
 ### `device.listener()`
 - **Definition**: `pub fn listener(&self) -> impl Stream<Item = Result<TuyaMessage>>`
 - **Description**: Returns an asynchronous stream of messages/events from this device.
-- **Returns**: `impl Stream<Item = Result<TuyaMessage>>`
 - **Example**:
   ```rust
   let mut listener = device.listener();
@@ -108,7 +102,6 @@ Direct interaction with individual Tuya devices.
 ### `unified_listener()`
 - **Definition**: `pub fn unified_listener(devices: Vec<Device>) -> impl Stream<Item = Result<DeviceEvent>>`
 - **Description**: Aggregates event streams from multiple devices into a single unified stream.
-- **Returns**: `impl Stream<Item = Result<DeviceEvent>>`
 - **Example**:
   ```rust
   let listener = unified_listener(vec![dev1, dev2]);
@@ -130,7 +123,6 @@ Interaction with sub-devices (endpoints) through a parent Gateway `Device`. Obta
 
 ### `sub_device.status()` / `set_value()` / `set_dps()`
 - **Description**: These methods mirror the `Device` API but target the specific sub-device via the parent gateway.
-- **Returns**: `Result<Option<String>>`
 - **Example**:
   ```rust
   sub.set_value(1, true).await?;
@@ -144,7 +136,6 @@ UDP-based device discovery on the local network.
 ### `Scanner::scan()`
 - **Definition**: `pub async fn scan() -> Result<Vec<DiscoveryResult>>`
 - **Description**: Performs a one-time scan using the global scanner instance and returns all found devices.
-- **Returns**: `Result<Vec<DiscoveryResult>>`
 - **Example**:
   ```rust
   let devices = Scanner::scan().await?;
@@ -156,22 +147,10 @@ UDP-based device discovery on the local network.
 ### `Scanner::scan_stream()`
 - **Definition**: `pub fn scan_stream() -> impl Stream<Item = DiscoveryResult>`
 - **Description**: Returns a stream from the global scanner instance that yields devices as they are discovered in real-time.
-- **Returns**: `impl Stream<Item = DiscoveryResult>`
 - **Example**:
   ```rust
   let mut stream = Scanner::scan_stream();
   while let Some(device) = stream.next().await {
       println!("Found device: {} at {}", device.id, device.ip);
-  }
-  ```
-
-### `Scanner::discover_device()`
-- **Definition**: `pub async fn discover_device(device_id: &str) -> Result<Option<DiscoveryResult>>`
-- **Description**: Discovers a specific device by its ID using the global scanner instance.
-- **Returns**: `Result<Option<DiscoveryResult>>`
-- **Example**:
-  ```rust
-  if let Some(device) = Scanner::discover_device("your_device_id").await? {
-      println!("Found device: {}", device.ip);
   }
   ```

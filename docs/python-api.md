@@ -40,7 +40,7 @@ Direct interaction and control for individual Tuya devices.
 - **Example**:
   ```python
   from rustuya import Device
-  dev = Device("id", "key", nowait=False)
+  dev = Device("DEVICE_ID", "LOCAL_KEY", nowait=False)
   ```
 
 ### `device.status()`
@@ -54,7 +54,6 @@ Direct interaction and control for individual Tuya devices.
 ### `device.set_value()`
 - **Description**: Sets a single DP value.
 - **Arguments**: `dp_id` (int or str), `value` (bool, int, str, dict, etc.)
-- **Returns**: `dict` (or `None` if `nowait=True`)
 - **Example**:
   ```python
   dev.set_value(1, True)
@@ -143,16 +142,6 @@ Search for devices on the local network.
   stream = Scanner.scan_stream()
   for dev in stream:
       print(f"Found: {dev['id']} at {dev['ip']}")
-  ```
-
-### `Scanner.discover()`
-- **Description**: Discovers a specific device by its ID.
-- **Example**:
-  ```python
-  from rustuya import Scanner
-  dev = Scanner.discover("your_device_id")
-  if dev:
-      print(f"Found device at {dev['ip']}")
   ```
 
 ---
