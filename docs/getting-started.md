@@ -19,16 +19,15 @@ Minimal example to control a device from Rust:
 ```rust
 use rustuya::sync::Device;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a device handle
     let device = Device::new("DEVICE_ID", "DEVICE_KEY");
 
     // Set a DP value (e.g., DP 1 to true)
-    match device.set_value(1, true) {
-        Ok(Some(res)) => println!("[SUCCESS] SetValue result: {}", res),
-        Ok(None) => println!("[SUCCESS] SetValue sent (no response yet)"),
-        Err(e) => println!("[ERROR] SetValue failed: {:?}", e),
-    }
+    let res = device.set_value(1, true)?;
+    println!("Response: {:?}", res);
+    
+    Ok(())
 }
 ```
 
