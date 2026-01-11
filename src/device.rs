@@ -30,8 +30,8 @@ use tokio_util::sync::CancellationToken;
 
 const SLEEP_HEARTBEAT_DEFAULT: Duration = Duration::from_secs(7);
 const SLEEP_HEARTBEAT_CHECK: Duration = Duration::from_secs(5);
-const SLEEP_RECONNECT_MIN: Duration = Duration::from_secs(1);
-const SLEEP_RECONNECT_MAX: Duration = Duration::from_secs(1024);
+const SLEEP_RECONNECT_MIN: Duration = Duration::from_secs(16);
+const SLEEP_RECONNECT_MAX: Duration = Duration::from_secs(4096);
 const SLEEP_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const ADDR_AUTO: &str = "Auto";
