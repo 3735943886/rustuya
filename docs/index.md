@@ -1,28 +1,29 @@
 # Rustuya
 
-Rustuya is a high-performance, concurrency-friendly implementation of the Tuya Local API. It provides a robust way to control and monitor Tuya-compatible devices over the local network with minimal latency and high reliability.
+Rustuya is a high-performance, concurrency-friendly implementation of the Tuya Local API. It provides a robust interface for controlling and monitoring Tuya-compatible devices over a local network with minimal latency and high reliability.
 
 ---
 
 ## **Key Features**
-- **High Performance**: Built on Rust's `tokio` for efficient asynchronous I/O.
-- **Thread-Safe & Concurrent**: Designed for safe multi-threaded access across both Rust and Python.
-- **Multi-language Support**: Native Rust API and high-level Python bindings.
-- **Robust Connection Management**: Automatic background reconnection with exponential backoff.
+- **High Performance**: Built on Rust's efficient asynchronous I/O and non-blocking execution.
+- **Thread-Safe & Concurrent**: Designed for safe multi-threaded access across both Rust and Python environments.
+- **Multi-language Support**: Native Rust API and high-performance PyO3-based Python bindings.
+- **Resilient Connections**: Per-device background tasks handle automatic reconnection with exponential backoff.
+- **System Optimization**: Built-in utilities to maximize system resources for large-scale device management.
 - **Gateway & Sub-device Support**: Comprehensive support for Zigbee/Bluetooth gateways and sub-devices.
-- **Real-time Monitoring**: Event-driven architecture for instant status updates.
-- **Universal Compatibility**: Supports Tuya protocol versions 3.1, 3.3, 3.4, 3.5, and device22.
+- **Real-time Monitoring**: Event-driven architecture providing instant status updates via streams or iterators.
+- **Universal Compatibility**: Supports Tuya protocol versions 3.1 to 3.5, including the device22 variation.
 
 ---
 
 ## **Documentation**
-- [**Getting Started**](./getting-started.md) - Quick installation and usage guide for Rust and Python.
-- [**Rust API Reference**](./rust-api.md) - Detailed documentation for the core Rust library.
-- [**Python API Guide**](./python-api.md) - Guide and reference for Python developers.
-- [**Python Examples**](./python-examples.md) - Practical code examples for Python.
-- [**Design Philosophy**](./philosophy.md) - Understanding how Rustuya works under the hood.
-- [**Architecture**](./architecture.md) - Internal structure and module overview.
-- [**FAQ**](./faq.md) - Frequently asked questions.
+- [**Getting Started**](./getting-started.md) - Installation and quick start guide for Rust and Python.
+- [**Rust API Reference**](./rust-api.md) - Detailed reference for the core Rust library components.
+- [**Python API Guide**](./python-api.md) - API reference and guide for Python integration.
+- [**Python Examples**](./python-examples.md) - Practical code examples for common Python use cases.
+- [**Design Philosophy**](./philosophy.md) - Core concepts and the underlying execution model.
+- [**Architecture**](./architecture.md) - System design and internal component breakdown.
+- [**FAQ**](./faq.md) - Frequently asked questions and troubleshooting.
 
 ---
 

@@ -27,6 +27,7 @@ impl TuyaCipher {
         Ok(Self { key: k, gcm })
     }
 
+    #[must_use]
     pub fn key(&self) -> &[u8; 16] {
         &self.key
     }

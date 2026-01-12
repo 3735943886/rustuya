@@ -63,11 +63,13 @@ pub const NO_PROTOCOL_HEADER_CMDS: &[u32] = &[
 
 define_version! {
     V3_1 = ("3.1", 3.1),
+    V3_2 = ("3.2", 3.2),
     V3_3 = ("3.3", 3.3),
     V3_4 = ("3.4", 3.4),
     V3_5 = ("3.5", 3.5),
 }
 
+#[must_use]
 pub fn create_base_payload(
     device_id: &str,
     cid: Option<&str>,
@@ -92,12 +94,15 @@ pub fn create_base_payload(
 
 pub mod dev22;
 pub mod v31;
+pub mod v32;
 pub mod v33;
 pub mod v34;
 pub mod v35;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceType {
+    #[default]
+    Auto,
     Default,
     Device22,
 }
@@ -106,6 +111,7 @@ impl std::str::FromStr for DeviceType {
     type Err = ();
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "auto" | "" => Ok(DeviceType::Auto),
             "default" => Ok(DeviceType::Default),
             "device22" => Ok(DeviceType::Device22),
             _ => Err(()),
@@ -114,20 +120,42 @@ impl std::str::FromStr for DeviceType {
 }
 
 impl DeviceType {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            DeviceType::Auto => "auto",
             DeviceType::Default => "default",
             DeviceType::Device22 => "device22",
         }
     }
 }
 
-impl From<f32> for DeviceType {
-    fn from(v: f32) -> Self {
-        if (v - 3.2).abs() < f32::EPSILON {
-            DeviceType::Device22
-        } else {
-            DeviceType::Default
+impl From<&str> for DeviceType {
+    fn from(s: &str) -> Self {
+        s.parse().unwrap_or(DeviceType::Auto)
+    }
+}
+
+impl From<String> for DeviceType {
+    fn from(s: String) -> Self {
+        s.parse().unwrap_or(DeviceType::Auto)
+    }
+}
+
+impl From<Option<String>> for DeviceType {
+    fn from(s: Option<String>) -> Self {
+        match s {
+            Some(s) => s.parse().unwrap_or(DeviceType::Auto),
+            None => DeviceType::Auto,
+        }
+    }
+}
+
+impl From<Option<&str>> for DeviceType {
+    fn from(s: Option<&str>) -> Self {
+        match s {
+            Some(s) => s.parse().unwrap_or(DeviceType::Auto),
+            None => DeviceType::Auto,
         }
     }
 }
@@ -146,16 +174,98 @@ pub trait TuyaProtocol: Send + Sync {
     fn pack_payload(&self, payload: &[u8], cmd: u32, cipher: &TuyaCipher) -> Result<Vec<u8>>;
     fn decrypt_payload(&self, payload: Vec<u8>, cipher: &TuyaCipher) -> Result<Vec<u8>>;
     fn has_version_header(&self, payload: &[u8]) -> bool;
+
+    /// Returns whether this protocol version requires session key negotiation.
+    fn requires_session_key(&self) -> bool;
+
+    /// Encrypts the session key according to protocol version requirements.
+    fn encrypt_session_key(
+        &self,
+        session_key: &[u8],
+        cipher: &TuyaCipher,
+        nonce: &[u8],
+    ) -> Result<Vec<u8>>;
+
+    /// Returns the message prefix (e.g., 0x55AA or 0x6699) for this protocol version.
+    fn get_prefix(&self) -> u32;
+
+    /// Returns the HMAC key to use for message packing/unpacking, if applicable.
+    fn get_hmac_key<'a>(&self, cipher_key: &'a [u8]) -> Option<&'a [u8]>;
+
+    /// Returns whether an empty payload is allowed for the given command.
+    fn is_empty_payload_allowed(&self, cmd: u32) -> bool;
+
+    /// Returns whether the protocol should attempt dev22 fallback on error.
+    fn should_check_dev22_fallback(&self) -> bool;
+
+    /// Step 1: Prepare local nonce for session key negotiation.
+    fn prepare_session_key_negotiation(&self) -> Vec<u8> {
+        use rand::RngCore;
+        let mut local_nonce = vec![0u8; 16];
+        rand::rng().fill_bytes(&mut local_nonce);
+        local_nonce
+    }
+
+    /// Step 2: Verify the HMAC from device response during negotiation.
+    fn verify_session_key_response(
+        &self,
+        local_nonce: &[u8],
+        remote_payload: &[u8],
+        local_key: &[u8],
+    ) -> Result<Vec<u8>> {
+        if remote_payload.len() < 48 {
+            return Err(TuyaError::KeyOrVersionError);
+        }
+        let remote_nonce = &remote_payload[..16];
+        let remote_hmac = &remote_payload[16..48];
+
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(local_key).map_err(|_| TuyaError::EncryptionFailed)?;
+        mac.update(local_nonce);
+        mac.verify_slice(remote_hmac)
+            .map_err(|_| TuyaError::EncryptionFailed)?;
+
+        Ok(remote_nonce.to_vec())
+    }
+
+    /// Step 3: Calculate final session key and its HMAC for the finish message.
+    fn finalize_session_key(
+        &self,
+        local_nonce: &[u8],
+        remote_nonce: &[u8],
+        local_key: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(local_key).map_err(|_| TuyaError::EncryptionFailed)?;
+        mac.update(remote_nonce);
+        let finish_hmac = mac.finalize().into_bytes().to_vec();
+
+        let session_key: Vec<u8> = local_nonce
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ remote_nonce[i % remote_nonce.len()])
+            .collect();
+
+        Ok((session_key, finish_hmac))
+    }
 }
 
+#[must_use]
 pub fn get_protocol(version: Version, dev_type: DeviceType) -> Box<dyn TuyaProtocol> {
-    match (version, dev_type) {
-        (Version::V3_1, _) => Box::new(v31::ProtocolV31),
-        (Version::V3_3, DeviceType::Device22) => Box::new(dev22::ProtocolDev22),
-        (Version::V3_3, _) => Box::new(v33::ProtocolV33),
-        (Version::V3_4, _) => Box::new(v34::ProtocolV34),
-        (Version::V3_5, _) => Box::new(v35::ProtocolV35),
-        _ => Box::new(v33::ProtocolV33), // Default to 3.3
+    let base: Box<dyn TuyaProtocol> = match version {
+        Version::V3_1 => Box::new(v31::ProtocolV31),
+        Version::V3_2 => Box::new(v32::ProtocolV32),
+        Version::V3_3 => Box::new(v33::ProtocolV33),
+        Version::V3_4 => Box::new(v34::ProtocolV34),
+        Version::V3_5 => Box::new(v35::ProtocolV35),
+        // Fallback to v3.3 if version is Auto or unknown
+        _ => Box::new(v33::ProtocolV33),
+    };
+
+    if dev_type == DeviceType::Device22 {
+        Box::new(dev22::ProtocolDev22::new(base))
+    } else {
+        base
     }
 }
 
@@ -170,10 +280,21 @@ pub struct TuyaMessage {
 }
 
 impl TuyaMessage {
+    #[must_use]
     pub fn payload_as_string(&self) -> Option<String> {
         std::str::from_utf8(&self.payload)
             .ok()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
+    }
+
+    #[must_use]
+    pub fn is_55aa(&self) -> bool {
+        self.prefix == PREFIX_55AA
+    }
+
+    #[must_use]
+    pub fn is_6699(&self) -> bool {
+        self.prefix == PREFIX_6699
     }
 }
 
@@ -199,7 +320,7 @@ pub struct TuyaHeader {
     pub total_length: u32,
 }
 
-/// Packs TuyaMessage into binary data.
+/// Packs `TuyaMessage` into binary data.
 pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut data = Vec::new();
 
@@ -333,8 +454,7 @@ pub fn unpack_message(
 
         if payload_end < header_len {
             return Err(TuyaError::DecodeError(format!(
-                "Payload end ({}) is before header end ({})",
-                payload_end, header_len
+                "Payload end ({payload_end}) is before header end ({header_len})"
             )));
         }
 

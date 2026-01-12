@@ -11,12 +11,12 @@ No. Rustuya is strictly a **Local API** implementation. It communicates directly
 
 ### **2. Which Tuya device versions are supported?**
 Rustuya supports all major Tuya protocol versions:
-- **3.1, 3.3, 3.4, 3.5**: Standard protocol versions used by most Wi-Fi devices.
+- **3.1 to 3.5**: Standard protocol versions used by most Wi-Fi devices.
 - **device22**: A special version used by some devices.
 
 ---
 
-### **3. How do I find my device's Local Key?**
+### **3. How to find the Local Key?**
 The Local Key is required for encryption. It can be obtained by:
 1.  Using the [Tuya IoT Platform](https://iot.tuya.com/) and utilizing the **Core API** to retrieve keys for registered devices.
 2.  Using external tools and libraries:
@@ -26,10 +26,13 @@ The Local Key is required for encryption. It can be obtained by:
 
 ---
 
-### **4. Can I use Rustuya in synchronous code?**
-Yes. While the core is asynchronous (`tokio`), a synchronous wrapper is provided in `rustuya::sync` for Rust and Python.
+### **4. Is it possible to use Rustuya in synchronous code?**
+Yes. While the core is asynchronous, a synchronous wrapper is provided in `rustuya::sync` for Rust and Python.
 
 ---
 
-### **5. How many devices can I manage at once?**
-Rustuya is designed for high concurrency. You can manage thousands of devices using the `Manager`. On Unix-like systems, remember to call `Manager::maximize_fd_limit()` to increase the number of allowed open sockets.
+### **5. How many devices can be managed at once?**
+Rustuya is designed for high concurrency and can manage thousands of devices efficiently. On Unix-like systems, the process file descriptor limit must be increased when handling a very large number of concurrent connections. This can be handled automatically by calling:
+
+- **Rust**: `rustuya::maximize_fd_limit()`
+- **Python**: `rustuya.maximize_fd_limit()`

@@ -1,11 +1,10 @@
 [package]
 name = "rustuya"
-version = "0.1.6"
+version = "0.2.0"
 authors = ["3735943886"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/3735943886/rustuya"
-documentation = "https://docs.rs/rustuya"
 homepage = "https://github.com/3735943886/rustuya"
 description = "A fast and concurrent Tuya Local API implementation in Rust"
 keywords = ["tuya", "iot", "smart-home", "automation"]
@@ -41,7 +40,6 @@ log = "0.4"
 md-5 = "0.10"
 parking_lot = "0.12"
 rand = "0.9"
-rlimit = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -50,6 +48,9 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
 
 [profile.release]
 opt-level = 3

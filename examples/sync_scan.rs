@@ -1,13 +1,13 @@
 /**
- * Device Scanner Example
+ * Scanner Example (Sync Iterator)
  *
  * This example demonstrates how to use the synchronous scanner to find
- * Tuya devices on the local network in real-time using a standard iterator.
+ * Tuya devices on the local network in real-time using a standard iterator (Receiver).
  */
 use rustuya::sync::Scanner;
 
 fn main() {
-    println!("--- Rustuya Device Scanner Example ---");
+    println!("--- Rustuya - Scanner (Sync) ---");
     println!("[INFO] Scanning the network for Tuya devices in real-time...");
 
     // 1. Get a scan_stream (mpsc::Receiver) directly from Scanner
@@ -15,7 +15,7 @@ fn main() {
 
     let mut count = 0;
 
-    // 2. Process devices as they are discovered
+    // 3. Process devices as they are discovered (blocking loop)
     // Receiver implements IntoIterator, so we can use it in a for loop
     for device in stream {
         count += 1;

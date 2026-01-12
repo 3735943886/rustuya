@@ -1,53 +1,20 @@
 # Python API Reference
 
-This document provides a detailed reference for the `rustuya` Python bindings. The Python API is a synchronous, thread-safe wrapper around the high-performance Rust core.
+This document provides a detailed reference for the `rustuya` Python bindings.
 
 For practical code examples, see the [Python Examples](./python-examples.md) page.
 
 ---
 
-## **1. Manager API**
-The `Manager` is used for managing multiple devices simultaneously and receiving a unified event stream.
+## **1. System Optimization**
+To handle high-concurrency environments with many device connections, use this utility.
 
-### `Manager()`
-- **Description**: Creates a new manager instance.
+### `maximize_fd_limit()`
+- **Description**: Increases the maximum number of open file descriptors (sockets) allowed for the process. Recommended for gateways or management servers.
 - **Example**:
   ```python
-  from rustuya import Manager
-  mgr = Manager()
-  ```
-
-### `Manager.maximize_fd_limit()` (Static)
-- **Description**: (Unix-like systems only) Increases the process file descriptor limit. Recommended when managing a large number of devices.
-- **Example**: `Manager.maximize_fd_limit()`
-
-### `manager.add(id, address, local_key, version)`
-- **Description**: Registers a device with the manager. Starts a background connection task.
-- **Arguments**:
-  - `id`: Unique device ID.
-  - `address`: IP address or "Auto" for discovery.
-  - `local_key`: Local key for encryption.
-  - `version`: Protocol version (e.g., "3.1", "3.3", "3.4", "3.5") or "Auto" for discovery.
-- **Example**: `mgr.add("id", "192.168.1.100", "key", "3.3")`
-
-### `manager.get(id)`
-- **Description**: Returns a `Device` handle for the given ID. Returns `None` if not found.
-- **Example**: `dev = mgr.get("id")`
-
-### `manager.remove(id)`
-- **Description**: Removes a device from the manager's tracking.
-- **Example**: `mgr.remove("id")`
-
-### `manager.list()`
-- **Description**: Returns a list of `DeviceInfo` objects for all managed devices.
-- **Example**: `devices = mgr.list()`
-
-### `manager.listener()`
-- **Description**: Returns a `ManagerEventReceiver` to iterate over events from all managed devices.
-- **Example**:
-  ```python
-  for event in mgr.listener():
-      print(f"Device {event['device_id']} sent: {event['payload']}")
+  import rustuya
+  rustuya.maximize_fd_limit()
   ```
 
 ---
@@ -55,94 +22,132 @@ The `Manager` is used for managing multiple devices simultaneously and receiving
 ## **2. Device API**
 Direct interaction and control for individual Tuya devices.
 
-### `Device(id, address, local_key, version)`
+### `Device()`
+- **Definition**: `Device(id, local_key, address="Auto", version="Auto", dev_type=None, persist=True, timeout=None, nowait=False)`
 - **Description**: Creates a new device handle.
-- **Note**: `Device` objects obtained via `manager.get()` provide the same functionality.
-
-### `device.status()`
-- **Description**: Requests the current status (all DPS) from the device.
-- **Returns**: None (Results arrive via listener).
-
-### `device.set_value(dp_id, value)`
-- **Description**: Sets a single DP value.
-- **Arguments**: `dp_id` (int or str), `value` (bool, int, str, etc.).
-
-### `device.set_dps(dps_dict)`
-- **Description**: Sets multiple DP values at once.
-- **Arguments**: A dictionary of DP ID to value.
-- **Example**: `dev.set_dps({"1": True, "2": 50})`
-
-### `device.listener()`
-- **Description**: Returns a `DeviceMessageReceiver` that yields messages from the device.
+- **Arguments**:
+  - `id` (str, **Required**): The unique device ID.
+  - `local_key` (str, **Required**): The 16-character local key.
+  - `address` (str, *Optional*): IP address. Default is `"Auto"` (uses UDP discovery).
+  - `version` (str, *Optional*): Protocol version. Default is `"Auto"`.
+  - `dev_type` (str, *Optional*): Device architecture type.
+    - `None` (default): **Automatic detection**. Switches to `"device22"` if ID length is 22.
+    - `"default"`: Force standard Tuya device architecture (disables auto-detection).
+    - `"device22"`: Force specialized 22-character ID architecture.
+  - `persist` (bool, *Optional*): Whether to keep the TCP connection alive. Default is `True`.
+  - `timeout` (float, *Optional*): Global timeout for network operations and responses in seconds (default: 10.0)
+  - `nowait` (bool, *Optional*): If `True`, command methods return immediately after queuing. Default is `False`.
 - **Example**:
   ```python
-  listener = dev.listener()
-  msg = listener.recv(timeout_ms=5000) # Optional timeout
+  from rustuya import Device
+  dev = Device("DEVICE_ID", "LOCAL_KEY", nowait=False)
   ```
 
-### **Advanced Usage**
+### `device.status()`
+- **Description**: Requests current status (DPS values) from the device.
+- **Returns**: `dict` (or `None` if `nowait=True`)
+- **Example**:
+  ```python
+  status = dev.status()
+  ```
 
-#### `device.request(command, data=None, cid=None)`
-- **Description**: Low-level method to send a raw Tuya command.
-- **Arguments**: `command` (int from `CommandType`), `data` (dict, optional), `cid` (str, optional).
+### `device.set_value()`
+- **Description**: Sets a single DP value.
+- **Arguments**: `dp_id` (int or str), `value` (bool, int, str, dict, etc.)
+- **Example**:
+  ```python
+  dev.set_value(1, True)
+  ```
+
+### `device.set_dps()`
+- **Description**: Sets multiple DP values at once.
+- **Arguments**: A dictionary of DP ID to value.
+- **Example**:
+  ```python
+  dev.set_dps({"1": True, "2": 50})
+  ```
+
+### `device.request()`
+- **Description**: Sends a low-level Tuya command.
+- **Arguments**:
+  - `command` (int, **Required**): Command ID (use `CommandType`).
+  - `data` (dict, *Optional*): Payload data. Default is `None`.
+  - `cid` (str, *Optional*): Child ID for sub-devices. Default is `None`.
 - **Example**:
   ```python
   from rustuya import CommandType
-  dev.request(CommandType["DpQuery"], None)
+  dev.request(CommandType["DpQuery"], data=None)
   ```
 
-### **Gateway API**
+### `device.listener()`
+- **Description**: Returns a `DeviceEventReceiver` for real-time messages.
+- **Example**:
+  ```python
+  listener = dev.listener()
+  for msg in listener:
+      print(f"Received: {msg}")
+  ```
 
-#### `device.sub_discover()`
-- **Description**: Sends a command to the gateway to discover connected sub-devices.
-
-#### `device.sub(cid)`
-- **Description**: Returns a `SubDevice` handle for the given cid.
-- **Example**: `sub_device = dev.sub("sub_id_123")`
+### `unified_listener()`
+- **Description**: Aggregates event streams from multiple devices into a single receiver.
+- **Arguments**: `devices` (list of `Device` objects)
+- **Returns**: `UnifiedEventReceiver`
+- **Example**:
+  ```python
+  from rustuya import unified_listener
+  listener = unified_listener([dev1, dev2])
+  for event in listener:
+      print(f"Device {event['id']} updated: {event['payload']}")
+  ```
 
 ---
 
 ## **3. SubDevice API**
-API for interacting with sub-devices (endpoints) through a parent Gateway `Device`. These objects are obtained via `device.sub(cid)`.
+Interaction with sub-devices (endpoints) through a parent Gateway `Device`. Obtained via `device.sub(cid)`.
 
-### `sub_device.status()`
-- **Description**: Requests status for the sub-device via the gateway.
-
-### `sub_device.set_value(dp_id, value)`
-- **Description**: Sets a single DP value for the sub-device.
-
-### `sub_device.set_dps(dps_dict)`
-- **Description**: Sets multiple DP values for the sub-device.
-
-### **Advanced Usage**
-- **Note**: Sub-devices do not have a direct `request()` method. To send raw commands to a sub-device, use the parent `Device` handle's `request()` method and provide the sub-device's ID as the `cid` argument.
+### `device.sub()`
+- **Description**: Returns a `SubDevice` handle for the given Child ID.
 - **Example**:
   ```python
-  from rustuya import CommandType
-  # Use parent device to send request to sub-device
-  parent_dev.request(CommandType["DpQuery"], None, cid=sub_dev.id)
+  sub = gateway.sub("sub_id")
+  ```
+
+### `sub_device.status()` / `set_value()` / `set_dps()`
+- **Description**: These methods mirror the `Device` API but target the specific sub-device via the parent gateway.
+- **Example**:
+  ```python
+  sub.set_value(1, True)
   ```
 
 ---
 
-## **4. Scanner API**
-Used for discovering Tuya devices on the local network via UDP broadcast.
+## **4. Discovery (Scanner)**
+Search for devices on the local network.
 
-### `Scanner()`
-- **Description**: Creates a new scanner instance with default settings.
-
-### `scanner.with_timeout(timeout_ms)`
-- **Description**: Sets the scan duration in milliseconds. Returns a new configured `Scanner`.
-
-### `scanner.set_bind_address(address)`
-- **Description**: Sets the local IP address to bind to for discovery.
-
-### `scanner.scan()`
-- **Description**: Performs an active scan and returns a list of discovered devices.
-- **Example**: 
+### `Scanner.scan()`
+- **Description**: Performs a one-time scan and returns a list of discovered devices.
+- **Example**:
   ```python
   from rustuya import Scanner
-  results = Scanner().with_timeout(5000).scan()
-  for device in results:
-      print(f"Found: {device['id']} at {device['ip']}")
+  devices = Scanner.scan()
+  for dev in devices:
+      print(f"Found: {dev['id']} at {dev['ip']}")
   ```
+
+### `Scanner.scan_stream()`
+- **Description**: Returns an iterator that yields devices as they are discovered in real-time.
+- **Example**:
+  ```python
+  from rustuya import Scanner
+  stream = Scanner.scan_stream()
+  for dev in stream:
+      print(f"Found: {dev['id']} at {dev['ip']}")
+  ```
+
+---
+
+## **5. Thread Safety**
+The `rustuya` Python API is fully thread-safe. All core objects—`Device`, `SubDevice`, and `Scanner`—are designed to be shared across multiple threads without additional locking in Python.
+
+- **Background Tasks**: Connection maintenance and message processing happen in background Rust threads.
+- **Non-blocking Loop**: If using `asyncio`, set `nowait=True` to call methods without blocking the event loop.
