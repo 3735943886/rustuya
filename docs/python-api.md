@@ -40,7 +40,7 @@ Direct interaction and control for individual Tuya devices.
 - **Example**:
   ```python
   from rustuya import Device
-  dev = Device("DEVICE_ID", "LOCAL_KEY", nowait=False)
+  dev = Device("DEVICE_ID", "LOCAL_KEY")
   ```
 
 ### `device.status()`

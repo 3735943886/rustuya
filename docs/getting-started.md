@@ -24,9 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::new("DEVICE_ID", "LOCAL_KEY");
 
     // Set a DP value (e.g., DP 1 to true)
-    let res = device.set_value(1, true)?;
-    println!("Response: {:?}", res);
-    
+    device.set_value(1, true)?;
+
     Ok(())
 }
 ```
@@ -50,8 +49,8 @@ from rustuya import Device
 # Create a device handle
 device = Device("DEVICE_ID", "LOCAL_KEY")
 
-# Set a DP value
-print(device.set_value(1, True))
+# Set a DP value (e.g., DP 1 to true)
+device.set_value(1, True)
 ```
 
 ---
