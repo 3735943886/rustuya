@@ -956,16 +956,16 @@ impl Device {
             tokio::select! {
                 () = &mut sleep_fut => return Some(()),
                 () = &mut discovery_notified => {
-                    if let Some(res) = get_scanner().get_cached_result(&self.id) {
-                        if res.discovered_at.elapsed() < Duration::from_secs(10) {
-                            let current_ip = self.with_state(|s| s.real_ip.clone());
-                            if current_ip.is_empty() || current_ip != res.ip {
-                                debug!(
-                                    "Bypassing backoff for {} due to IP change ({} -> {})",
-                                    self.id, current_ip, res.ip
-                                );
-                                return Some(());
-                            }
+                    if let Some(res) = get_scanner().get_cached_result(&self.id)
+                        && res.discovered_at.elapsed() < Duration::from_secs(10)
+                    {
+                        let current_ip = self.with_state(|s| s.real_ip.clone());
+                        if current_ip.is_empty() || current_ip != res.ip {
+                            debug!(
+                                "Bypassing backoff for {} due to IP change ({} -> {})",
+                                self.id, current_ip, res.ip
+                            );
+                            return Some(());
                         }
                     }
                     discovery_notified.set(get_scanner().notified());
