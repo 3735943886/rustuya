@@ -365,6 +365,13 @@ impl Scanner {
         self.inner.notify.notified()
     }
 
+    /// Returns the cached discovery result for a device, if it exists and is not expired.
+    #[must_use]
+    pub fn get_cached_result(&self, device_id: &str) -> Option<DiscoveryResult> {
+        let guard = self.inner.cache.read();
+        guard.get(device_id).cloned()
+    }
+
     /// Checks if a device was discovered within the last `within` duration.
     #[must_use]
     pub fn is_recently_discovered(&self, device_id: &str, within: Duration) -> bool {
