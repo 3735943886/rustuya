@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 [dependencies]
 hex = "0.4"
 log = "0.4"
-pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py37"] }
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py37"] }
 pyo3-log = "0.13.2"
 pythonize = "0.27.0"
 rustuya = { path = ".." }
