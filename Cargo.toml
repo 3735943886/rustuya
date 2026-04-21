@@ -22,7 +22,7 @@ name = "rustuya"
 crate-type = ["rlib"]
 
 [dependencies]
-aes = "0.8"
+aes = "0.9"
 aes-gcm = "0.10"
 async-stream = "0.3"
 base64 = "0.22"
