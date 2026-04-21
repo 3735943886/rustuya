@@ -200,7 +200,7 @@ impl ScannerIterator {
 }
 
 /// Sub-device handle for gateways in Python.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct SubDevice {
     inner: SyncSubDevice,
@@ -296,7 +296,7 @@ impl SubDevice {
 }
 
 /// Device handle for Python.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Device {
     inner: SyncDevice,
