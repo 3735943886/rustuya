@@ -14,13 +14,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    target-branch: "feat/update-dependencies"
 
   - package-ecosystem: "cargo"
     directory: "/python"
     schedule:
       interval: "weekly"
-
-  - package-ecosystem: "pip"
-    directory: "/python"
-    schedule:
-      interval: "weekly"
+    target-branch: "feat/update-dependencies"
