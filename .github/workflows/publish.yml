@@ -43,7 +43,7 @@ jobs:
         with:
           args: -o CHANGELOG.md --tag "${{ github.ref_name }}"
       - name: Upload changelog
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: changelog
           path: CHANGELOG.md
@@ -72,7 +72,7 @@ jobs:
           manylinux: auto
           working-directory: python
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: python/dist
@@ -99,7 +99,7 @@ jobs:
           sccache: 'true'
           working-directory: python
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-windows-${{ matrix.platform.target }}
           path: python/dist
@@ -125,7 +125,7 @@ jobs:
           sccache: 'true'
           working-directory: python
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: python/dist
@@ -142,7 +142,7 @@ jobs:
           args: --out dist
           working-directory: python
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: python/dist
