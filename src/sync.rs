@@ -192,7 +192,7 @@ impl Device {
 
     pub fn listener(&self) -> std::sync::mpsc::Receiver<TuyaMessage> {
         let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_SYNC_CAPACITY);
-        let mut broadcast_rx = self.inner.broadcast_tx.subscribe();
+        let mut broadcast_rx = self.inner.broadcast_tx().subscribe();
 
         runtime::spawn(async move {
             while let Ok(msg) = broadcast_rx.recv().await {
