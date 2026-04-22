@@ -16,7 +16,7 @@ use futures_core::stream::Stream;
 use hex;
 use log::{debug, error, info, trace, warn};
 use parking_lot::RwLock;
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
