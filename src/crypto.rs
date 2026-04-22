@@ -6,9 +6,9 @@ use crate::error::{Result, TuyaError};
 use aes::Aes128;
 use aes_gcm::{
     Aes128Gcm, Nonce,
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, KeyInit, Payload, consts::U12},
 };
-use cipher::{BlockDecryptMut, BlockEncryptMut};
+use cipher::{Block, BlockModeDecrypt, BlockModeEncrypt};
 use ecb::{Decryptor, Encryptor};
 
 pub struct TuyaCipher {
@@ -41,8 +41,8 @@ impl TuyaCipher {
         padding: bool,
     ) -> Result<Vec<u8>> {
         let encrypted_bytes = if let Some(iv_bytes) = iv {
-            let nonce = Nonce::from_slice(&iv_bytes[..12]);
-
+            let nonce = <&Nonce<U12>>::try_from(&iv_bytes[..12])
+                .map_err(|_| TuyaError::EncryptionFailed)?;
             let payload = Payload {
                 msg: data,
                 aad: header.unwrap_or(&[]),
@@ -79,8 +79,9 @@ impl TuyaCipher {
 
             let mut ciphertext = padded_data.clone();
             for chunk in ciphertext.chunks_mut(16) {
-                let block = cipher::generic_array::GenericArray::from_mut_slice(chunk);
-                encryptor.encrypt_block_mut(block);
+                let block = <&mut Block<Aes128>>::try_from(chunk)
+                    .map_err(|_| TuyaError::EncryptionFailed)?;
+                encryptor.encrypt_block(block);
             }
 
             ciphertext
@@ -113,8 +114,8 @@ impl TuyaCipher {
         };
 
         if let Some(iv_bytes) = iv {
-            let nonce = Nonce::from_slice(&iv_bytes[..12]);
-
+            let nonce = <&Nonce<U12>>::try_from(&iv_bytes[..12])
+                .map_err(|_| TuyaError::EncryptionFailed)?;
             let payload = Payload {
                 msg: &input_data,
                 aad: header.unwrap_or(&[]),
@@ -135,8 +136,9 @@ impl TuyaCipher {
             }
 
             for chunk in plaintext.chunks_mut(16) {
-                let block = cipher::generic_array::GenericArray::from_mut_slice(chunk);
-                decryptor.decrypt_block_mut(block);
+                let block = <&mut Block<Aes128>>::try_from(chunk)
+                    .map_err(|_| TuyaError::EncryptionFailed)?;
+                decryptor.decrypt_block(block);
             }
 
             if plaintext.is_empty() {

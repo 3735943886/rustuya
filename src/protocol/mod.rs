@@ -5,6 +5,7 @@
 use crate::crypto::TuyaCipher;
 use crate::error::{Result, TuyaError};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
+use cipher::KeyInit;
 use crc::{CRC_32_ISO_HDLC, Crc};
 use hmac::{Hmac, Mac};
 use serde::Serialize;
@@ -200,7 +201,7 @@ pub trait TuyaProtocol: Send + Sync {
 
     /// Step 1: Prepare local nonce for session key negotiation.
     fn prepare_session_key_negotiation(&self) -> Vec<u8> {
-        use rand::RngCore;
+        use rand::Rng;
         let mut local_nonce = vec![0u8; 16];
         rand::rng().fill_bytes(&mut local_nonce);
         local_nonce
@@ -372,7 +373,7 @@ pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8
             iv.clone()
         } else {
             let mut iv = vec![0u8; 12];
-            rand::RngCore::fill_bytes(&mut rand::rng(), &mut iv);
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut iv);
             iv
         };
 

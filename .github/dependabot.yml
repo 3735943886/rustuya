@@ -19,8 +19,3 @@ updates:
     directory: "/python"
     schedule:
       interval: "weekly"
-
-  - package-ecosystem: "pip"
-    directory: "/python"
-    schedule:
-      interval: "weekly"
