@@ -566,13 +566,14 @@ impl Scanner {
         &self,
         device_id: &str,
     ) -> Result<Option<DiscoveryResult>> {
-        self.discover_device_internal(device_id, false).await
+        self.discover_device_internal(device_id, false, None).await
     }
 
     pub async fn discover_device_internal(
         &self,
         device_id: &str,
         force_scan: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<Option<DiscoveryResult>> {
         // 1. Check cache and cooldowns
         if let Some(res) = self.check_cache_and_cooldown(device_id, force_scan) {
@@ -583,7 +584,7 @@ impl Scanner {
         self.ensure_scan_started(device_id, force_scan).await;
 
         // 3. Wait for the result to appear in cache
-        Ok(self.wait_for_cache_result(device_id).await)
+        Ok(self.wait_for_cache_result(device_id, cancel).await)
     }
 
     fn check_cache_and_cooldown(
@@ -636,7 +637,11 @@ impl Scanner {
         }
     }
 
-    async fn wait_for_cache_result(&self, device_id: &str) -> Option<DiscoveryResult> {
+    async fn wait_for_cache_result(
+        &self,
+        device_id: &str,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Option<DiscoveryResult> {
         let state = &self.inner;
         let start_wait = Instant::now();
 
@@ -652,7 +657,18 @@ impl Scanner {
             }
 
             let remaining = self.timeout.saturating_sub(elapsed);
-            let _ = tokio::time::timeout(remaining, state.notify.notified()).await;
+            let notified = state.notify.notified();
+            tokio::pin!(notified);
+
+            if let Some(ct) = cancel {
+                tokio::select! {
+                    _ = ct.cancelled() => return None,
+                    _ = tokio::time::sleep(remaining) => {}
+                    _ = &mut notified => {}
+                }
+            } else {
+                let _ = tokio::time::timeout(remaining, &mut notified).await;
+            }
         }
     }
 

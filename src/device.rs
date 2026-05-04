@@ -1175,7 +1175,11 @@ impl Device {
         }
 
         if let Ok(Some(result)) = get_scanner()
-            .discover_device_internal(&self.inner.id, force_discovery)
+            .discover_device_internal(
+                &self.inner.id,
+                force_discovery,
+                Some(&self.inner.cancel_token),
+            )
             .await
         {
             let mut state = self.inner.state.write();
