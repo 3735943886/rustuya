@@ -39,9 +39,8 @@ pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(future)
-    } else {
-        get_runtime().spawn(future)
-    }
+    // Always spawn on the library's own dedicated runtime.
+    // Using the caller's runtime (try_current) caused background scanner/device
+    // tasks to attach to the consumer app's runtime, preventing clean shutdown.
+    get_runtime().spawn(future)
 }
