@@ -55,9 +55,11 @@ Direct interaction with individual Tuya devices.
     - `.nowait(bool)`: Do not wait for response (default: false).
 - **Example**:
   ```rust
+  use rustuya::{Device, Version};
+
   let device = Device::builder("DEVICE_ID", "LOCAL_KEY")
       .address("192.168.1.100")
-      .version("3.4")
+      .version(Version::V3_4)            // or "3.4".parse::<Version>()?
       .nowait(true)
       .run();
   ```

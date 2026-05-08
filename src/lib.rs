@@ -12,13 +12,12 @@
 //! device.set_value(1, true);
 //! ```
 //!
-#[macro_use]
-pub mod macros;
+pub(crate) mod macros;
 pub mod crypto;
 pub mod device;
 pub mod error;
 pub mod protocol;
-pub mod runtime;
+pub(crate) mod runtime;
 pub mod scanner;
 pub mod sync;
 

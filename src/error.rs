@@ -2,12 +2,16 @@
 //!
 //! Defines Tuya-specific error codes and provides conversion from standard IO and JSON errors.
 
+use crate::macros::define_error_codes;
 use thiserror::Error;
 
 #[derive(Error, Debug, Clone)]
 pub enum TuyaError {
-    #[error("IO error: {0}")]
-    Io(String),
+    #[error("IO error ({kind:?}): {message}")]
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 
     #[error("JSON error: {0}")]
     Json(String),
@@ -56,7 +60,10 @@ pub type Result<T> = std::result::Result<T, TuyaError>;
 
 impl From<std::io::Error> for TuyaError {
     fn from(err: std::io::Error) -> Self {
-        TuyaError::Io(err.to_string())
+        TuyaError::Io {
+            kind: err.kind(),
+            message: err.to_string(),
+        }
     }
 }
 
@@ -67,10 +74,33 @@ impl From<serde_json::Error> for TuyaError {
 }
 
 impl TuyaError {
+    /// Builds an `Io` error with the given kind and message.
+    pub fn io<S: Into<String>>(kind: std::io::ErrorKind, message: S) -> Self {
+        Self::Io {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Builds an `Io` error with `ErrorKind::Other` and the given message.
+    pub fn io_other<S: Into<String>>(message: S) -> Self {
+        Self::io(std::io::ErrorKind::Other, message)
+    }
+
+    /// Returns the underlying `io::ErrorKind` if this is an `Io` error.
+    #[must_use]
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        if let Self::Io { kind, .. } = self {
+            Some(*kind)
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn code(&self) -> u32 {
         match self {
-            TuyaError::Io(_) => ERR_CONNECT,
+            TuyaError::Io { .. } => ERR_CONNECT,
             TuyaError::Json(_) => ERR_JSON,
             TuyaError::DecryptionFailed => ERR_KEY_OR_VER,
             TuyaError::EncryptionFailed => ERR_KEY_OR_VER,
@@ -97,7 +127,7 @@ impl TuyaError {
             ERR_OFFLINE => TuyaError::Offline,
             ERR_KEY_OR_VER => TuyaError::KeyOrVersionError,
             ERR_PAYLOAD => TuyaError::InvalidPayload,
-            _ => TuyaError::Io(format!("Unknown error code: {code}")),
+            _ => TuyaError::io_other(format!("Unknown error code: {code}")),
         }
     }
 }

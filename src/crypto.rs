@@ -60,15 +60,13 @@ impl TuyaCipher {
         } else {
             let mut encryptor = Encryptor::<Aes128>::new(&self.key.into());
 
-            let padded_data = if padding {
+            let mut buffer = if padding {
                 let len = data.len();
-                let remainder = len % 16;
-                let padding_len = 16 - remainder;
+                let padding_len = 16 - (len % 16);
 
-                let mut p = data.to_vec();
-                for _ in 0..padding_len {
-                    p.push(padding_len as u8);
-                }
+                let mut p = Vec::with_capacity(len + padding_len);
+                p.extend_from_slice(data);
+                p.resize(len + padding_len, padding_len as u8);
                 p
             } else {
                 if !data.len().is_multiple_of(16) {
@@ -77,14 +75,13 @@ impl TuyaCipher {
                 data.to_vec()
             };
 
-            let mut ciphertext = padded_data.clone();
-            for chunk in ciphertext.chunks_mut(16) {
+            for chunk in buffer.chunks_mut(16) {
                 let block = <&mut Block<Aes128>>::try_from(chunk)
                     .map_err(|_| TuyaError::EncryptionFailed)?;
                 encryptor.encrypt_block(block);
             }
 
-            ciphertext
+            buffer
         };
 
         if use_base64 {
@@ -129,9 +126,9 @@ impl TuyaCipher {
             Ok(plaintext)
         } else {
             let mut decryptor = Decryptor::<Aes128>::new(&self.key.into());
-            let mut plaintext = input_data.clone();
+            let mut plaintext = input_data;
 
-            if plaintext.len() % 16 != 0 {
+            if !plaintext.len().is_multiple_of(16) {
                 return Err(TuyaError::DecryptionFailed);
             }
 

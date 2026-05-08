@@ -22,13 +22,20 @@ use tokio::sync::mpsc;
 /// Default capacity for synchronous event channels to prevent memory buildup.
 const CHAN_SYNC_CAPACITY: usize = 128;
 
+#[doc(hidden)]
 pub mod internal {
-    use super::*;
+    use super::get_runtime;
     pub fn get_sync_runtime() -> &'static tokio::runtime::Runtime {
         get_runtime()
     }
 }
 
+/// Internal sync-to-async dispatch envelope used by language bindings.
+///
+/// Not part of the stable public API. Visible only because foreign-language
+/// bindings (e.g. pyo3) need to construct it directly to interleave
+/// `blocking_send` with signal handling.
+#[doc(hidden)]
 pub struct SyncRequest<C, R = Option<String>> {
     pub command: C,
     pub resp_tx: std::sync::mpsc::Sender<Result<R>>,
@@ -36,24 +43,39 @@ pub struct SyncRequest<C, R = Option<String>> {
 
 fn send_sync<C, R>(tx: &mpsc::Sender<SyncRequest<C, R>>, command: C) -> Result<R> {
     let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-    let _ = tx.blocking_send(SyncRequest { command, resp_tx });
+    if tx
+        .blocking_send(SyncRequest { command, resp_tx })
+        .is_err()
+    {
+        return Err(crate::error::TuyaError::io_other("Worker died"));
+    }
     resp_rx
         .recv()
-        .map_err(|_| crate::error::TuyaError::Io("Worker died".into()))?
+        .map_err(|_| crate::error::TuyaError::io_other("Worker died"))?
 }
 
 macro_rules! wait_for_response {
     ($tx:expr, $cmd_gen:expr) => {{
         let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-        let _ = $tx.blocking_send($cmd_gen(resp_tx));
-        resp_rx
-            .recv()
-            .map_err(|_| crate::error::TuyaError::Io("Worker died".into()))
+        if $tx.blocking_send($cmd_gen(resp_tx)).is_err() {
+            Err(crate::error::TuyaError::io_other("Worker died"))
+        } else {
+            resp_rx
+                .recv()
+                .map_err(|_| crate::error::TuyaError::io_other("Worker died"))
+        }
     }};
 }
 
 // --- Device ---
 
+/// Internal command enum for the sync device dispatch worker.
+///
+/// Not part of the stable public API. Foreign-language bindings (e.g. pyo3)
+/// construct these directly when they need to interleave `blocking_send`
+/// with signal handling; ordinary Rust callers should use the `Device`
+/// methods (`status()`, `set_dps()`, etc.) instead.
+#[doc(hidden)]
 #[derive(Debug)]
 pub enum DeviceCommand {
     Status,
@@ -71,7 +93,9 @@ pub enum DeviceCommand {
 
 #[derive(Clone)]
 pub struct Device {
+    #[doc(hidden)]
     pub inner: AsyncDevice,
+    #[doc(hidden)]
     pub cmd_tx: mpsc::Sender<SyncRequest<DeviceCommand>>,
 }
 
@@ -273,6 +297,9 @@ impl DeviceBuilder {
 
 // --- SubDevice ---
 
+/// Internal command enum for the sync sub-device dispatch worker.
+/// Not part of the stable public API; see [`DeviceCommand`].
+#[doc(hidden)]
 #[derive(Debug)]
 pub enum SubDeviceCommand {
     Status,
@@ -286,7 +313,9 @@ pub enum SubDeviceCommand {
 
 #[derive(Clone)]
 pub struct SubDevice {
+    #[doc(hidden)]
     pub inner: AsyncSubDevice,
+    #[doc(hidden)]
     pub cmd_tx: mpsc::Sender<SyncRequest<SubDeviceCommand>>,
 }
 

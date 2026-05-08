@@ -4,6 +4,7 @@
 
 use crate::crypto::TuyaCipher;
 use crate::error::{Result, TuyaError};
+use crate::macros::{define_command_type, define_version};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
 use cipher::KeyInit;
 use crc::{CRC_32_ISO_HDLC, Crc};
@@ -108,14 +109,19 @@ pub enum DeviceType {
     Device22,
 }
 
+/// Error returned when parsing a [`DeviceType`] from a string fails.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid device type: {0}")]
+pub struct ParseDeviceTypeError(pub String);
+
 impl std::str::FromStr for DeviceType {
-    type Err = ();
+    type Err = ParseDeviceTypeError;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "auto" | "" => Ok(DeviceType::Auto),
             "default" => Ok(DeviceType::Default),
             "device22" => Ok(DeviceType::Device22),
-            _ => Err(()),
+            _ => Err(ParseDeviceTypeError(s.to_string())),
         }
     }
 }
@@ -131,33 +137,23 @@ impl DeviceType {
     }
 }
 
-impl From<&str> for DeviceType {
-    fn from(s: &str) -> Self {
-        s.parse().unwrap_or(DeviceType::Auto)
+impl<'a> std::convert::TryFrom<&'a str> for DeviceType {
+    type Error = ParseDeviceTypeError;
+    fn try_from(s: &'a str) -> std::result::Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
-impl From<String> for DeviceType {
-    fn from(s: String) -> Self {
-        s.parse().unwrap_or(DeviceType::Auto)
+impl std::convert::TryFrom<String> for DeviceType {
+    type Error = ParseDeviceTypeError;
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
-impl From<Option<String>> for DeviceType {
-    fn from(s: Option<String>) -> Self {
-        match s {
-            Some(s) => s.parse().unwrap_or(DeviceType::Auto),
-            None => DeviceType::Auto,
-        }
-    }
-}
-
-impl From<Option<&str>> for DeviceType {
-    fn from(s: Option<&str>) -> Self {
-        match s {
-            Some(s) => s.parse().unwrap_or(DeviceType::Auto),
-            None => DeviceType::Auto,
-        }
+impl std::fmt::Display for DeviceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

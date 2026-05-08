@@ -221,17 +221,7 @@ impl Scanner {
                                 None => break,
                             };
 
-                            // We need to parse the packet. Since parse_packet is a method of Scanner,
-                            // but we want to avoid holding a Scanner (which holds an Arc),
-                            // we use a temporary Scanner instance for parsing.
-                            let temp_scanner = Scanner {
-                                inner: state.clone(),
-                                timeout: Duration::from_secs(0),
-                                bind_addr: String::new(),
-                                ports: Vec::new(),
-                            };
-
-                            if let Some(res) = temp_scanner.parse_packet(&data) {
+                            if let Some(res) = parse_packet(&data) {
                                 let mut guard = state.cache.write();
 
                                 // Keep memory clean by removing expired entries on every update.
@@ -727,33 +717,32 @@ impl Scanner {
         Ok(())
     }
 
-    fn parse_packet(&self, data: &[u8]) -> Option<DiscoveryResult> {
-        trace!("Parsing UDP packet of {} bytes...", data.len());
+    /// Invalidates the cache entry for a specific device.
+    #[must_use]
+    pub fn invalidate_cache(&self, id: &str) -> bool {
+        let mut guard = self.inner.cache.write();
+        guard.remove(id).is_some()
+    }
+}
 
-        // 1. Try raw JSON (v3.1, port 6666)
-        if let Ok(val) = serde_json::from_slice::<Value>(data) {
-            trace!("Successfully parsed raw JSON packet");
-            return self.parse_json(&val);
-        }
+const UDP_TRY_KEYS: [Option<&[u8]>; 4] =
+    [Some(UDP_KEY_35), Some(UDP_KEY_34), Some(UDP_KEY_33), None];
+const UDP_TRY_RETCODES: [Option<bool>; 3] = [Some(true), Some(false), None];
 
-        // 2. Try Tuya message format (55AA or 6699)
-        let tries: &[(Option<&[u8]>, Option<bool>)] = &[
-            (Some(UDP_KEY_35), Some(true)),
-            (Some(UDP_KEY_35), Some(false)),
-            (Some(UDP_KEY_35), None),
-            (Some(UDP_KEY_34), Some(true)),
-            (Some(UDP_KEY_34), Some(false)),
-            (Some(UDP_KEY_34), None),
-            (Some(UDP_KEY_33), Some(true)),
-            (Some(UDP_KEY_33), Some(false)),
-            (Some(UDP_KEY_33), None),
-            (None, Some(true)),
-            (None, Some(false)),
-            (None, None),
-        ];
+/// Parses a UDP discovery packet, attempting multiple keys and retcode strategies.
+fn parse_packet(data: &[u8]) -> Option<DiscoveryResult> {
+    trace!("Parsing UDP packet of {} bytes...", data.len());
 
-        for (key, no_retcode) in tries {
-            match protocol::unpack_message(data, *key, None, *no_retcode) {
+    // 1. Try raw JSON (v3.1, port 6666)
+    if let Ok(val) = serde_json::from_slice::<Value>(data) {
+        trace!("Successfully parsed raw JSON packet");
+        return parse_json(&val);
+    }
+
+    // 2. Try Tuya message format (55AA or 6699) across all key/retcode combinations.
+    for key in UDP_TRY_KEYS {
+        for no_retcode in UDP_TRY_RETCODES {
+            match protocol::unpack_message(data, key, None, no_retcode) {
                 Ok(msg) => {
                     if msg.payload.is_empty() {
                         continue;
@@ -762,14 +751,13 @@ impl Scanner {
                     // 2a. Payload is raw JSON (v3.5 or unencrypted v3.3)
                     if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
                         trace!("Successfully parsed JSON from Tuya message payload");
-                        return self.parse_json(&val);
+                        return parse_json(&val);
                     }
 
                     // 2b. Payload is ECB encrypted (v3.3/v3.4)
-                    let keys_to_try = if let Some(k) = key {
-                        vec![*k]
-                    } else {
-                        vec![UDP_KEY_33, UDP_KEY_34, UDP_KEY_35]
+                    let keys_to_try: Vec<&[u8]> = match key {
+                        Some(k) => vec![k],
+                        None => vec![UDP_KEY_33, UDP_KEY_34, UDP_KEY_35],
                     };
 
                     for k in keys_to_try {
@@ -781,7 +769,7 @@ impl Scanner {
                             trace!(
                                 "Successfully decrypted and parsed JSON from Tuya message payload"
                             );
-                            return self.parse_json(&val);
+                            return parse_json(&val);
                         }
                     }
                 }
@@ -795,69 +783,57 @@ impl Scanner {
                             | crate::error::TuyaError::InvalidHeader
                     ) {
                         trace!(
-                            "unpack_message failed with key {:?}: {}",
+                            "unpack_message failed with key {:?}: {e}",
                             key.map(hex::encode),
-                            e
                         );
                     }
                 }
             }
         }
+    }
 
-        // 3. Try to decrypt the entire packet as AES-ECB (v3.3 discovery fallback)
-        for key in &[UDP_KEY_33, UDP_KEY_34] {
-            if let Ok(cipher) = TuyaCipher::new(key)
-                && let Ok(decrypted) = cipher.decrypt(data, false, None, None, None)
-                && let Ok(val) = serde_json::from_slice::<Value>(&decrypted)
-            {
-                trace!("Successfully decrypted and parsed JSON from entire packet");
-                return self.parse_json(&val);
-            }
-        }
-
-        // 4. Fallback: search for JSON start '{' in the packet
-        if let Some(pos) = data.iter().position(|&b| b == b'{')
-            && let Ok(val) = serde_json::from_slice::<Value>(&data[pos..])
+    // 3. Try to decrypt the entire packet as AES-ECB (v3.3 discovery fallback)
+    for key in &[UDP_KEY_33, UDP_KEY_34] {
+        if let Ok(cipher) = TuyaCipher::new(key)
+            && let Ok(decrypted) = cipher.decrypt(data, false, None, None, None)
+            && let Ok(val) = serde_json::from_slice::<Value>(&decrypted)
         {
-            trace!("Successfully found and parsed JSON from middle of packet");
-            return self.parse_json(&val);
-        }
-
-        trace!("Failed to parse UDP packet");
-        None
-    }
-
-    /// Invalidates the cache entry for a specific device.
-    #[must_use]
-    pub fn invalidate_cache(&self, id: &str) -> bool {
-        let mut guard = self.inner.cache.write();
-        guard.remove(id).is_some()
-    }
-
-    /// Extract device info from JSON.
-    fn parse_json(&self, val: &Value) -> Option<DiscoveryResult> {
-        let id = val
-            .get("gwId")
-            .or_else(|| val.get("devId"))
-            .or_else(|| val.get("id"))
-            .and_then(|v| v.as_str());
-        let ip = val.get("ip").and_then(|v| v.as_str());
-
-        if let (Some(id), Some(ip)) = (id, ip) {
-            let ver_s = val.get("version").and_then(|v| v.as_str());
-            let pk = val.get("productKey").and_then(|v| v.as_str());
-
-            Some(DiscoveryResult {
-                id: id.to_string(),
-                ip: ip.to_string(),
-                version: ver_s.and_then(|s| Version::from_str(s).ok()),
-                product_key: pk.map(std::string::ToString::to_string),
-                discovered_at: Instant::now(),
-            })
-        } else {
-            None
+            trace!("Successfully decrypted and parsed JSON from entire packet");
+            return parse_json(&val);
         }
     }
+
+    // 4. Fallback: search for JSON start '{' in the packet
+    if let Some(pos) = data.iter().position(|&b| b == b'{')
+        && let Ok(val) = serde_json::from_slice::<Value>(&data[pos..])
+    {
+        trace!("Successfully found and parsed JSON from middle of packet");
+        return parse_json(&val);
+    }
+
+    trace!("Failed to parse UDP packet");
+    None
+}
+
+/// Extracts device info from a JSON discovery payload.
+fn parse_json(val: &Value) -> Option<DiscoveryResult> {
+    let id = val
+        .get("gwId")
+        .or_else(|| val.get("devId"))
+        .or_else(|| val.get("id"))
+        .and_then(|v| v.as_str())?;
+    let ip = val.get("ip").and_then(|v| v.as_str())?;
+
+    let ver_s = val.get("version").and_then(|v| v.as_str());
+    let pk = val.get("productKey").and_then(|v| v.as_str());
+
+    Some(DiscoveryResult {
+        id: id.to_string(),
+        ip: ip.to_string(),
+        version: ver_s.and_then(|s| Version::from_str(s).ok()),
+        product_key: pk.map(std::string::ToString::to_string),
+        discovered_at: Instant::now(),
+    })
 }
 
 /// Builder for creating a custom `Scanner`.

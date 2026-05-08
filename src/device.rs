@@ -43,6 +43,15 @@ const CHAN_MPSC_CAPACITY: usize = 64;
 /// Commands that must return data (payload) and should not return on empty ACK.
 const MANDATORY_DATA_CMDS: &[u32] = &[CommandType::LanExtStream as u32];
 
+/// Commands that do not produce a response we should wait for
+/// (handshake handshake-internal commands and heartbeats).
+const NO_RESPONSE_CMDS: &[u32] = &[
+    CommandType::SessKeyNegStart as u32,
+    CommandType::SessKeyNegResp as u32,
+    CommandType::SessKeyNegFinish as u32,
+    CommandType::HeartBeat as u32,
+];
+
 mod keys {
     pub const REQ_TYPE: &str = "reqType";
 
@@ -507,7 +516,7 @@ impl Device {
                         return Ok(msg);
                     }
                 }
-                Err(e) => return Err(TuyaError::Io(e.to_string())),
+                Err(e) => return Err(TuyaError::io_other(e.to_string())),
             }
         }
     }
@@ -809,12 +818,12 @@ impl Device {
                             Ok(Err(e)) => {
                                 let err = if e.kind() == std::io::ErrorKind::UnexpectedEof {
                                     if packets_received > 0 {
-                                        TuyaError::Io("Connection reset".to_string())
+                                        TuyaError::io(std::io::ErrorKind::ConnectionReset, "Connection reset")
                                     } else {
                                         TuyaError::KeyOrVersionError
                                     }
                                 } else {
-                                    TuyaError::Io(e.to_string())
+                                    TuyaError::from(e)
                                 };
                                 let _ = internal_tx.send(err).await;
                                 break;
@@ -1057,7 +1066,7 @@ impl Device {
                 s.state = ConnectionState::Disconnected;
             }
         });
-        self.broadcast_error(e.code(), Some(serde_json::json!(format!("{}", e))));
+        self.broadcast_error(e.code(), Some(serde_json::json!(format!("{e}"))));
     }
 
     fn drain_rx(&self, rx: &mut mpsc::Receiver<DeviceCommand>, err: TuyaError, close: bool) {
@@ -1088,7 +1097,7 @@ impl Device {
             .map_err(|_| TuyaError::Timeout)?
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::ConnectionRefused => TuyaError::ConnectionFailed,
-                _ => TuyaError::Io(e.to_string()),
+                _ => TuyaError::from(e),
             })?;
 
         let protocol = get_protocol(self.version(), self.dev_type());
@@ -1235,7 +1244,7 @@ impl Device {
             } => {
                 let nowait = self.inner.nowait.load(Ordering::Relaxed);
                 let cmd_code = command as u32;
-                let response_rx = if !nowait && ![3, 4, 5, 9].contains(&cmd_code) {
+                let response_rx = if !nowait && !NO_RESPONSE_CMDS.contains(&cmd_code) {
                     Some(self.inner.broadcast_tx.subscribe())
                 } else {
                     None
@@ -1334,8 +1343,12 @@ impl Device {
                             }
                         }
                     })
-                    .await
-                    .unwrap_or(Err(TuyaError::Timeout));
+                    .await;
+
+                    let wait_res = match wait_res {
+                        Ok(inner) => inner,
+                        Err(_) => Err(TuyaError::Timeout),
+                    };
 
                     let _ = resp_tx.send(wait_res);
                 } else {
@@ -1464,7 +1477,7 @@ impl Device {
         cmd: u32,
         payload: &Value,
     ) -> Result<()> {
-        let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+        let payload_bytes = serde_json::to_vec(payload)?;
         let msg = self.build_message(seqno, cmd, payload_bytes);
         self.send_raw_to_stream(stream, msg).await
     }
@@ -1523,13 +1536,13 @@ impl Device {
             }
             Ok(None) => Ok(None),
             Err(e) => {
-                if matches!(e, TuyaError::Io(_)) {
+                if matches!(e, TuyaError::Io { .. }) {
                     return Err(e);
                 }
                 warn!("Error parsing message from {}: {}", self.inner.id, e);
                 Ok(Some(self.error_helper(
                     ERR_PAYLOAD,
-                    Some(serde_json::json!(format!("{}", e))),
+                    Some(serde_json::json!(format!("{e}"))),
                 )))
             }
         }
@@ -1732,8 +1745,15 @@ impl Device {
             }
         }
 
+        // Serializing a Value built from `serde_json::json!` cannot fail in
+        // practice; if it ever does, fall back to an empty payload so we
+        // still deliver an ACK rather than panicking inside the broadcast.
+        let payload = serde_json::to_vec(&response).unwrap_or_else(|e| {
+            warn!("error_helper: failed to serialize error payload: {e}");
+            Vec::new()
+        });
         TuyaMessage {
-            payload: serde_json::to_vec(&response).unwrap_or_default(),
+            payload,
             prefix: get_protocol(self.version(), self.dev_type()).get_prefix(),
             ..Default::default()
         }
