@@ -21,11 +21,11 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Interval, MissedTickBehavior, interval, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 const SLEEP_HEARTBEAT_DEFAULT: Duration = Duration::from_secs(7);
@@ -707,11 +707,11 @@ impl Device {
         // Stagger connection attempts
         tokio::select! {
             () = self.inner.cancel_token.cancelled() => return,
-            () = tokio::time::sleep(jitter) => {}
+            () = sleep(jitter) => {}
         }
 
-        let mut heartbeat_interval = tokio::time::interval(SLEEP_HEARTBEAT_CHECK);
-        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut heartbeat_interval = interval(SLEEP_HEARTBEAT_CHECK);
+        heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -776,7 +776,7 @@ impl Device {
         stream: TcpStream,
         rx: &mut mpsc::Receiver<DeviceCommand>,
         seqno: &mut u32,
-        heartbeat_interval: &mut tokio::time::Interval,
+        heartbeat_interval: &mut Interval,
         initial_cmd: Option<DeviceCommand>,
     ) -> Result<()> {
         let (mut read_half, mut write_half) = stream.into_split();

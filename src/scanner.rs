@@ -15,9 +15,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
-use tokio::time::{Duration, Instant};
+use tokio::time::{interval, sleep, timeout};
 
 use serde::Serialize;
 
@@ -351,7 +352,11 @@ impl Scanner {
     }
 
     /// Returns a future that resolves when any device is discovered.
-    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+    ///
+    /// Crate-internal: the returned future borrows the underlying
+    /// `tokio::sync::Notify`, so leaking it across the crate boundary would
+    /// expose an internal runtime detail.
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.inner.notify.notified()
     }
 
@@ -487,7 +492,7 @@ impl Scanner {
 
                 // Wait for next discovery notification or timeout
                 tokio::select! {
-                    () = tokio::time::sleep(remaining) => break,
+                    () = sleep(remaining) => break,
                     () = state.notify.notified() => {
                         let new_items: Vec<_> = {
                             let guard = state.cache.read();
@@ -653,11 +658,11 @@ impl Scanner {
             if let Some(ct) = cancel {
                 tokio::select! {
                     _ = ct.cancelled() => return None,
-                    _ = tokio::time::sleep(remaining) => {}
+                    _ = sleep(remaining) => {}
                     _ = &mut notified => {}
                 }
             } else {
-                let _ = tokio::time::timeout(remaining, &mut notified).await;
+                let _ = timeout(remaining, &mut notified).await;
             }
         }
     }
@@ -691,7 +696,7 @@ impl Scanner {
         }
 
         let start = Instant::now();
-        let mut broadcast_interval = tokio::time::interval(BROADCAST_INTERVAL);
+        let mut broadcast_interval = interval(BROADCAST_INTERVAL);
         let mut broadcast_count = 0;
 
         while start.elapsed() < self.timeout {
@@ -701,7 +706,7 @@ impl Scanner {
             }
 
             tokio::select! {
-                () = tokio::time::sleep(remaining) => break,
+                () = sleep(remaining) => break,
                 _ = broadcast_interval.tick() => {
                     if broadcast_count < 3 {
                         broadcast_count += 1;
