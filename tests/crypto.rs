@@ -9,17 +9,21 @@ fn ecb_roundtrip_with_padding() {
     let cipher = TuyaCipher::new(KEY).unwrap();
 
     let cases: &[&[u8]] = &[
-        b"",                                     // empty -> 16 bytes of pad
-        b"hi",                                   // tiny
-        b"this is exactly 15",                   // 18 bytes
-        b"the quick brown fox jumps over",       // 30 bytes (mid-block)
-        b"a 16-byte block!",                     // exactly 16 bytes -> +16 pad
+        b"",                               // empty -> 16 bytes of pad
+        b"hi",                             // tiny
+        b"this is exactly 15",             // 18 bytes
+        b"the quick brown fox jumps over", // 30 bytes (mid-block)
+        b"a 16-byte block!",               // exactly 16 bytes -> +16 pad
     ];
 
     for plain in cases {
         let ct = cipher.encrypt(plain, false, None, None, true).unwrap();
         let pt = cipher.decrypt(&ct, false, None, None, None).unwrap();
-        assert_eq!(pt.as_slice(), *plain, "ECB roundtrip mismatch for {plain:?}");
+        assert_eq!(
+            pt.as_slice(),
+            *plain,
+            "ECB roundtrip mismatch for {plain:?}"
+        );
     }
 }
 
@@ -27,7 +31,11 @@ fn ecb_roundtrip_with_padding() {
 fn ecb_no_padding_requires_block_aligned_input() {
     let cipher = TuyaCipher::new(KEY).unwrap();
     // 13 bytes → not a multiple of 16 → encryption must fail
-    assert!(cipher.encrypt(b"thirteen byte", false, None, None, false).is_err());
+    assert!(
+        cipher
+            .encrypt(b"thirteen byte", false, None, None, false)
+            .is_err()
+    );
 }
 
 #[test]

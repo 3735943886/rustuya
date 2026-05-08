@@ -58,7 +58,10 @@ fn device_type_parse_invalid_returns_err() {
 #[test]
 fn device_type_parse_is_case_insensitive() {
     assert_eq!(DeviceType::from_str("AUTO").unwrap(), DeviceType::Auto);
-    assert_eq!(DeviceType::from_str("Default").unwrap(), DeviceType::Default);
+    assert_eq!(
+        DeviceType::from_str("Default").unwrap(),
+        DeviceType::Default
+    );
     assert_eq!(
         DeviceType::from_str("DEVICE22").unwrap(),
         DeviceType::Device22

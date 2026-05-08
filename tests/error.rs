@@ -1,7 +1,9 @@
 //! Tests for `TuyaError` construction, conversion, and code mapping.
 
 use rustuya::TuyaError;
-use rustuya::error::{ERR_CONNECT, ERR_JSON, ERR_KEY_OR_VER, ERR_OFFLINE, ERR_PAYLOAD, ERR_TIMEOUT};
+use rustuya::error::{
+    ERR_CONNECT, ERR_JSON, ERR_KEY_OR_VER, ERR_OFFLINE, ERR_PAYLOAD, ERR_TIMEOUT,
+};
 use std::io;
 
 #[test]
@@ -22,8 +24,8 @@ fn io_kind_returns_none_for_non_io_variant() {
 
 #[test]
 fn json_error_maps_to_err_json() {
-    let je = serde_json::from_str::<serde_json::Value>("not json")
-        .expect_err("intentionally bad JSON");
+    let je =
+        serde_json::from_str::<serde_json::Value>("not json").expect_err("intentionally bad JSON");
     let tuya: TuyaError = je.into();
     assert!(matches!(tuya, TuyaError::Json(_)));
     assert_eq!(tuya.code(), ERR_JSON);

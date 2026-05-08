@@ -43,10 +43,7 @@ pub struct SyncRequest<C, R = Option<String>> {
 
 fn send_sync<C, R>(tx: &mpsc::Sender<SyncRequest<C, R>>, command: C) -> Result<R> {
     let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-    if tx
-        .blocking_send(SyncRequest { command, resp_tx })
-        .is_err()
-    {
+    if tx.blocking_send(SyncRequest { command, resp_tx }).is_err() {
         return Err(crate::error::TuyaError::io_other("Worker died"));
     }
     resp_rx

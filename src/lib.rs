@@ -12,10 +12,10 @@
 //! device.set_value(1, true);
 //! ```
 //!
-pub(crate) mod macros;
 pub mod crypto;
 pub mod device;
 pub mod error;
+pub(crate) mod macros;
 pub mod protocol;
 pub(crate) mod runtime;
 pub mod scanner;
