@@ -4,7 +4,7 @@
 
 use crate::crypto::TuyaCipher;
 use crate::error::{
-    ERR_DEVTYPE, ERR_JSON, ERR_OFFLINE, ERR_PAYLOAD, ERR_SUCCESS, Result, TuyaError,
+    ERR_DEVTYPE, ERR_JSON, ERR_OFFLINE, ERR_PAYLOAD, ERR_STATE, ERR_SUCCESS, Result, TuyaError,
     get_error_message,
 };
 use crate::protocol::{
@@ -153,6 +153,7 @@ struct DeviceState {
     force_discovery: bool,
     timeout: Duration,
     cipher: Option<Arc<TuyaCipher>>,
+    last_reported_discovered_ip: Option<String>,
 }
 
 pub struct DeviceBuilder {
@@ -306,6 +307,7 @@ impl Device {
             force_discovery: false,
             timeout: builder.timeout,
             cipher: TuyaCipher::new(&builder.local_key).ok().map(Arc::new),
+            last_reported_discovered_ip: None,
         };
 
         let inner = Arc::new(DeviceInner {
@@ -1001,13 +1003,44 @@ impl Device {
                     if let Some(res) = get_scanner().get_cached_result(&self.inner.id)
                         && res.discovered_at.elapsed() < Duration::from_secs(10)
                     {
-                        let current_ip = self.with_state(|s| s.real_ip.clone());
-                        if current_ip.is_empty() || current_ip != res.ip {
-                            debug!(
-                                "Bypassing backoff for {} due to IP change ({} -> {})",
-                                self.inner.id, current_ip, res.ip
-                            );
-                            return Some(());
+                        let (current_ip, config_addr, last_reported) = self.with_state(|s| {
+                            (
+                                s.real_ip.clone(),
+                                s.config_address.clone(),
+                                s.last_reported_discovered_ip.clone(),
+                            )
+                        });
+                        match decide_discovery_notify_action(
+                            &current_ip,
+                            &config_addr,
+                            &res.ip,
+                            last_reported.as_deref(),
+                        ) {
+                            DiscoveryNotifyAction::BypassBackoff => {
+                                debug!(
+                                    "Bypassing backoff for {} due to IP change ({} -> {})",
+                                    self.inner.id, current_ip, res.ip
+                                );
+                                return Some(());
+                            }
+                            DiscoveryNotifyAction::Report => {
+                                warn!(
+                                    "Device {} configured at {} but scanner discovered it at {}",
+                                    self.inner.id, current_ip, res.ip
+                                );
+                                self.with_state_mut(|s| {
+                                    s.last_reported_discovered_ip = Some(res.ip.clone());
+                                });
+                                self.broadcast_error(
+                                    ERR_STATE,
+                                    Some(serde_json::json!({
+                                        "reason": "ip_mismatch",
+                                        "configured": current_ip,
+                                        "discovered": res.ip,
+                                    })),
+                                );
+                            }
+                            DiscoveryNotifyAction::Ignore => {}
                         }
                     }
                     discovery_notified.set(get_scanner().notified());
@@ -1757,5 +1790,107 @@ impl Device {
             prefix: get_protocol(self.version(), self.dev_type()).get_prefix(),
             ..Default::default()
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryNotifyAction {
+    /// Same IP, duplicate report, or otherwise no-op.
+    Ignore,
+    /// Explicit-IP mismatch; emit `ERR_STATE` so the caller can decide.
+    Report,
+    /// Auto mode and the discovered IP differs from the current one — skip
+    /// the remaining backoff so the next attempt picks up the new IP.
+    BypassBackoff,
+}
+
+fn decide_discovery_notify_action(
+    current_ip: &str,
+    config_addr: &str,
+    discovered_ip: &str,
+    last_reported_ip: Option<&str>,
+) -> DiscoveryNotifyAction {
+    if !current_ip.is_empty() && current_ip == discovered_ip {
+        return DiscoveryNotifyAction::Ignore;
+    }
+    let ip_explicit =
+        config_addr != ADDR_AUTO && config_addr != "0.0.0.0" && !config_addr.is_empty();
+    if ip_explicit {
+        if last_reported_ip == Some(discovered_ip) {
+            DiscoveryNotifyAction::Ignore
+        } else {
+            DiscoveryNotifyAction::Report
+        }
+    } else {
+        DiscoveryNotifyAction::BypassBackoff
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ADDR_AUTO, DiscoveryNotifyAction, decide_discovery_notify_action};
+
+    #[test]
+    fn auto_mode_with_different_ip_bypasses_backoff() {
+        let action = decide_discovery_notify_action("10.0.0.50", ADDR_AUTO, "10.0.0.73", None);
+        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
+    }
+
+    #[test]
+    fn auto_mode_with_empty_real_ip_bypasses_backoff() {
+        let action = decide_discovery_notify_action("", ADDR_AUTO, "10.0.0.73", None);
+        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
+    }
+
+    #[test]
+    fn auto_mode_with_matching_ip_is_ignored() {
+        let action = decide_discovery_notify_action("10.0.0.73", ADDR_AUTO, "10.0.0.73", None);
+        assert_eq!(action, DiscoveryNotifyAction::Ignore);
+    }
+
+    #[test]
+    fn explicit_ip_with_different_discovery_reports() {
+        let action = decide_discovery_notify_action("10.0.0.50", "10.0.0.50", "10.0.0.73", None);
+        assert_eq!(action, DiscoveryNotifyAction::Report);
+    }
+
+    #[test]
+    fn explicit_ip_with_matching_discovery_is_ignored() {
+        let action = decide_discovery_notify_action("10.0.0.50", "10.0.0.50", "10.0.0.50", None);
+        assert_eq!(action, DiscoveryNotifyAction::Ignore);
+    }
+
+    #[test]
+    fn explicit_ip_does_not_repeat_report_for_same_discovered_ip() {
+        let action = decide_discovery_notify_action(
+            "10.0.0.50",
+            "10.0.0.50",
+            "10.0.0.73",
+            Some("10.0.0.73"),
+        );
+        assert_eq!(action, DiscoveryNotifyAction::Ignore);
+    }
+
+    #[test]
+    fn explicit_ip_reports_again_when_discovered_ip_changes() {
+        let action = decide_discovery_notify_action(
+            "10.0.0.50",
+            "10.0.0.50",
+            "10.0.0.95",
+            Some("10.0.0.73"),
+        );
+        assert_eq!(action, DiscoveryNotifyAction::Report);
+    }
+
+    #[test]
+    fn zero_zero_zero_zero_treated_as_auto() {
+        let action = decide_discovery_notify_action("10.0.0.50", "0.0.0.0", "10.0.0.73", None);
+        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
+    }
+
+    #[test]
+    fn empty_config_addr_treated_as_auto() {
+        let action = decide_discovery_notify_action("10.0.0.50", "", "10.0.0.73", None);
+        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
     }
 }
