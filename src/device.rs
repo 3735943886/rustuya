@@ -34,6 +34,11 @@ const SLEEP_RECONNECT_MIN: Duration = Duration::from_secs(16);
 const SLEEP_RECONNECT_MAX: Duration = Duration::from_secs(4096);
 const SLEEP_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Base cooldown between scanner-triggered backoff bypasses when the
+/// discovered IP matches what the device already knows. Doubles on each
+/// useless bypass and resets on a successful connect.
+const SCANNER_BYPASS_BASE_COOLDOWN: Duration = Duration::from_secs(60);
+
 const ADDR_AUTO: &str = "Auto";
 const DATA_UNVALID: &str = "data unvalid";
 
@@ -154,6 +159,8 @@ struct DeviceState {
     timeout: Duration,
     cipher: Option<Arc<TuyaCipher>>,
     last_reported_discovered_ip: Option<String>,
+    last_scanner_bypass_at: Option<Instant>,
+    scanner_bypass_failures: u32,
 }
 
 pub struct DeviceBuilder {
@@ -308,6 +315,8 @@ impl Device {
             timeout: builder.timeout,
             cipher: TuyaCipher::new(&builder.local_key).ok().map(Arc::new),
             last_reported_discovered_ip: None,
+            last_scanner_bypass_at: None,
+            scanner_bypass_failures: 0,
         };
 
         let inner = Arc::new(DeviceInner {
@@ -916,7 +925,11 @@ impl Device {
 
             let result = timeout(self.timeout() * 2, self.connect_and_handshake(seqno)).await;
             if let Ok(Ok(s)) = result {
-                self.with_state_mut(|s| s.state = ConnectionState::Connected);
+                self.with_state_mut(|s| {
+                    s.state = ConnectionState::Connected;
+                    s.scanner_bypass_failures = 0;
+                    s.last_scanner_bypass_at = None;
+                });
                 info!(
                     "Connected to device {} ({})",
                     self.inner.id,
@@ -948,7 +961,11 @@ impl Device {
                                         .await;
 
                                 if let Ok(Ok(s)) = retry_result {
-                                    self.with_state_mut(|s| s.state = ConnectionState::Connected);
+                                    self.with_state_mut(|s| {
+                                        s.state = ConnectionState::Connected;
+                                        s.scanner_bypass_failures = 0;
+                                        s.last_scanner_bypass_at = None;
+                                    });
                                     info!("Connected to {} on demand", self.inner.id);
                                     self.broadcast_error(ERR_SUCCESS, None);
                                     return Some((s, Some(cmd)));
@@ -1003,24 +1020,35 @@ impl Device {
                     if let Some(res) = get_scanner().get_cached_result(&self.inner.id)
                         && res.discovered_at.elapsed() < Duration::from_secs(10)
                     {
-                        let (current_ip, config_addr, last_reported) = self.with_state(|s| {
-                            (
-                                s.real_ip.clone(),
-                                s.config_address.clone(),
-                                s.last_reported_discovered_ip.clone(),
-                            )
-                        });
+                        let (current_ip, config_addr, last_reported, last_bypass_at, bypass_failures) =
+                            self.with_state(|s| {
+                                (
+                                    s.real_ip.clone(),
+                                    s.config_address.clone(),
+                                    s.last_reported_discovered_ip.clone(),
+                                    s.last_scanner_bypass_at,
+                                    s.scanner_bypass_failures,
+                                )
+                            });
                         match decide_discovery_notify_action(
                             &current_ip,
                             &config_addr,
                             &res.ip,
                             last_reported.as_deref(),
+                            last_bypass_at,
+                            bypass_failures,
+                            Instant::now(),
                         ) {
                             DiscoveryNotifyAction::BypassBackoff => {
                                 debug!(
-                                    "Bypassing backoff for {} due to IP change ({} -> {})",
+                                    "Bypassing backoff for {} on scanner notify ({} -> {})",
                                     self.inner.id, current_ip, res.ip
                                 );
+                                self.with_state_mut(|s| {
+                                    s.last_scanner_bypass_at = Some(Instant::now());
+                                    s.scanner_bypass_failures =
+                                        s.scanner_bypass_failures.saturating_add(1);
+                                });
                                 return Some(());
                             }
                             DiscoveryNotifyAction::Report => {
@@ -1795,13 +1823,27 @@ impl Device {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryNotifyAction {
-    /// Same IP, duplicate report, or otherwise no-op.
+    /// Already-reported duplicate, cooldown not yet elapsed, or otherwise no-op.
     Ignore,
     /// Explicit-IP mismatch; emit `ERR_STATE` so the caller can decide.
     Report,
-    /// Auto mode and the discovered IP differs from the current one — skip
-    /// the remaining backoff so the next attempt picks up the new IP.
+    /// Skip the remaining backoff and retry now. Fired either because the
+    /// discovered IP changed (Auto mode) or because the device just proved
+    /// it's reachable (same-IP case, throttled by the bypass cooldown).
     BypassBackoff,
+}
+
+/// Cooldown between successive scanner-triggered bypass attempts that target
+/// the same IP we already know about.
+///
+/// Doubles on every failed bypass so a persistently broken setup (e.g. key
+/// mismatch) self-throttles down to the regular reminder cadence; capped at
+/// the main reconnect ceiling so the bypass cadence never outpaces backoff.
+fn scanner_bypass_cooldown(failures: u32) -> Duration {
+    let base = SCANNER_BYPASS_BASE_COOLDOWN.as_secs();
+    let cap = SLEEP_RECONNECT_MAX.as_secs();
+    let secs = base.saturating_mul(1u64 << failures.min(10)).min(cap);
+    Duration::from_secs(secs)
 }
 
 fn decide_discovery_notify_action(
@@ -1809,88 +1851,228 @@ fn decide_discovery_notify_action(
     config_addr: &str,
     discovered_ip: &str,
     last_reported_ip: Option<&str>,
+    last_bypass_at: Option<Instant>,
+    bypass_failures: u32,
+    now: Instant,
 ) -> DiscoveryNotifyAction {
-    if !current_ip.is_empty() && current_ip == discovered_ip {
-        return DiscoveryNotifyAction::Ignore;
-    }
+    let ip_match = !current_ip.is_empty() && current_ip == discovered_ip;
     let ip_explicit =
         config_addr != ADDR_AUTO && config_addr != "0.0.0.0" && !config_addr.is_empty();
-    if ip_explicit {
-        if last_reported_ip == Some(discovered_ip) {
-            DiscoveryNotifyAction::Ignore
-        } else {
-            DiscoveryNotifyAction::Report
+
+    match (ip_explicit, ip_match) {
+        // Auto + fresh IP: always bypass — the new IP itself is the news.
+        (false, false) => DiscoveryNotifyAction::BypassBackoff,
+        // Explicit + different IP: scanner news can't be acted on (resolve_address
+        // would return the configured IP anyway), so elevate to the listener.
+        (true, false) => {
+            if last_reported_ip == Some(discovered_ip) {
+                DiscoveryNotifyAction::Ignore
+            } else {
+                DiscoveryNotifyAction::Report
+            }
         }
-    } else {
-        DiscoveryNotifyAction::BypassBackoff
+        // Same IP either way: device is alive — bypass if the cooldown allows.
+        (_, true) => {
+            let cooldown = scanner_bypass_cooldown(bypass_failures);
+            let allowed = last_bypass_at.is_none_or(|t| now.duration_since(t) >= cooldown);
+            if allowed {
+                DiscoveryNotifyAction::BypassBackoff
+            } else {
+                DiscoveryNotifyAction::Ignore
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ADDR_AUTO, DiscoveryNotifyAction, decide_discovery_notify_action};
+    use super::{
+        ADDR_AUTO, DiscoveryNotifyAction, SCANNER_BYPASS_BASE_COOLDOWN, SLEEP_RECONNECT_MAX,
+        decide_discovery_notify_action, scanner_bypass_cooldown,
+    };
+    use std::time::{Duration, Instant};
+
+    /// Wrapper that fixes the cooldown-related inputs at "first call ever"
+    /// (no prior bypass, no failures) so the legacy four-arg call sites stay
+    /// readable.
+    fn decide_fresh(
+        current_ip: &str,
+        config_addr: &str,
+        discovered_ip: &str,
+        last_reported_ip: Option<&str>,
+    ) -> DiscoveryNotifyAction {
+        decide_discovery_notify_action(
+            current_ip,
+            config_addr,
+            discovered_ip,
+            last_reported_ip,
+            None,
+            0,
+            Instant::now(),
+        )
+    }
 
     #[test]
     fn auto_mode_with_different_ip_bypasses_backoff() {
-        let action = decide_discovery_notify_action("10.0.0.50", ADDR_AUTO, "10.0.0.73", None);
-        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
+        assert_eq!(
+            decide_fresh("10.0.0.50", ADDR_AUTO, "10.0.0.73", None),
+            DiscoveryNotifyAction::BypassBackoff
+        );
     }
 
     #[test]
     fn auto_mode_with_empty_real_ip_bypasses_backoff() {
-        let action = decide_discovery_notify_action("", ADDR_AUTO, "10.0.0.73", None);
-        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
+        assert_eq!(
+            decide_fresh("", ADDR_AUTO, "10.0.0.73", None),
+            DiscoveryNotifyAction::BypassBackoff
+        );
     }
 
     #[test]
-    fn auto_mode_with_matching_ip_is_ignored() {
-        let action = decide_discovery_notify_action("10.0.0.73", ADDR_AUTO, "10.0.0.73", None);
-        assert_eq!(action, DiscoveryNotifyAction::Ignore);
+    fn auto_mode_with_matching_ip_bypasses_when_no_prior_attempt() {
+        // Same-IP scanner news is now treated as a "device alive" signal and
+        // bypasses backoff — throttled by the cooldown, but unrestricted on
+        // the first encounter.
+        assert_eq!(
+            decide_fresh("10.0.0.73", ADDR_AUTO, "10.0.0.73", None),
+            DiscoveryNotifyAction::BypassBackoff
+        );
     }
 
     #[test]
     fn explicit_ip_with_different_discovery_reports() {
-        let action = decide_discovery_notify_action("10.0.0.50", "10.0.0.50", "10.0.0.73", None);
-        assert_eq!(action, DiscoveryNotifyAction::Report);
+        assert_eq!(
+            decide_fresh("10.0.0.50", "10.0.0.50", "10.0.0.73", None),
+            DiscoveryNotifyAction::Report
+        );
     }
 
     #[test]
-    fn explicit_ip_with_matching_discovery_is_ignored() {
-        let action = decide_discovery_notify_action("10.0.0.50", "10.0.0.50", "10.0.0.50", None);
-        assert_eq!(action, DiscoveryNotifyAction::Ignore);
+    fn explicit_ip_with_matching_discovery_bypasses_when_no_prior_attempt() {
+        assert_eq!(
+            decide_fresh("10.0.0.50", "10.0.0.50", "10.0.0.50", None),
+            DiscoveryNotifyAction::BypassBackoff
+        );
     }
 
     #[test]
     fn explicit_ip_does_not_repeat_report_for_same_discovered_ip() {
-        let action = decide_discovery_notify_action(
-            "10.0.0.50",
-            "10.0.0.50",
-            "10.0.0.73",
-            Some("10.0.0.73"),
+        assert_eq!(
+            decide_fresh("10.0.0.50", "10.0.0.50", "10.0.0.73", Some("10.0.0.73")),
+            DiscoveryNotifyAction::Ignore
         );
-        assert_eq!(action, DiscoveryNotifyAction::Ignore);
     }
 
     #[test]
     fn explicit_ip_reports_again_when_discovered_ip_changes() {
-        let action = decide_discovery_notify_action(
-            "10.0.0.50",
-            "10.0.0.50",
-            "10.0.0.95",
-            Some("10.0.0.73"),
+        assert_eq!(
+            decide_fresh("10.0.0.50", "10.0.0.50", "10.0.0.95", Some("10.0.0.73")),
+            DiscoveryNotifyAction::Report
         );
-        assert_eq!(action, DiscoveryNotifyAction::Report);
     }
 
     #[test]
     fn zero_zero_zero_zero_treated_as_auto() {
-        let action = decide_discovery_notify_action("10.0.0.50", "0.0.0.0", "10.0.0.73", None);
-        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
+        assert_eq!(
+            decide_fresh("10.0.0.50", "0.0.0.0", "10.0.0.73", None),
+            DiscoveryNotifyAction::BypassBackoff
+        );
     }
 
     #[test]
     fn empty_config_addr_treated_as_auto() {
-        let action = decide_discovery_notify_action("10.0.0.50", "", "10.0.0.73", None);
-        assert_eq!(action, DiscoveryNotifyAction::BypassBackoff);
+        assert_eq!(
+            decide_fresh("10.0.0.50", "", "10.0.0.73", None),
+            DiscoveryNotifyAction::BypassBackoff
+        );
+    }
+
+    // --- Scanner-bypass cooldown behavior ---
+
+    #[test]
+    fn same_ip_bypass_is_throttled_within_cooldown() {
+        let now = Instant::now();
+        let just_bypassed = now - Duration::from_secs(5);
+        assert_eq!(
+            decide_discovery_notify_action(
+                "10.0.0.50",
+                "10.0.0.50",
+                "10.0.0.50",
+                None,
+                Some(just_bypassed),
+                1,
+                now,
+            ),
+            DiscoveryNotifyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn same_ip_bypass_allowed_once_cooldown_elapses() {
+        let now = Instant::now();
+        let past = now - SCANNER_BYPASS_BASE_COOLDOWN * 3;
+        assert_eq!(
+            decide_discovery_notify_action(
+                "10.0.0.50",
+                "10.0.0.50",
+                "10.0.0.50",
+                None,
+                Some(past),
+                1,
+                now,
+            ),
+            DiscoveryNotifyAction::BypassBackoff
+        );
+    }
+
+    #[test]
+    fn cooldown_doubles_with_each_failed_bypass() {
+        assert_eq!(scanner_bypass_cooldown(0), SCANNER_BYPASS_BASE_COOLDOWN);
+        assert_eq!(scanner_bypass_cooldown(1), SCANNER_BYPASS_BASE_COOLDOWN * 2);
+        assert_eq!(scanner_bypass_cooldown(2), SCANNER_BYPASS_BASE_COOLDOWN * 4);
+    }
+
+    #[test]
+    fn cooldown_is_capped_at_main_reconnect_max() {
+        // Many failures should still saturate at SLEEP_RECONNECT_MAX, never above.
+        assert_eq!(scanner_bypass_cooldown(20), SLEEP_RECONNECT_MAX);
+    }
+
+    #[test]
+    fn auto_mode_different_ip_ignores_cooldown() {
+        // A fresh IP is brand-new information; cooldown must not gate it.
+        let now = Instant::now();
+        let just_bypassed = now - Duration::from_secs(1);
+        assert_eq!(
+            decide_discovery_notify_action(
+                "10.0.0.50",
+                ADDR_AUTO,
+                "10.0.0.73",
+                None,
+                Some(just_bypassed),
+                5,
+                now,
+            ),
+            DiscoveryNotifyAction::BypassBackoff
+        );
+    }
+
+    #[test]
+    fn explicit_ip_different_ip_ignores_cooldown_and_reports() {
+        // Cooldown only gates bypass; the Report path is independent.
+        let now = Instant::now();
+        let just_bypassed = now - Duration::from_secs(1);
+        assert_eq!(
+            decide_discovery_notify_action(
+                "10.0.0.50",
+                "10.0.0.50",
+                "10.0.0.73",
+                None,
+                Some(just_bypassed),
+                5,
+                now,
+            ),
+            DiscoveryNotifyAction::Report
+        );
     }
 }
