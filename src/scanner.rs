@@ -263,6 +263,7 @@ impl Scanner {
             let ct = cancel_token.clone();
             let task = crate::runtime::spawn(async move {
                 let mut buf = vec![0u8; 4096];
+                let local_addr = socket.local_addr().ok();
                 loop {
                     tokio::select! {
                         () = ct.cancelled() => break,
@@ -270,10 +271,26 @@ impl Scanner {
                             match res {
                                 Ok((len, addr)) => {
                                     if tx.send((buf[..len].to_vec(), addr)).await.is_err() {
+                                        // Downstream consumer is gone; nothing left to feed.
                                         break;
                                     }
                                 }
-                                Err(_) => break,
+                                Err(e) => {
+                                    // UDP recv errors are usually transient (ICMP
+                                    // unreachable, brief interface flap, EINTR).
+                                    // Log and back off briefly so we don't burn CPU
+                                    // if it keeps recurring, but never give up — the
+                                    // passive listener must survive network hiccups
+                                    // so devices can be re-discovered after recovery.
+                                    warn!(
+                                        "Scanner UDP recv error on {:?}: {} (continuing)",
+                                        local_addr, e
+                                    );
+                                    tokio::select! {
+                                        () = ct.cancelled() => break,
+                                        () = sleep(Duration::from_millis(500)) => {}
+                                    }
+                                }
                             }
                         }
                     }

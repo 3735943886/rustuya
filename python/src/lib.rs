@@ -565,12 +565,19 @@ impl UnifiedEventReceiver {
 }
 
 #[pyfunction]
-pub fn unified_listener(devices: Vec<Bound<'_, Device>>) -> PyResult<UnifiedEventReceiver> {
+#[pyo3(signature = (devices, capacity=None))]
+pub fn unified_listener(
+    devices: Vec<Bound<'_, Device>>,
+    capacity: Option<usize>,
+) -> PyResult<UnifiedEventReceiver> {
     let sync_devices: Vec<SyncDevice> = devices
         .into_iter()
         .map(|d| d.borrow().inner.clone())
         .collect();
-    let receiver = ::rustuya::sync::unified_listener(sync_devices);
+    let receiver = match capacity {
+        Some(n) => ::rustuya::sync::unified_listener_with_capacity(sync_devices, n),
+        None => ::rustuya::sync::unified_listener(sync_devices),
+    };
     Ok(UnifiedEventReceiver {
         inner: Arc::new(Mutex::new(receiver)),
     })

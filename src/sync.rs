@@ -12,15 +12,25 @@ use crate::error::Result;
 use crate::protocol::{TuyaMessage, Version};
 use crate::runtime::{self, get_runtime};
 use crate::scanner::{DiscoveryResult, Scanner as AsyncScanner, get as get_async_scanner};
+use futures_util::StreamExt;
+use log::warn;
 use serde::Serialize;
 use serde_json::Value;
 use std::ops::Deref;
 use std::sync::OnceLock;
+use std::sync::mpsc::TrySendError;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Default capacity for synchronous event channels to prevent memory buildup.
+/// Default capacity for per-device synchronous listener channels.
 const CHAN_SYNC_CAPACITY: usize = 128;
+
+/// Default capacity for the unified sync listener.
+///
+/// Sized to absorb burst events from hundreds-to-low-thousands of devices
+/// (e.g. network recovery firing all devices at once). Power users with
+/// larger fleets can override via [`unified_listener_with_capacity`].
+const CHAN_UNIFIED_CAPACITY: usize = 2048;
 
 #[doc(hidden)]
 pub mod internal {
@@ -213,15 +223,19 @@ impl Device {
 
     pub fn listener(&self) -> std::sync::mpsc::Receiver<TuyaMessage> {
         let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_SYNC_CAPACITY);
-        let mut broadcast_rx = self.inner.broadcast_tx().subscribe();
+        let stream = self.inner.listener();
+        let device_id = self.inner.id().to_string();
 
         runtime::spawn(async move {
-            while let Ok(msg) = broadcast_rx.recv().await {
-                if !msg.payload.is_empty() && tx.try_send(msg).is_err() {
-                    // Buffer full or receiver dropped
-                    break;
-                }
-            }
+            tokio::pin!(stream);
+            let messages = stream.filter_map(|res| async move { res.ok() });
+            tokio::pin!(messages);
+            bridge_to_sync(messages, tx, move |dropped| {
+                warn!(
+                    "Sync listener for device {device_id} resumed after dropping {dropped} buffered messages"
+                );
+            })
+            .await;
         });
 
         rx
@@ -484,14 +498,12 @@ impl Scanner {
         let async_scanner = self.inner.clone();
 
         runtime::spawn(async move {
-            use futures_util::StreamExt;
             let stream = async_scanner.scan_stream_instance();
             tokio::pin!(stream);
-            while let Some(device) = stream.next().await {
-                if tx.try_send(device).is_err() {
-                    break;
-                }
-            }
+            bridge_to_sync(stream, tx, |dropped| {
+                warn!("Sync scan stream resumed after dropping {dropped} buffered results");
+            })
+            .await;
         });
 
         rx
@@ -536,20 +548,174 @@ impl ScannerBuilder {
     }
 }
 
-/// Merges multiple sync device listeners into a single synchronous receiver.
+/// Merges multiple sync device listeners into a single synchronous receiver
+/// with the default buffer capacity ([`CHAN_UNIFIED_CAPACITY`]).
 pub fn unified_listener(devices: Vec<Device>) -> std::sync::mpsc::Receiver<Result<DeviceEvent>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_SYNC_CAPACITY);
+    unified_listener_with_capacity(devices, CHAN_UNIFIED_CAPACITY)
+}
+
+/// Same as [`unified_listener`] but with a caller-specified channel buffer.
+///
+/// Use a larger capacity for deployments where burst event rates can briefly
+/// exceed consumer throughput. A rough sizing rule is "a few seconds of
+/// slack at the expected aggregate event rate".
+pub fn unified_listener_with_capacity(
+    devices: Vec<Device>,
+    capacity: usize,
+) -> std::sync::mpsc::Receiver<Result<DeviceEvent>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
     let async_devices: Vec<AsyncDevice> = devices.into_iter().map(|d| d.inner.clone()).collect();
 
     runtime::spawn(async move {
-        use futures_util::StreamExt;
-        let mut stream = async_unified_listener(async_devices);
-        while let Some(event) = stream.next().await {
-            if tx.try_send(event).is_err() {
-                break;
-            }
-        }
+        let stream = async_unified_listener(async_devices);
+        tokio::pin!(stream);
+        bridge_to_sync(stream, tx, |dropped| {
+            warn!("Sync unified listener resumed after dropping {dropped} buffered events");
+        })
+        .await;
     });
 
     rx
+}
+
+/// Forwards items from an async [`Stream`] into a bounded sync channel,
+/// keeping the bridge alive even when the consumer is too slow.
+///
+/// On a full channel the item is dropped and a counter is incremented; when
+/// the consumer catches up the next successful send fires `on_resume` once
+/// with the dropped count. The bridge only exits when the receiver is
+/// disconnected or the stream ends.
+async fn bridge_to_sync<S, T, F>(
+    mut stream: std::pin::Pin<&mut S>,
+    tx: std::sync::mpsc::SyncSender<T>,
+    mut on_resume: F,
+) where
+    S: futures_core::stream::Stream<Item = T>,
+    F: FnMut(u64),
+{
+    let mut dropped: u64 = 0;
+    while let Some(item) = stream.next().await {
+        match tx.try_send(item) {
+            Ok(()) => {
+                if dropped > 0 {
+                    on_resume(dropped);
+                    dropped = 0;
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                dropped = dropped.saturating_add(1);
+            }
+            Err(TrySendError::Disconnected(_)) => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bridge_to_sync;
+    use futures_util::stream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Bridge survives when the channel is full and drops the overflow,
+    /// rather than exiting like the previous `try_send`-and-`break` version.
+    #[test]
+    fn bridge_drops_overflow_and_keeps_running() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(2);
+            let resumed_with = Arc::new(AtomicU64::new(0));
+            let resumed_clone = resumed_with.clone();
+
+            // 5 items into a 2-slot channel: first 2 land, next 3 are dropped.
+            let stream = stream::iter(vec![1u32, 2, 3, 4, 5]);
+            tokio::pin!(stream);
+            bridge_to_sync(stream, tx, move |dropped| {
+                resumed_clone.store(dropped, Ordering::SeqCst);
+            })
+            .await;
+
+            assert_eq!(rx.try_recv().unwrap(), 1);
+            assert_eq!(rx.try_recv().unwrap(), 2);
+            // Items 3..=5 were dropped and never made it to the channel.
+            assert!(rx.try_recv().is_err());
+            // No "resume" was fired because the consumer never caught up.
+            assert_eq!(resumed_with.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// When the consumer catches up after a drop streak, `on_resume` fires
+    /// exactly once with the cumulative dropped count.
+    #[test]
+    fn bridge_reports_dropped_count_when_consumer_catches_up() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+            let resumed_with = Arc::new(AtomicU64::new(0));
+            let resumed_clone = resumed_with.clone();
+
+            // Drain channel between items so the bridge alternates full/empty.
+            let (gate_tx, mut gate_rx) = tokio::sync::mpsc::channel::<()>(8);
+            let producer = async_stream::stream! {
+                yield 1u32;       // lands
+                yield 2;          // dropped (channel full)
+                yield 3;          // dropped
+                gate_rx.recv().await; // wait for consumer to drain
+                yield 4;          // lands → triggers resume with dropped=2
+            };
+            tokio::pin!(producer);
+
+            let consumer = tokio::spawn(async move {
+                // Eagerly drain item 1, then signal producer to continue.
+                tokio::task::spawn_blocking(move || {
+                    let first = rx.recv().unwrap();
+                    assert_eq!(first, 1);
+                    // Tell producer the consumer caught up.
+                    let _ = gate_tx.blocking_send(());
+                    let next = rx.recv().unwrap();
+                    assert_eq!(next, 4);
+                })
+                .await
+                .unwrap();
+            });
+
+            bridge_to_sync(producer, tx, move |dropped| {
+                resumed_clone.store(dropped, Ordering::SeqCst);
+            })
+            .await;
+
+            consumer.await.unwrap();
+            assert_eq!(resumed_with.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// Bridge exits cleanly when the receiver is dropped.
+    #[test]
+    fn bridge_exits_on_receiver_disconnect() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(4);
+            drop(rx); // Consumer is gone before the bridge starts pumping.
+
+            let stream = stream::iter(vec![1u32, 2, 3]);
+            tokio::pin!(stream);
+            // No panic, no hang — just early exit.
+            bridge_to_sync(stream, tx, |_| {
+                panic!("on_resume must not fire on disconnect")
+            })
+            .await;
+        });
+    }
 }

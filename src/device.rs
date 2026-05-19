@@ -358,10 +358,6 @@ impl Device {
         &self.inner.id
     }
 
-    pub(crate) fn broadcast_tx(&self) -> &tokio::sync::broadcast::Sender<TuyaMessage> {
-        &self.inner.broadcast_tx
-    }
-
     #[must_use]
     pub fn dev_type(&self) -> DeviceType {
         self.with_state(|s| s.dev_type)
@@ -473,11 +469,31 @@ impl Device {
 
 impl Device {
     pub fn listener(&self) -> impl Stream<Item = Result<TuyaMessage>> + Send + 'static {
+        use tokio::sync::broadcast::error::RecvError;
         let mut rx = self.inner.broadcast_tx.subscribe();
+        let device = self.clone();
         async_stream::stream! {
-            while let Ok(msg) = rx.recv().await {
-                if !msg.payload.is_empty() {
-                    yield Ok(msg);
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        if !msg.payload.is_empty() {
+                            yield Ok(msg);
+                        }
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!(
+                            "Listener for device {} lagged behind broadcast, skipped {} messages",
+                            device.inner.id, skipped
+                        );
+                        yield Ok(device.error_helper(
+                            ERR_STATE,
+                            Some(serde_json::json!({
+                                "reason": "listener_lagged",
+                                "skipped": skipped,
+                            })),
+                        ));
+                    }
+                    Err(RecvError::Closed) => break,
                 }
             }
         }
@@ -519,6 +535,7 @@ impl Device {
     }
 
     pub async fn receive(&self) -> Result<TuyaMessage> {
+        use tokio::sync::broadcast::error::RecvError;
         let mut rx = self.inner.broadcast_tx.subscribe();
         loop {
             match rx.recv().await {
@@ -527,7 +544,14 @@ impl Device {
                         return Ok(msg);
                     }
                 }
-                Err(e) => return Err(TuyaError::io_other(e.to_string())),
+                Err(RecvError::Lagged(skipped)) => {
+                    warn!(
+                        "Device {} receive() lagged, skipped {} broadcast messages",
+                        self.inner.id, skipped
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => return Err(TuyaError::Offline),
             }
         }
     }
@@ -1400,7 +1424,18 @@ impl Device {
 
                                     return Ok(Some(msg));
                                 }
-                                Err(_) => return Err(TuyaError::Offline),
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                    skipped,
+                                )) => {
+                                    warn!(
+                                        "Response wait for device {} lagged, skipped {} broadcast messages",
+                                        self.inner.id, skipped
+                                    );
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    return Err(TuyaError::Offline);
+                                }
                             }
                         }
                     })
