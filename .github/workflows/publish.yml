@@ -17,8 +17,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify tag matches Cargo version
         run: |
+          # Strip leading "v" from the tag. Extract whatever sits between the
+          # quotes in `version = "..."` — this captures full SemVer including
+          # pre-release suffixes like 0.3.0-rc.1 (the old [0-9]+\.[0-9]+\.[0-9]+
+          # regex silently truncated the suffix and broke rc releases).
           TAG="${GITHUB_REF#refs/tags/v}"
-          VER="$(grep -E '^version\s*=\s*"' Cargo.toml | head -n1 | sed -E 's/[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+          VER="$(grep -E '^version\s*=\s*"' Cargo.toml | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')"
           if [ "$TAG" != "$VER" ]; then
             echo "Version mismatch: tag v$TAG != Cargo.toml $VER"
             exit 1
@@ -26,7 +30,7 @@ jobs:
       - name: Verify python crate Cargo.toml version
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
-          PYVER="$(grep -E '^version\s*=\s*"' python/Cargo.toml | head -n1 | sed -E 's/[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+          PYVER="$(grep -E '^version\s*=\s*"' python/Cargo.toml | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')"
           if [ "$TAG" != "$PYVER" ]; then
             echo "Version mismatch: tag v$TAG != python/Cargo.toml $PYVER"
             exit 1
