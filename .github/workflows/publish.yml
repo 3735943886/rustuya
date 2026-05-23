@@ -178,6 +178,10 @@ jobs:
         with:
           body_path: CHANGELOG.md
           files: dist/*
+          # SemVer pre-releases all contain a `-` (e.g. 0.3.0-rc.1, 0.3.0-beta.2).
+          # The action's auto-detection didn't catch v0.3.0-rc.1 on first run,
+          # so set the flag explicitly from the tag name.
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   crates-io:
     runs-on: ubuntu-latest
