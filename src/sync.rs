@@ -51,7 +51,25 @@ pub struct SyncRequest<C, R = Option<String>> {
     pub resp_tx: std::sync::mpsc::Sender<Result<R>>,
 }
 
+/// Returns an error if the current thread is inside a tokio runtime context.
+///
+/// `tokio::sync::mpsc::Sender::blocking_send` panics ("Cannot block the current
+/// thread from within a runtime") if called from an async task. The sync API
+/// exists for callers who don't want a runtime; if you're already in one, use
+/// the async [`rustuya::Device`] instead.
+#[inline]
+fn check_no_runtime_context() -> Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(crate::error::TuyaError::io_other(
+            "rustuya sync API called from inside a tokio runtime — \
+             use rustuya::Device (async) instead",
+        ));
+    }
+    Ok(())
+}
+
 fn send_sync<C, R>(tx: &mpsc::Sender<SyncRequest<C, R>>, command: C) -> Result<R> {
+    check_no_runtime_context()?;
     let (resp_tx, resp_rx) = std::sync::mpsc::channel();
     if tx.blocking_send(SyncRequest { command, resp_tx }).is_err() {
         return Err(crate::error::TuyaError::io_other("Worker died"));
@@ -63,13 +81,17 @@ fn send_sync<C, R>(tx: &mpsc::Sender<SyncRequest<C, R>>, command: C) -> Result<R
 
 macro_rules! wait_for_response {
     ($tx:expr, $cmd_gen:expr) => {{
-        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-        if $tx.blocking_send($cmd_gen(resp_tx)).is_err() {
-            Err(crate::error::TuyaError::io_other("Worker died"))
+        if let Err(e) = crate::sync::check_no_runtime_context() {
+            Err(e)
         } else {
-            resp_rx
-                .recv()
-                .map_err(|_| crate::error::TuyaError::io_other("Worker died"))
+            let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+            if $tx.blocking_send($cmd_gen(resp_tx)).is_err() {
+                Err(crate::error::TuyaError::io_other("Worker died"))
+            } else {
+                resp_rx
+                    .recv()
+                    .map_err(|_| crate::error::TuyaError::io_other("Worker died"))
+            }
         }
     }};
 }
@@ -213,12 +235,20 @@ impl Device {
         SubDevice::new(self.inner.sub(cid))
     }
 
+    /// Drops the current device connection. The background reconnect task
+    /// stays alive — the next sync call (`status`, `set_dps`, …) will trigger
+    /// a fresh connect attempt unless `persist` is false.
+    ///
+    /// Bypasses the sync worker channel so it can short-circuit any pending
+    /// command in flight (M2.1).
     pub fn close(&self) {
-        let _ = send_sync(&self.cmd_tx, DeviceCommand::Close);
+        self.inner.fire_close();
     }
 
+    /// Permanently stops the device. Subsequent sync calls return
+    /// `TuyaError::Offline`. Bypasses the worker channel.
     pub fn stop(&self) {
-        let _ = send_sync(&self.cmd_tx, DeviceCommand::Stop);
+        self.inner.fire_stop();
     }
 
     pub fn listener(&self) -> std::sync::mpsc::Receiver<TuyaMessage> {
@@ -612,10 +642,35 @@ async fn bridge_to_sync<S, T, F>(
 
 #[cfg(test)]
 mod tests {
-    use super::bridge_to_sync;
+    use super::{bridge_to_sync, check_no_runtime_context};
     use futures_util::stream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // M1.7 regression: calling the sync API from inside a tokio runtime must
+    // surface a clear error instead of panicking inside `blocking_send`.
+    #[test]
+    fn check_no_runtime_context_errors_inside_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let res = check_no_runtime_context();
+            assert!(res.is_err(), "expected error when inside a tokio runtime");
+            let msg = format!("{}", res.unwrap_err());
+            assert!(
+                msg.contains("tokio runtime"),
+                "error message should mention runtime, got: {msg}"
+            );
+        });
+    }
+
+    // And from a plain thread (no runtime) the guard must permit the call.
+    #[test]
+    fn check_no_runtime_context_ok_outside_runtime() {
+        assert!(check_no_runtime_context().is_ok());
+    }
 
     /// Bridge survives when the channel is full and drops the overflow,
     /// rather than exiting like the previous `try_send`-and-`break` version.

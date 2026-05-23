@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, sleep, timeout};
 
 use serde::Serialize;
@@ -59,21 +59,60 @@ const UDP_KEY_35: &[u8] = UDP_KEY_34;
 /// v3.3 UDP discovery encryption key
 const UDP_KEY_33: &[u8] = b"yG9shRKIBrIBUjc3";
 
+// --- Discovery timing ---
+//
+// The active scan schedule, by construction:
+//   t=0       broadcast #1 (tokio `interval` fires immediately on first tick)
+//   t=6s      broadcast #2
+//   t=12s     broadcast #3  (MAX_BROADCASTS reached, no more sends)
+//   t=18s     timeout       (RECEIVE_MARGIN of 6s after the last broadcast)
+//
+// The invariant we want to preserve is "at least one BROADCAST_INTERVAL of
+// receive window after the last broadcast" — otherwise late device replies are
+// lost. `DEFAULT_SCAN_TIMEOUT` is derived from the other constants so a future
+// tweak can't silently destroy the margin; an assertion in `Scanner::new`
+// pins it.
 const BROADCAST_INTERVAL: Duration = Duration::from_secs(6);
+const MAX_BROADCASTS: u32 = 3;
+const RECEIVE_MARGIN: Duration = BROADCAST_INTERVAL;
+const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(
+    BROADCAST_INTERVAL.as_secs() * (MAX_BROADCASTS as u64 - 1) + RECEIVE_MARGIN.as_secs(),
+);
+
 const GLOBAL_SCAN_COOLDOWN: Duration = Duration::from_secs(1800); // 30 minutes
 const SCAN_THROTTLE_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds minimum gap between active scans
-const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(18); // Hardcoded 18s timeout
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+
+/// Sender half of the scanner's shared packet bus (one per dispatcher).
+type PacketSender = mpsc::Sender<(Vec<u8>, SocketAddr)>;
+/// Receiver half — paired with `PacketSender`, consumed by the dispatcher.
+type PacketReceiver = mpsc::Receiver<(Vec<u8>, SocketAddr)>;
 
 #[derive(Debug)]
 struct ScannerState {
     cache: RwLock<HashMap<String, DiscoveryResult>>,
-    notify: Notify,
+    // `tokio::sync::watch` instead of `tokio::sync::Notify` so consumers cannot
+    // miss a publish that fires between two `notified()` calls. Each cache
+    // update bumps the counter; subscribers `changed().await` and re-read the
+    // cache. The carried value is a monotonic discovery version — callers
+    // don't read it, the *change* itself is the signal.
+    discovery_version: (watch::Sender<u64>, watch::Receiver<u64>),
     active_scanning: AtomicBool,
     last_scan_time: RwLock<Option<Instant>>,
     listener_started: AtomicBool,
-    cancel_token: tokio_util::sync::CancellationToken,
+    // RwLock<CancellationToken> — the token is replaced (not just cancelled)
+    // each time the passive listener is stopped, so a subsequent start gets a
+    // fresh, uncancelled token. CancellationToken is one-shot by design; reusing
+    // a cancelled instance would make every new receiver task exit immediately.
+    cancel_token: RwLock<tokio_util::sync::CancellationToken>,
     sockets: RwLock<HashMap<u16, Arc<UdpSocket>>>,
+    // Single long-lived mpsc shared by ALL receiver tasks (one per port). The
+    // dispatcher task drains the matching receiver. When `set_ports` later adds
+    // a port, the new receiver task clones this same sender — so its packets
+    // reach the same dispatcher. (Before this design, each call to
+    // `spawn_receiver_tasks` minted a fresh channel whose `rx` was never
+    // polled, silently dropping every packet on the newly added port.)
+    packet_tx: RwLock<Option<PacketSender>>,
     receiver_tasks: RwLock<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -81,20 +120,58 @@ impl ScannerState {
     fn new() -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
-            notify: Notify::new(),
+            discovery_version: watch::channel(0u64),
             active_scanning: AtomicBool::new(false),
             last_scan_time: RwLock::new(None),
             listener_started: AtomicBool::new(false),
-            cancel_token: tokio_util::sync::CancellationToken::new(),
+            cancel_token: RwLock::new(tokio_util::sync::CancellationToken::new()),
             sockets: RwLock::new(HashMap::new()),
+            packet_tx: RwLock::new(None),
             receiver_tasks: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Returns a clone of the current cancellation token.
+    fn current_cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel_token.read().clone()
+    }
+
+    /// Cancels the current token and installs a fresh one. Subsequent
+    /// `current_cancel_token()` calls return the new (uncancelled) token.
+    fn reset_cancel_token(&self) {
+        let mut guard = self.cancel_token.write();
+        guard.cancel();
+        *guard = tokio_util::sync::CancellationToken::new();
+    }
+
+    /// Returns the active packet sender if a listener is currently running.
+    fn current_packet_tx(&self) -> Option<PacketSender> {
+        self.packet_tx.read().clone()
+    }
+
+    /// Publishes a new discovery version. Subscribers' `changed().await`
+    /// resolves; if a subscriber is between awaits, the bumped value is
+    /// retained until they next call `changed()`, so notifications cannot be
+    /// lost (unlike `Notify::notify_waiters`).
+    fn publish_discovery(&self) {
+        self.discovery_version
+            .0
+            .send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// Subscribes to discovery notifications. The returned receiver is
+    /// pre-marked-seen at the current version, so only *future* updates
+    /// resolve `changed()`.
+    fn subscribe_discoveries(&self) -> watch::Receiver<u64> {
+        let mut rx = self.discovery_version.1.clone();
+        rx.mark_unchanged();
+        rx
     }
 }
 
 impl Drop for ScannerState {
     fn drop(&mut self) {
-        self.cancel_token.cancel();
+        self.cancel_token.write().cancel();
         for task in self.receiver_tasks.write().drain(..) {
             task.abort();
         }
@@ -130,11 +207,6 @@ pub fn get() -> &'static Scanner {
 pub fn builder() -> ScannerBuilder {
     ScannerBuilder::new()
 }
-
-type ReceiverResult = (
-    mpsc::Receiver<(Vec<u8>, SocketAddr)>,
-    Vec<tokio::task::JoinHandle<()>>,
-);
 
 impl Scanner {
     /// Returns the global scanner instance.
@@ -199,64 +271,90 @@ impl Scanner {
             return;
         }
 
-        // Only start a new receiver task if it wasn't already started
+        // Two distinct paths:
+        //   (a) first-time startup  — create the shared channel, spawn the
+        //       dispatcher (consumes rx), then spawn one receiver per socket.
+        //   (b) listener already running, this call only adds ports — clone
+        //       the existing sender so new receivers feed the same dispatcher.
         if !state.listener_started.swap(true, Ordering::SeqCst) {
-            let cancel_token = state.cancel_token.clone();
+            let cancel_token = state.current_cancel_token();
+            let (tx, mut rx): (PacketSender, PacketReceiver) = mpsc::channel(100);
+            *state.packet_tx.write() = Some(tx.clone());
+
+            let recv_tasks = Self::spawn_receiver_tasks(new_sockets, tx, cancel_token.clone());
+            state.receiver_tasks.write().extend(recv_tasks);
+
             let state_weak = Arc::downgrade(&self.inner);
-
-            let (mut rx, tasks) = Self::spawn_receiver_tasks(new_sockets, cancel_token.clone());
-            {
-                let mut guard = state.receiver_tasks.write();
-                guard.extend(tasks);
-            }
-
-            crate::runtime::spawn(async move {
+            let dispatcher_ct = cancel_token.clone();
+            let dispatcher = crate::runtime::spawn(async move {
                 debug!("Starting background passive listener task...");
-
                 loop {
                     tokio::select! {
-                        () = cancel_token.cancelled() => break,
-                        Some((data, _addr)) = rx.recv() => {
-                            let state = match state_weak.upgrade() {
-                                Some(s) => s,
-                                None => break,
-                            };
-
-                            if let Some(res) = parse_packet(&data) {
-                                let mut guard = state.cache.write();
-
-                                // Keep memory clean by removing expired entries on every update.
-                                guard.retain(|_, v| v.discovered_at.elapsed() < CACHE_TTL);
-
-                                let should_log = match guard.get(&res.id) {
-                                    Some(existing) => !res.is_same_device(existing),
-                                    None => true,
-                                };
-
-                                if should_log {
-                                    let mode = if state.active_scanning.load(Ordering::SeqCst) { "A" } else { "P" };
-                                    let version = res.version.map_or_else(|| "unknown".to_string(), |v| v.to_string());
-                                    info!("Discovered device {}(v{}) at {} - {}", res.id, version, res.ip, mode);
-                                }
-
-                                guard.insert(res.id.clone(), res.clone());
-                                state.notify.notify_waiters();
-                            }
+                        () = dispatcher_ct.cancelled() => break,
+                        msg = rx.recv() => {
+                            let Some((data, _addr)) = msg else { break };
+                            let Some(state) = state_weak.upgrade() else { break };
+                            Self::dispatch_packet(&state, &data);
                         }
                     }
                 }
                 debug!("Background passive listener task stopped");
             });
+            state.receiver_tasks.write().push(dispatcher);
+        } else if let Some(tx) = state.current_packet_tx() {
+            // Listener already up — splice in receivers for the newly added ports.
+            let recv_tasks =
+                Self::spawn_receiver_tasks(new_sockets, tx, state.current_cancel_token());
+            state.receiver_tasks.write().extend(recv_tasks);
+        } else {
+            // Should not happen: listener_started is true but no tx. Treat as a
+            // race against `stop_passive_listener` and rebuild from scratch.
+            state.listener_started.store(false, Ordering::SeqCst);
+            drop(new_sockets);
+            self.ensure_passive_listener();
         }
+    }
+
+    /// Decodes one UDP packet and folds it into the discovery cache.
+    /// Extracted so first-start and shared-channel paths use identical logic.
+    fn dispatch_packet(state: &Arc<ScannerState>, data: &[u8]) {
+        let Some(res) = parse_packet(data) else { return };
+        let mut guard = state.cache.write();
+
+        // Keep memory clean by removing expired entries on every update.
+        guard.retain(|_, v| v.discovered_at.elapsed() < CACHE_TTL);
+
+        let should_log = match guard.get(&res.id) {
+            Some(existing) => !res.is_same_device(existing),
+            None => true,
+        };
+
+        if should_log {
+            let mode = if state.active_scanning.load(Ordering::SeqCst) {
+                "A"
+            } else {
+                "P"
+            };
+            let version = res
+                .version
+                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+            info!(
+                "Discovered device {}(v{}) at {} - {}",
+                res.id, version, res.ip, mode
+            );
+        }
+
+        guard.insert(res.id.clone(), res.clone());
+        drop(guard);
+        state.publish_discovery();
     }
 
     fn spawn_receiver_tasks(
         sockets: Vec<Arc<UdpSocket>>,
+        tx: PacketSender,
         cancel_token: tokio_util::sync::CancellationToken,
-    ) -> ReceiverResult {
-        let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100);
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
-
         for socket in sockets {
             let tx = tx.clone();
             let socket = socket.clone();
@@ -298,7 +396,7 @@ impl Scanner {
             });
             tasks.push(task);
         }
-        (rx, tasks)
+        tasks
     }
 
     fn create_udp_socket(bind_addr: &str, port: u16) -> Result<UdpSocket> {
@@ -322,11 +420,24 @@ impl Scanner {
         Ok(UdpSocket::from_std(std_socket)?)
     }
 
-    /// Stops background passive listener.
+    /// Stops the background passive listener and resets internal state so the
+    /// scanner can be started again later (e.g. via `set_ports` or another
+    /// `scan()` call).
     pub fn stop_passive_listener(&self) {
-        self.inner.cancel_token.cancel();
+        // Cancel-then-replace: receiver/dispatcher tasks observe the cancel
+        // and exit; future starts pick up the fresh token.
+        self.inner.reset_cancel_token();
         self.inner.listener_started.store(false, Ordering::SeqCst);
         self.inner.sockets.write().clear();
+        // Drop the shared sender so the dispatcher's `rx.recv()` resolves to
+        // None even if some receiver task is slow to see the cancel.
+        *self.inner.packet_tx.write() = None;
+        // Best-effort: drop any receiver task handles we still own. Tasks
+        // already woken by the cancel will finish on their own; this only
+        // forces immediate abort for any that are stuck on a syscall.
+        for task in self.inner.receiver_tasks.write().drain(..) {
+            task.abort();
+        }
     }
 
     /// Sets the discovery timeout.
@@ -368,13 +479,14 @@ impl Scanner {
         s
     }
 
-    /// Returns a future that resolves when any device is discovered.
+    /// Returns a `watch` receiver that fires whenever any device is
+    /// discovered. The receiver is pre-marked-seen, so only events *after*
+    /// the call resolve `changed()`.
     ///
-    /// Crate-internal: the returned future borrows the underlying
-    /// `tokio::sync::Notify`, so leaking it across the crate boundary would
-    /// expose an internal runtime detail.
-    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.inner.notify.notified()
+    /// Crate-internal: the receiver carries an internal monotonic counter
+    /// that callers should not rely on.
+    pub(crate) fn subscribe_discoveries(&self) -> watch::Receiver<u64> {
+        self.inner.subscribe_discoveries()
     }
 
     /// Returns the cached discovery result for a device, if it exists and is not expired.
@@ -394,10 +506,42 @@ impl Scanner {
         false
     }
 
+    /// Best-effort local-IP detection. Cached process-wide via `LOCAL_IP_CACHE`
+    /// so the (blocking) socket calls run at most once. Tries multiple
+    /// non-routing destinations so the lookup works in air-gapped LANs where
+    /// `8.8.8.8` is unreachable. UDP `connect()` only performs a kernel route
+    /// lookup; no packet is actually sent.
+    fn discover_local_ip_blocking() -> Option<String> {
+        // Each candidate covers a different network environment:
+        //   - "8.8.8.8"        : internet-connected hosts (most common)
+        //   - "255.255.255.255": LAN-only / air-gapped, needs SO_BROADCAST
+        //   - "203.0.113.1"    : TEST-NET-3 (RFC 5737), non-routable but
+        //                        still triggers a route lookup that returns
+        //                        the default-route source IP
+        const CANDIDATES: &[&str] = &["8.8.8.8:80", "255.255.255.255:80", "203.0.113.1:80"];
+        for dst in CANDIDATES {
+            let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+                continue;
+            };
+            let _ = socket.set_broadcast(true); // needed for 255.255.255.255
+            if socket.connect(dst).is_ok()
+                && let Ok(addr) = socket.local_addr()
+                && !addr.ip().is_unspecified()
+            {
+                return Some(addr.ip().to_string());
+            }
+        }
+        None
+    }
+
+    /// Returns the local LAN IP, computing it once per process. Safe to call
+    /// from an async context: the lookup is cached, so only the very first
+    /// invocation does any blocking work.
     fn get_local_ip(&self) -> Option<String> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-        socket.connect("8.8.8.8:80").ok()?;
-        socket.local_addr().ok().map(|addr| addr.ip().to_string())
+        static LOCAL_IP_CACHE: OnceLock<Option<String>> = OnceLock::new();
+        LOCAL_IP_CACHE
+            .get_or_init(Self::discover_local_ip_blocking)
+            .clone()
     }
 
     async fn send_discovery_broadcast(&self, socket: &UdpSocket, port: u16) -> Result<()> {
@@ -467,20 +611,35 @@ impl Scanner {
         let start_time = Instant::now();
         let scanner = self.clone();
 
-        // 1. Start a new scan if none is in progress and cooldown has passed
-        let should_start = !state.active_scanning.load(Ordering::SeqCst) && {
+        // Atomically claim the "active scanner" slot. compare_exchange ensures
+        // only one of multiple concurrent scan_stream() callers wins; the
+        // losers join the existing scan instead of spawning a duplicate
+        // discovery loop. (Before this, a load-then-store split allowed two
+        // callers to both decide they should start.)
+        let cooldown_ok = {
             let last_scan = state.last_scan_time.read();
             last_scan.is_none_or(|t| t.elapsed() >= GLOBAL_SCAN_COOLDOWN)
         };
+        let should_start = cooldown_ok
+            && state
+                .active_scanning
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+
+        // Subscribe to discovery events BEFORE spawning the discovery loop.
+        // The watch receiver retains the "last seen version", so any publish
+        // that lands between subscription and the first `changed().await` is
+        // replayed — but we still want to subscribe before publishers can run
+        // so the ordering is obviously correct on a cold read.
+        let mut discovery_rx = state.subscribe_discoveries();
 
         if should_start {
-            state.active_scanning.store(true, Ordering::SeqCst);
             *state.last_scan_time.write() = Some(Instant::now());
             let state_clone = state.clone();
             crate::runtime::spawn(async move {
                 let _ = scanner.perform_discovery_loop().await;
                 state_clone.active_scanning.store(false, Ordering::SeqCst);
-                state_clone.notify.notify_waiters();
+                state_clone.publish_discovery();
             });
         }
 
@@ -510,7 +669,7 @@ impl Scanner {
                 // Wait for next discovery notification or timeout
                 tokio::select! {
                     () = sleep(remaining) => break,
-                    () = state.notify.notified() => {
+                    _ = discovery_rx.changed() => {
                         let new_items: Vec<_> = {
                             let guard = state.cache.read();
                             guard.values()
@@ -644,7 +803,7 @@ impl Scanner {
             crate::runtime::spawn(async move {
                 let _ = scanner.perform_discovery_loop().await;
                 state.active_scanning.store(false, Ordering::SeqCst);
-                state.notify.notify_waiters();
+                state.publish_discovery();
             });
         }
     }
@@ -656,6 +815,11 @@ impl Scanner {
     ) -> Option<DiscoveryResult> {
         let state = &self.inner;
         let start_wait = Instant::now();
+        // Subscribe ONCE up front. The watch receiver carries its own
+        // "last seen version", so even if a publish happens between the cache
+        // check below and the `changed().await`, the next `changed()` call
+        // resolves immediately instead of hanging.
+        let mut discovery_rx = state.subscribe_discoveries();
 
         loop {
             if let Some(res) = state.cache.read().get(device_id).cloned() {
@@ -669,17 +833,15 @@ impl Scanner {
             }
 
             let remaining = self.timeout.saturating_sub(elapsed);
-            let notified = state.notify.notified();
-            tokio::pin!(notified);
 
             if let Some(ct) = cancel {
                 tokio::select! {
                     _ = ct.cancelled() => return None,
                     _ = sleep(remaining) => {}
-                    _ = &mut notified => {}
+                    _ = discovery_rx.changed() => {}
                 }
             } else {
-                let _ = timeout(remaining, &mut notified).await;
+                let _ = timeout(remaining, discovery_rx.changed()).await;
             }
         }
     }
@@ -725,9 +887,9 @@ impl Scanner {
             tokio::select! {
                 () = sleep(remaining) => break,
                 _ = broadcast_interval.tick() => {
-                    if broadcast_count < 3 {
+                    if broadcast_count < MAX_BROADCASTS {
                         broadcast_count += 1;
-                        debug!("Sent broadcast {broadcast_count}/3");
+                        debug!("Sent broadcast {broadcast_count}/{MAX_BROADCASTS}");
                         for (socket, port) in &target_sockets {
                             let _ = self.send_discovery_broadcast(socket, *port).await;
                         }
@@ -902,3 +1064,96 @@ impl ScannerBuilder {
         scanner
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // M1.8 regression: lock the discovery timing invariant — the timeout MUST
+    // exceed the time of the last broadcast by at least RECEIVE_MARGIN so
+    // late device replies have a chance to arrive before the loop exits.
+    #[test]
+    fn scan_timeout_leaves_room_after_last_broadcast() {
+        let last_broadcast_at = BROADCAST_INTERVAL * (MAX_BROADCASTS - 1);
+        let margin = DEFAULT_SCAN_TIMEOUT.saturating_sub(last_broadcast_at);
+        assert!(
+            margin >= RECEIVE_MARGIN,
+            "scan timeout ({DEFAULT_SCAN_TIMEOUT:?}) leaves only {margin:?} after \
+             the last broadcast (at {last_broadcast_at:?}); need at least {RECEIVE_MARGIN:?}"
+        );
+    }
+
+    // M1.2 regression: the shared `packet_tx` must survive a follow-up
+    // `ensure_passive_listener` call (i.e. a `set_ports` that adds a port). If
+    // a second call swapped the channel, receivers spawned by it would feed an
+    // unowned rx and packets on the new port would be silently dropped.
+    #[test]
+    fn packet_tx_lifecycle_persists_then_clears_on_stop() {
+        let state = Arc::new(ScannerState::new());
+
+        // Before any listener: no sender.
+        assert!(state.current_packet_tx().is_none());
+
+        // Simulate first ensure_passive_listener: install a sender.
+        let (tx, _rx): (PacketSender, PacketReceiver) = mpsc::channel(8);
+        *state.packet_tx.write() = Some(tx);
+
+        // Second ensure_passive_listener (e.g. set_ports) must NOT replace the
+        // sender — it should reuse the existing one for new receivers.
+        let tx_clone_a = state.current_packet_tx().expect("listener up");
+        let tx_clone_b = state.current_packet_tx().expect("listener up");
+        assert!(tx_clone_a.same_channel(&tx_clone_b));
+
+        // Stop clears the sender; future calls would create a fresh one.
+        *state.packet_tx.write() = None;
+        assert!(state.current_packet_tx().is_none());
+    }
+
+    // M1.2 end-to-end-ish: dispatch_packet folds a known v3.1 broadcast into
+    // the cache. Locks in the routing extraction (single cache write path).
+    #[test]
+    fn dispatch_packet_updates_cache_for_known_v31_broadcast() {
+        let state = Arc::new(ScannerState::new());
+        let payload =
+            br#"{"gwId":"test-device-id","ip":"10.0.0.42","version":"3.1","productKey":"pk"}"#;
+
+        Scanner::dispatch_packet(&state, payload);
+
+        let cache = state.cache.read();
+        let entry = cache
+            .get("test-device-id")
+            .expect("dispatch must insert into cache");
+        assert_eq!(entry.ip, "10.0.0.42");
+        assert_eq!(entry.version, Some(Version::V3_1));
+    }
+
+    // M1.1 regression: after `reset_cancel_token`, the *new* token must be
+    // uncancelled. Before this fix the listener used a one-shot
+    // `CancellationToken`, which permanently disabled the scanner once stopped.
+    #[test]
+    fn reset_cancel_token_yields_fresh_uncancelled_token() {
+        let state = ScannerState::new();
+        let first = state.current_cancel_token();
+        assert!(!first.is_cancelled());
+
+        state.reset_cancel_token();
+
+        // The previously-handed-out clone is cancelled (so any pre-stop task
+        // that was awaiting it will wake up and exit).
+        assert!(first.is_cancelled());
+
+        // A fresh clone obtained *after* the reset is a brand-new token.
+        let second = state.current_cancel_token();
+        assert!(!second.is_cancelled());
+
+        // The first and second tokens are distinct: cancelling one does not
+        // affect the other.
+        state.cancel_token.write().cancel();
+        assert!(state.current_cancel_token().is_cancelled());
+
+        state.reset_cancel_token();
+        let third = state.current_cancel_token();
+        assert!(!third.is_cancelled());
+    }
+}
+
