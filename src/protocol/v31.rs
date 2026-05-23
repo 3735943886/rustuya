@@ -1,6 +1,9 @@
 use crate::crypto::TuyaCipher;
 use crate::error::{Result, TuyaError};
-use crate::protocol::{CommandType, TuyaProtocol, Version, create_base_payload};
+use crate::protocol::{
+    CommandType, TuyaProtocol, Version, apply_update_dps, create_base_payload,
+    legacy_lan_ext_stream, strip_status_heartbeat,
+};
 use base64::{Engine as _, engine::general_purpose};
 use log::trace;
 use md5::{Digest, Md5};
@@ -30,39 +33,19 @@ impl TuyaProtocol for ProtocolV31 {
             create_base_payload(device_id, cid, data.clone(), Some(t.to_string().into()));
 
         match command {
-            CommandType::UpdateDps => {
-                payload.retain(|k, _| k == "cid");
-                let d = data.unwrap_or_else(|| serde_json::json!([18, 19, 20]));
-                payload.insert("dpId".into(), d);
-            }
-            CommandType::Control | CommandType::ControlNew => {
+            CommandType::UpdateDps => apply_update_dps(&mut payload, data),
+            CommandType::Control | CommandType::ControlNew | CommandType::DpQueryNew => {
                 payload.remove("gwId");
             }
             CommandType::DpQuery => {
-                // Keep all: gwId, devId, uid, cid, t, dps
-            }
-            CommandType::DpQueryNew => {
-                payload.remove("gwId");
+                // v3.1 keeps gwId/devId/uid/cid/t/dps unchanged.
             }
             CommandType::LanExtStream => {
-                // For LanExtStream in v3.1 and below, we keep everything at root
-                payload.clear();
-                if let Some(Value::Object(mut data_obj)) = data {
-                    if let Some(req_type) = data_obj.remove("reqType") {
-                        payload.insert("reqType".into(), req_type);
-                    }
-                    // Move remaining fields from data_obj to payload root
-                    for (k, v) in data_obj {
-                        payload.insert(k, v);
-                    }
-                }
+                payload = legacy_lan_ext_stream(data);
             }
-            CommandType::Status | CommandType::HeartBeat => {
-                payload.remove("uid");
-                payload.remove("t");
-            }
+            CommandType::Status | CommandType::HeartBeat => strip_status_heartbeat(&mut payload),
             _ => {
-                // Default for others: gwId, devId, uid, cid, t, dps
+                // Default: gwId, devId, uid, cid, t, dps
             }
         }
 
@@ -89,7 +72,7 @@ impl TuyaProtocol for ProtocolV31 {
             hasher.update(cipher.key());
 
             let hash = hasher.finalize();
-            let md5_hex = hex::encode(hash);
+            let md5_hex = crate::crypto::hex_encode(&hash);
             let md5_slice = &md5_hex[8..24];
 
             // 4. Final payload: b"3.1" + md5slice + base64payload

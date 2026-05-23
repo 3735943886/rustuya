@@ -3,6 +3,7 @@
 //! Handles TCP connections, handshakes, heartbeats, and command-response flows.
 
 use crate::crypto::TuyaCipher;
+use crate::crypto::hex_encode;
 use crate::error::{
     ERR_DEVTYPE, ERR_JSON, ERR_OFFLINE, ERR_PAYLOAD, ERR_STATE, ERR_SUCCESS, Result, TuyaError,
     get_error_message,
@@ -13,7 +14,6 @@ use crate::protocol::{
 };
 use crate::scanner::get as get_scanner;
 use futures_core::stream::Stream;
-use hex;
 use log::{debug, error, info, trace, warn};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -66,6 +66,12 @@ mod keys {
     pub const ERR_PAYLOAD_OBJ: &str = "errorPayload";
     pub const PAYLOAD_STR: &str = "payloadStr";
     pub const PAYLOAD_RAW: &str = "payloadRaw";
+
+    // Inbound payload keys consulted when synthesizing error messages from
+    // device responses. Kept here so a future protocol change has one site
+    // to update.
+    pub const IN_DATA: &str = "data";
+    pub const IN_PAYLOAD: &str = "payload";
 }
 
 /// A sub-device (endpoint) of a gateway device.
@@ -235,9 +241,21 @@ impl DeviceBuilder {
         self
     }
 
+    /// Finalizes the builder and returns a connected [`Device`].
+    ///
+    /// This is the conventional builder terminal verb. The older
+    /// [`run`](Self::run) name is retained as a deprecated alias and will be
+    /// removed in a future minor release.
     #[must_use]
-    pub fn run(self) -> Device {
+    pub fn build(self) -> Device {
         Device::with_builder(self)
+    }
+
+    /// Deprecated: prefer [`build`](Self::build).
+    #[must_use]
+    #[deprecated(since = "0.3.0", note = "use `DeviceBuilder::build` instead")]
+    pub fn run(self) -> Device {
+        self.build()
     }
 }
 
@@ -272,21 +290,35 @@ pub struct Device {
     tx: Option<mpsc::Sender<DeviceCommand>>,
 }
 
-impl Drop for Device {
-    fn drop(&mut self) {
-        // No manual strong_count check needed.
-        // When the last Arc<DeviceInner> is dropped, DeviceInner::drop will run.
-    }
-}
-
 impl Device {
-    /// Creates a new device with default settings and starts the connection task.
+    /// Creates a new device with default settings and starts the background
+    /// connection task.
+    ///
+    /// # Runtime behavior
+    ///
+    /// This is an **eager** constructor: it spawns a long-running tokio task
+    /// on the library's dedicated runtime (see [`crate::runtime`]) before
+    /// returning. The task stays alive — performing reconnects, heartbeats,
+    /// and IP rediscovery — until the last `Device` clone is dropped or
+    /// [`Device::stop`] is called.
+    ///
+    /// Consequences:
+    ///
+    /// - Calling `Device::new` outside any tokio runtime is fine; the
+    ///   internal runtime takes care of execution.
+    /// - You can `Device::new` from inside an async context as well; the
+    ///   spawned task does *not* attach to the caller's runtime, so
+    ///   consumer-side runtime shutdown won't kill it.
+    /// - The constructor itself returns quickly — actual TCP work happens on
+    ///   the spawned task.
+    /// - Construct devices lazily if you may have hundreds-to-thousands of
+    ///   them; each one starts a task on construction.
     pub fn new<I, K>(id: I, local_key: K) -> Self
     where
         I: Into<String>,
         K: Into<Vec<u8>>,
     {
-        DeviceBuilder::new(id, local_key).run()
+        DeviceBuilder::new(id, local_key).build()
     }
 
     /// Returns a builder to configure device settings before running.
@@ -366,6 +398,20 @@ impl Device {
     pub fn id(&self) -> &str {
         &self.inner.id
     }
+
+    // ----------------------------------------------------------------
+    // Getter implementation note
+    //
+    // These getters acquire `parking_lot::RwLock::read()` and return cheap
+    // Copy values. We deliberately did not factor each field into a separate
+    // atomic shadow: parking_lot's uncontended read is ~10ns, the getters
+    // are not called in tight loops (the genuinely hot path,
+    // `get_cipher`, was addressed separately with read-then-upgrade
+    // locking — see M2.3), and dual storage between an atomic and the
+    // canonical `DeviceState` would create a synchronization invariant
+    // that's easy to forget on a setter. If a future profile shows one of
+    // these is hot, the right move is to atomicize that single field.
+    // ----------------------------------------------------------------
 
     #[must_use]
     pub fn dev_type(&self) -> DeviceType {
@@ -626,7 +672,7 @@ impl Device {
                 if let Some(s) = msg.payload_as_string() {
                     Ok(Some(s))
                 } else {
-                    Ok(Some(hex::encode(&msg.payload)))
+                    Ok(Some(hex_encode(&msg.payload)))
                 }
             }
             None => Ok(None),
@@ -1074,9 +1120,7 @@ impl Device {
                                 // observed here (we re-enter rx.recv() next
                                 // iteration anyway).
                                 let backoff = self.with_state(|s| {
-                                    self.get_backoff_duration(
-                                        s.failure_count.saturating_sub(1),
-                                    )
+                                    self.get_backoff_duration(s.failure_count.saturating_sub(1))
                                 });
                                 if !backoff.is_zero() {
                                     debug!(
@@ -1112,8 +1156,7 @@ impl Device {
                                     };
                                     self.handle_connection_error(&err).await;
                                     self.with_state_mut(|s| {
-                                        s.failure_count =
-                                            s.failure_count.saturating_add(1);
+                                        s.failure_count = s.failure_count.saturating_add(1);
                                     });
                                     cmd.respond(Err(err.clone()));
                                     self.broadcast_error(ERR_OFFLINE, None);
@@ -1474,6 +1517,8 @@ impl Device {
                     let effective_cmd = protocol.get_effective_command(command);
                     let timeout_dur = self.timeout();
 
+                    let id_for_logs = self.inner.id.clone();
+                    let target_cid = cid.clone();
                     // NOTE: Tuya's LAN protocol is fundamentally asynchronous —
                     // the device treats inbound commands as fire-and-forget and
                     // independently emits unsolicited Status pushes whenever its
@@ -1494,77 +1539,20 @@ impl Device {
                     let wait_res = timeout(timeout_dur, async {
                         loop {
                             match rx.recv().await {
-                                Ok(msg) => {
-                                    // 0. Check for error response from device (cmd 0)
-                                    if msg.cmd == 0 {
-                                        debug!("Device returned error response (cmd 0), returning as valid response");
-                                        return Ok(Some(msg));
-                                    }
-
-                                    // 1. Check command ID
-                                    let cmd_matches = msg.cmd == effective_cmd
-                                        || msg.cmd == CommandType::Status as u32;
-
-                                    if !cmd_matches {
-                                        continue;
-                                    }
-
-                                    // 1.1 Check if this command requires data (must wait if payload is empty)
-                                    let needs_data = MANDATORY_DATA_CMDS.contains(&msg.cmd);
-
-                                    // Found matching response
-                                    // 2. If we sent a request with a specific CID, verify the response CID matches
-                                    if let Some(ref target_cid) = cid {
-                                        if msg.payload.is_empty() {
-                                            if needs_data {
-                                                trace!("Received empty ACK for command requiring data (0x{:02X}), continuing wait", msg.cmd);
-                                                continue;
-                                            }
-                                            // Empty payload for CID request is considered a valid ACK
-                                            debug!("Received empty ACK for CID request ({}), accepting", target_cid);
-                                            return Ok(Some(msg));
-                                        }
-
-                                        if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
-                                            let resp_cid = val.get("cid").and_then(|c| c.as_str());
-                                            if resp_cid == Some(target_cid) {
-                                                debug!("Received matching response for CID: {}", target_cid);
-                                                return Ok(Some(msg));
-                                            } else {
-                                                // Response for a different CID, ignore and keep waiting
-                                                trace!("Ignoring response for CID: {:?} (expected {})", resp_cid, target_cid);
-                                                continue;
-                                            }
-                                        }
-                                    } else {
-                                        // Request without CID (parent device request)
-                                        if msg.payload.is_empty() {
-                                            if needs_data {
-                                                trace!("Received empty ACK for parent command requiring data (0x{:02X}), continuing wait", msg.cmd);
-                                                continue;
-                                            }
-                                            return Ok(Some(msg));
-                                        }
-
-                                        if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
-                                            if val.get("cid").is_none() {
-                                                return Ok(Some(msg));
-                                            } else {
-                                                // Response with CID for a non-CID request, ignore
-                                                trace!("Ignoring response with CID for parent request");
-                                                continue;
-                                            }
-                                        }
-                                    }
-
-                                    return Ok(Some(msg));
-                                }
+                                Ok(msg) => match match_response(
+                                    &msg,
+                                    effective_cmd,
+                                    target_cid.as_deref(),
+                                ) {
+                                    MatchOutcome::Accept => return Ok(Some(msg)),
+                                    MatchOutcome::Continue => continue,
+                                },
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(
                                     skipped,
                                 )) => {
                                     warn!(
                                         "Response wait for device {} lagged, skipped {} broadcast messages",
-                                        self.inner.id, skipped
+                                        id_for_logs, skipped
                                     );
                                     continue;
                                 }
@@ -1619,7 +1607,7 @@ impl Device {
                 // Check if payload is valid JSON
                 if serde_json::from_slice::<Value>(&msg.payload).is_err() {
                     debug!("Non-JSON payload detected, broadcasting as ERR_JSON");
-                    let payload_hex = hex::encode(&msg.payload);
+                    let payload_hex = hex_encode(&msg.payload);
                     self.broadcast_error(
                         ERR_JSON,
                         Some(serde_json::json!({
@@ -1755,7 +1743,7 @@ impl Device {
                         Value::Null
                     } else {
                         serde_json::from_slice(&msg.payload).unwrap_or_else(
-                            |_| serde_json::json!({ keys::PAYLOAD_RAW: hex::encode(&msg.payload) }),
+                            |_| serde_json::json!({ keys::PAYLOAD_RAW: hex_encode(&msg.payload) }),
                         )
                     };
                     return Ok(Some(self.error_helper(ERR_DEVTYPE, Some(original_payload))));
@@ -1822,15 +1810,13 @@ impl Device {
         header_buf: [u8; 16],
     ) -> Result<Option<TuyaMessage>> {
         let (packet, header) = self.read_full_packet(stream, header_buf).await?;
-        trace!("Received packet (hex): {:?}", hex::encode(&packet));
+        trace!("Received packet (hex): {:?}", hex_encode(&packet));
 
         let mut decoded = self.unpack_and_check_dev22(&packet, header).await?;
 
         if !decoded.payload.is_empty() {
-            trace!("Raw payload (hex): {:?}", hex::encode(&decoded.payload));
-            decoded.payload = self
-                .decrypt_and_clean_payload(decoded.payload, decoded.prefix)
-                .await?;
+            trace!("Raw payload (hex): {:?}", hex_encode(&decoded.payload));
+            decoded.payload = self.decrypt_and_clean_payload(decoded.payload).await?;
         }
 
         Ok(Some(decoded))
@@ -1895,7 +1881,7 @@ impl Device {
         })
     }
 
-    async fn decrypt_and_clean_payload(&self, payload: Vec<u8>, _prefix: u32) -> Result<Vec<u8>> {
+    async fn decrypt_and_clean_payload(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         let (version, mut dev_type) = self.with_state(|s| (s.version, s.dev_type));
         let original_dev_type = dev_type;
         if dev_type == DeviceType::Auto {
@@ -1994,8 +1980,8 @@ impl Device {
                 Value::String(s) => response[keys::PAYLOAD_STR] = Value::String(s),
                 Value::Object(mut obj) => {
                     if let Some(raw) = obj
-                        .remove("data")
-                        .or_else(|| obj.remove("payload"))
+                        .remove(keys::IN_DATA)
+                        .or_else(|| obj.remove(keys::IN_PAYLOAD))
                         .or_else(|| obj.remove(keys::PAYLOAD_RAW))
                     {
                         response[keys::PAYLOAD_RAW] = raw;
@@ -2021,6 +2007,85 @@ impl Device {
             ..Default::default()
         }
     }
+}
+
+/// Verdict from `match_response` — either accept the broadcast message as
+/// the current request's response, or skip it and keep waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchOutcome {
+    Accept,
+    Continue,
+}
+
+/// Decides whether a broadcast message is the response we're waiting for.
+///
+/// Matching is by command id + optional CID; the Tuya LAN protocol does not
+/// carry a reliable request seqno (see the module-level note in
+/// `process_command`), so this is the strongest correlation available.
+///
+/// Pure / synchronous on purpose: keeps the actor's `select!` body small
+/// and lets us exhaustively unit-test the decision table.
+fn match_response(msg: &TuyaMessage, effective_cmd: u32, target_cid: Option<&str>) -> MatchOutcome {
+    // Device-reported error responses arrive as cmd=0; surface them as the
+    // current request's outcome regardless of CID.
+    if msg.cmd == 0 {
+        debug!("Device returned error response (cmd 0), accepting");
+        return MatchOutcome::Accept;
+    }
+
+    let cmd_matches = msg.cmd == effective_cmd || msg.cmd == CommandType::Status as u32;
+    if !cmd_matches {
+        return MatchOutcome::Continue;
+    }
+
+    let needs_data = MANDATORY_DATA_CMDS.contains(&msg.cmd);
+
+    if let Some(target_cid) = target_cid {
+        // Sub-device request: response must carry the same CID.
+        if msg.payload.is_empty() {
+            if needs_data {
+                trace!(
+                    "Received empty ACK for CID command requiring data (0x{:02X}), continuing wait",
+                    msg.cmd
+                );
+                return MatchOutcome::Continue;
+            }
+            debug!("Received empty ACK for CID request ({target_cid}), accepting");
+            return MatchOutcome::Accept;
+        }
+        if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
+            let resp_cid = val.get("cid").and_then(|c| c.as_str());
+            if resp_cid == Some(target_cid) {
+                debug!("Received matching response for CID: {target_cid}");
+                return MatchOutcome::Accept;
+            }
+            trace!("Ignoring response for CID: {resp_cid:?} (expected {target_cid})");
+            return MatchOutcome::Continue;
+        }
+        // Non-JSON payload on a CID request — accept rather than spin.
+        return MatchOutcome::Accept;
+    }
+
+    // Parent-device request: response must NOT carry a CID.
+    if msg.payload.is_empty() {
+        if needs_data {
+            trace!(
+                "Received empty ACK for parent command requiring data (0x{:02X}), continuing wait",
+                msg.cmd
+            );
+            return MatchOutcome::Continue;
+        }
+        return MatchOutcome::Accept;
+    }
+    if let Ok(val) = serde_json::from_slice::<Value>(&msg.payload) {
+        if val.get("cid").is_none() {
+            return MatchOutcome::Accept;
+        }
+        trace!("Ignoring response with CID for parent request");
+        return MatchOutcome::Continue;
+    }
+    // Non-JSON payload on a parent request — accept rather than spin.
+    MatchOutcome::Accept
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2089,10 +2154,111 @@ fn decide_discovery_notify_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        ADDR_AUTO, DiscoveryNotifyAction, SCANNER_BYPASS_BASE_COOLDOWN, SLEEP_RECONNECT_MAX,
-        decide_discovery_notify_action, scanner_bypass_cooldown,
+        ADDR_AUTO, DiscoveryNotifyAction, MatchOutcome, SCANNER_BYPASS_BASE_COOLDOWN,
+        SLEEP_RECONNECT_MAX, decide_discovery_notify_action, match_response,
+        scanner_bypass_cooldown,
     };
+    use crate::protocol::{CommandType, PREFIX_55AA, TuyaMessage};
     use std::time::{Duration, Instant};
+
+    fn make_msg(cmd: u32, payload: &[u8]) -> TuyaMessage {
+        TuyaMessage {
+            seqno: 0,
+            cmd,
+            retcode: None,
+            payload: payload.to_vec(),
+            prefix: PREFIX_55AA,
+            iv: None,
+        }
+    }
+
+    #[test]
+    fn match_cmd_zero_is_always_accept() {
+        let m = make_msg(0, b"{}");
+        assert_eq!(match_response(&m, 0x0d, None), MatchOutcome::Accept);
+        assert_eq!(
+            match_response(&m, 0x0d, Some("cid_a")),
+            MatchOutcome::Accept
+        );
+    }
+
+    #[test]
+    fn match_wrong_cmd_continues() {
+        let m = make_msg(0x09, b"{}"); // HeartBeat, not what we sent
+        assert_eq!(
+            match_response(&m, CommandType::DpQuery as u32, None),
+            MatchOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn match_status_cmd_is_accepted_as_response() {
+        // Devices commonly answer with a Status push regardless of what was
+        // sent — match_response accepts that as the response.
+        let m = make_msg(CommandType::Status as u32, b"{\"dps\":{\"1\":true}}");
+        assert_eq!(
+            match_response(&m, CommandType::DpQueryNew as u32, None),
+            MatchOutcome::Accept
+        );
+    }
+
+    #[test]
+    fn match_parent_request_rejects_cid_response() {
+        let m = make_msg(
+            CommandType::DpQueryNew as u32,
+            b"{\"cid\":\"sub_a\",\"dps\":{}}",
+        );
+        assert_eq!(
+            match_response(&m, CommandType::DpQueryNew as u32, None),
+            MatchOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn match_cid_request_accepts_matching_cid() {
+        let m = make_msg(
+            CommandType::DpQueryNew as u32,
+            b"{\"cid\":\"sub_a\",\"dps\":{}}",
+        );
+        assert_eq!(
+            match_response(&m, CommandType::DpQueryNew as u32, Some("sub_a")),
+            MatchOutcome::Accept
+        );
+    }
+
+    #[test]
+    fn match_cid_request_rejects_other_cid() {
+        let m = make_msg(
+            CommandType::DpQueryNew as u32,
+            b"{\"cid\":\"sub_b\",\"dps\":{}}",
+        );
+        assert_eq!(
+            match_response(&m, CommandType::DpQueryNew as u32, Some("sub_a")),
+            MatchOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn match_cid_request_accepts_empty_ack() {
+        // Many gateways send an empty ack for CID-targeted writes — accept
+        // it rather than wait for data that may never come.
+        let m = make_msg(CommandType::ControlNew as u32, b"");
+        assert_eq!(
+            match_response(&m, CommandType::ControlNew as u32, Some("sub_a")),
+            MatchOutcome::Accept
+        );
+    }
+
+    #[test]
+    fn match_mandatory_data_cmd_rejects_empty_ack() {
+        // LanExtStream is in MANDATORY_DATA_CMDS — empty payload must NOT be
+        // taken as the response.
+        let m = make_msg(CommandType::LanExtStream as u32, b"");
+        assert_eq!(
+            match_response(&m, CommandType::LanExtStream as u32, None),
+            MatchOutcome::Continue
+        );
+    }
 
     /// Wrapper that fixes the cooldown-related inputs at "first call ever"
     /// (no prior bypass, no failures) so the legacy four-arg call sites stay
@@ -2299,7 +2465,7 @@ mod tests {
         Device::builder("test_lifecycle_id", b"0123456789abcdef".to_vec())
             .address("203.0.113.1") // TEST-NET-3, RFC 5737
             .persist(false)
-            .run()
+            .build()
     }
 
     #[test]
@@ -2362,6 +2528,66 @@ mod tests {
                 .await
                 .expect("close_notify did not wake waiter within 200ms")
                 .expect("waiter task panicked");
+        });
+    }
+
+    // M5.5: state-machine invariants for ConnectionState transitions driven
+    // by fire_close / fire_stop. Hand-rolled exhaustive table rather than
+    // pulling in proptest as a dev-dep for a 4-state machine.
+
+    #[test]
+    fn stopped_is_terminal_for_fire_close() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let device = make_test_device();
+            device.fire_stop();
+            assert!(device.is_stopped());
+            // Calling close after stop must NOT resurrect the device into
+            // any state other than Stopped.
+            device.fire_close();
+            assert!(device.is_stopped(), "fire_close on Stopped must be a no-op");
+        });
+    }
+
+    #[test]
+    fn fire_stop_is_idempotent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let device = make_test_device();
+            device.fire_stop();
+            let token1_cancelled = device.inner.cancel_token.is_cancelled();
+            device.fire_stop();
+            let token2_cancelled = device.inner.cancel_token.is_cancelled();
+            assert!(token1_cancelled && token2_cancelled);
+            assert!(device.is_stopped());
+        });
+    }
+
+    #[test]
+    fn fire_close_does_not_set_stopped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let device = make_test_device();
+            // Initial state is Disconnected (test address can't connect).
+            assert!(!device.is_stopped());
+            device.fire_close();
+            assert!(
+                !device.is_stopped(),
+                "fire_close should leave state available for restart, not move to Stopped"
+            );
+            assert!(
+                !device.inner.cancel_token.is_cancelled(),
+                "fire_close must not cancel the connection task"
+            );
         });
     }
 

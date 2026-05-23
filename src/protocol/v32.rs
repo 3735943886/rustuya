@@ -1,7 +1,8 @@
 use crate::crypto::TuyaCipher;
 use crate::error::Result;
 use crate::protocol::{
-    CommandType, NO_PROTOCOL_HEADER_CMDS, TuyaProtocol, Version, create_base_payload,
+    CommandType, NO_PROTOCOL_HEADER_CMDS, TuyaProtocol, Version, apply_update_dps,
+    create_base_payload, legacy_lan_ext_stream, strip_status_heartbeat,
 };
 use log::trace;
 use serde_json::Value;
@@ -40,40 +41,21 @@ impl TuyaProtocol for ProtocolV32 {
 
         // Payload formation follows device22 (ProtocolDev22)
         match command {
-            CommandType::UpdateDps => {
-                payload.retain(|k, _| k == "cid");
-                let d = data.unwrap_or_else(|| serde_json::json!([18, 19, 20]));
-                payload.insert("dpId".into(), d);
-            }
-            CommandType::Control | CommandType::ControlNew => {
+            CommandType::UpdateDps => apply_update_dps(&mut payload, data),
+            CommandType::Control | CommandType::ControlNew | CommandType::DpQueryNew => {
                 payload.remove("gwId");
             }
             CommandType::DpQuery => {
+                // v3.2 differs from v3.1/v3.3: drop gwId and default `dps`.
                 payload.remove("gwId");
                 if payload.get("dps").is_none() {
                     payload.insert("dps".into(), serde_json::json!({"1": null}));
                 }
             }
-            CommandType::DpQueryNew => {
-                payload.remove("gwId");
-            }
             CommandType::LanExtStream => {
-                // For LanExtStream in v3.2 and below, we keep everything at root
-                payload.clear();
-                if let Some(Value::Object(mut data_obj)) = data {
-                    if let Some(req_type) = data_obj.remove("reqType") {
-                        payload.insert("reqType".into(), req_type);
-                    }
-                    // Move remaining fields from data_obj to payload root
-                    for (k, v) in data_obj {
-                        payload.insert(k, v);
-                    }
-                }
+                payload = legacy_lan_ext_stream(data);
             }
-            CommandType::Status | CommandType::HeartBeat => {
-                payload.remove("uid");
-                payload.remove("t");
-            }
+            CommandType::Status | CommandType::HeartBeat => strip_status_heartbeat(&mut payload),
             _ => {
                 // Default: gwId, devId, uid, cid, t, dps
             }

@@ -1,7 +1,8 @@
 use crate::crypto::TuyaCipher;
 use crate::error::Result;
 use crate::protocol::{
-    CommandType, NO_PROTOCOL_HEADER_CMDS, TuyaProtocol, Version, create_base_payload,
+    CommandType, NO_PROTOCOL_HEADER_CMDS, TuyaProtocol, Version, apply_update_dps,
+    create_base_payload, modern_control_envelope, modern_lan_ext_stream, strip_status_heartbeat,
 };
 use log::trace;
 use serde_json::Value;
@@ -43,43 +44,17 @@ impl TuyaProtocol for ProtocolV35 {
             create_base_payload(device_id, cid, data.clone(), Some(t.to_string().into()));
 
         match command {
-            CommandType::UpdateDps => {
-                payload.retain(|k, _| k == "cid");
-                let d = data.unwrap_or_else(|| serde_json::json!([18, 19, 20]));
-                payload.insert("dpId".into(), d);
-            }
+            CommandType::UpdateDps => apply_update_dps(&mut payload, data),
             CommandType::Control | CommandType::ControlNew => {
-                payload.clear();
-                payload.insert("protocol".into(), 5.into());
-                payload.insert("t".into(), t.into());
-
-                let mut data_obj = serde_json::Map::new();
-                if let Some(c) = cid {
-                    data_obj.insert("cid".into(), c.into());
-                    data_obj.insert("ctype".into(), 0.into());
-                }
-                if let Some(d) = data {
-                    data_obj.insert("dps".into(), d);
-                }
-                payload.insert("data".into(), Value::Object(data_obj));
+                payload = modern_control_envelope(t, cid, data);
             }
             CommandType::LanExtStream => {
-                // For LanExtStream in v3.5, we only keep reqType at root and move everything else under "data"
-                payload.clear();
-                if let Some(Value::Object(mut data_obj)) = data {
-                    if let Some(req_type) = data_obj.remove("reqType") {
-                        payload.insert("reqType".into(), req_type);
-                    }
-                    payload.insert("data".into(), Value::Object(data_obj));
-                }
+                payload = modern_lan_ext_stream(data);
             }
             CommandType::DpQuery | CommandType::DpQueryNew => {
                 payload.retain(|k, _| k == "cid" || k == "dps");
             }
-            CommandType::Status | CommandType::HeartBeat => {
-                payload.remove("uid");
-                payload.remove("t");
-            }
+            CommandType::Status | CommandType::HeartBeat => strip_status_heartbeat(&mut payload),
             _ => {
                 // Default: gwId, devId, uid, cid, t, dps
             }

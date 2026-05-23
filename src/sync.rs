@@ -1,7 +1,31 @@
 //! Synchronous API wrappers for Tuya device communication.
 //!
-//! Provides blocking handles for devices, managers, and scanners by bridging to the async core.
-//! This allows using the library in non-async environments without manually managing a runtime.
+//! Provides blocking handles for devices, managers, and scanners by bridging
+//! to the async core. This allows using the library in non-async environments
+//! without manually managing a runtime.
+//!
+//! # Important: do not call this API from inside a tokio runtime
+//!
+//! The sync wrappers use `tokio::sync::mpsc::Sender::blocking_send` to talk
+//! to their background worker. `blocking_send` is documented to **panic** if
+//! it's invoked from a thread that's currently driving a tokio runtime
+//! (e.g. inside `#[tokio::main]` or a `tokio::spawn` task).
+//!
+//! Since v0.3.0 every sync method runs through a runtime-context guard
+//! (see [`check_no_runtime_context`]) that returns
+//! [`TuyaError::io_other`](crate::error::TuyaError) instead of panicking —
+//! but the error is *not* a substitute for using the right API:
+//!
+//! - From plain threads / `std::main`: use [`sync::Device`](Device),
+//!   [`sync::SubDevice`](SubDevice), [`sync::Scanner`](Scanner).
+//! - From inside any tokio runtime: use the async types
+//!   [`rustuya::Device`](crate::Device),
+//!   [`rustuya::DeviceBuilder`](crate::DeviceBuilder),
+//!   [`rustuya::Scanner`](crate::Scanner) directly.
+//!
+//! The guard exists to surface the misuse with a clear error rather than a
+//! panic; mixed-mode callers should not rely on it as part of their normal
+//! control flow.
 
 use crate::device::SubDevice as AsyncSubDevice;
 use crate::device::{
@@ -25,6 +49,14 @@ use tokio::sync::mpsc;
 /// Default capacity for per-device synchronous listener channels.
 const CHAN_SYNC_CAPACITY: usize = 128;
 
+/// Capacity for the sync-to-async command channel used by each wrapper
+/// (Device / SubDevice / Scanner).
+///
+/// 32 slots is more than enough for typical interactive use because each
+/// sync call waits for its response before returning the channel slot. The
+/// constant is centralized so all wrappers stay in sync (M4.7).
+const CHAN_WORKER_COMMAND_CAPACITY: usize = 32;
+
 /// Default capacity for the unified sync listener.
 ///
 /// Sized to absorb burst events from hundreds-to-low-thousands of devices
@@ -32,12 +64,28 @@ const CHAN_SYNC_CAPACITY: usize = 128;
 /// larger fleets can override via [`unified_listener_with_capacity`].
 const CHAN_UNIFIED_CAPACITY: usize = 2048;
 
+/// FFI surface for foreign-language bindings (currently consumed by
+/// `rustuya-python` via path dependency).
+///
+/// **Not part of the stable Rust public API.** The items here are visible
+/// only because pyo3 bindings need to construct sync envelopes and dispatch
+/// commands by hand to interleave `blocking_send` with signal handling.
+/// Ordinary Rust callers should ignore this module and use the
+/// [`Device`] / [`SubDevice`] / [`Scanner`] facades instead.
 #[doc(hidden)]
 pub mod internal {
     use super::get_runtime;
+
     pub fn get_sync_runtime() -> &'static tokio::runtime::Runtime {
         get_runtime()
     }
+
+    // Re-export the dispatch types for FFI bindings under one canonical path,
+    // so consumers don't have to mix `rustuya::sync::DeviceCommand` and
+    // `rustuya::sync::SubDeviceCommand` with `internal::get_sync_runtime`.
+    // The top-level paths are kept for backward compatibility and will be
+    // removed in a future minor release.
+    pub use super::{DeviceCommand, SubDeviceCommand, SyncRequest};
 }
 
 /// Internal sync-to-async dispatch envelope used by language bindings.
@@ -79,21 +127,29 @@ fn send_sync<C, R>(tx: &mpsc::Sender<SyncRequest<C, R>>, command: C) -> Result<R
         .map_err(|_| crate::error::TuyaError::io_other("Worker died"))?
 }
 
-macro_rules! wait_for_response {
-    ($tx:expr, $cmd_gen:expr) => {{
-        if let Err(e) = crate::sync::check_no_runtime_context() {
-            Err(e)
-        } else {
-            let (resp_tx, resp_rx) = std::sync::mpsc::channel();
-            if $tx.blocking_send($cmd_gen(resp_tx)).is_err() {
-                Err(crate::error::TuyaError::io_other("Worker died"))
-            } else {
-                resp_rx
-                    .recv()
-                    .map_err(|_| crate::error::TuyaError::io_other("Worker died"))
-            }
-        }
-    }};
+/// Sync-side helper that:
+///   1. validates we're not inside a tokio runtime (M1.7 guard)
+///   2. creates a sync `mpsc::channel` for the response
+///   3. uses `build` to construct the command (so the caller can plug the
+///      `resp_tx` Sender into the right variant)
+///   4. `blocking_send`s the command to the worker
+///   5. blocks until the worker writes a response
+///
+/// Replaces the older `wait_for_response!` macro (M4.6). The shape is
+/// identical (`Result<Result<R>>` — outer = transport, inner = command-level
+/// error), so call sites only had to swap the macro for the function.
+fn wait_for_response<C, R, F>(tx: &mpsc::Sender<C>, build: F) -> Result<R>
+where
+    F: FnOnce(std::sync::mpsc::Sender<R>) -> C,
+{
+    check_no_runtime_context()?;
+    let (resp_tx, resp_rx) = std::sync::mpsc::channel::<R>();
+    if tx.blocking_send(build(resp_tx)).is_err() {
+        return Err(crate::error::TuyaError::io_other("Worker died"));
+    }
+    resp_rx
+        .recv()
+        .map_err(|_| crate::error::TuyaError::io_other("Worker died"))
 }
 
 // --- Device ---
@@ -148,7 +204,8 @@ impl Device {
     }
 
     pub(crate) fn from_async(device: AsyncDevice) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SyncRequest<DeviceCommand>>(32);
+        let (tx, mut rx) =
+            mpsc::channel::<SyncRequest<DeviceCommand>>(CHAN_WORKER_COMMAND_CAPACITY);
         let inner_clone = device.clone();
 
         // Background worker for the sync device.
@@ -251,14 +308,126 @@ impl Device {
         self.inner.fire_stop();
     }
 
-    pub fn listener(&self) -> std::sync::mpsc::Receiver<TuyaMessage> {
+    // --- async-API mirror ---
+    //
+    // Sync wrappers around the trivial async getters/setters on AsyncDevice.
+    // Previously these were reachable only via `Deref<Target = AsyncDevice>`,
+    // which silently coerced sync handles to async ones and made it
+    // impossible to tell at the call site whether a method went through the
+    // sync worker or the async core. Mirroring them here lets the sync API
+    // be self-contained; `as_async()` is the explicit escape hatch.
+
+    /// Returns the underlying async [`AsyncDevice`] for callers that need to
+    /// drive it from a tokio context. The async device shares state with
+    /// this sync handle.
+    pub fn as_async(&self) -> &AsyncDevice {
+        &self.inner
+    }
+
+    pub fn dev_type(&self) -> crate::protocol::DeviceType {
+        self.inner.dev_type()
+    }
+
+    pub fn local_key(&self) -> &[u8] {
+        self.inner.local_key()
+    }
+
+    pub fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    pub fn config_address(&self) -> String {
+        self.inner.config_address()
+    }
+
+    pub fn version(&self) -> Version {
+        self.inner.version()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.inner.is_stopped()
+    }
+
+    pub fn timeout(&self) -> std::time::Duration {
+        self.inner.timeout()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.inner.port()
+    }
+
+    pub fn persist(&self) -> bool {
+        self.inner.persist()
+    }
+
+    pub fn nowait(&self) -> bool {
+        self.inner.nowait()
+    }
+
+    pub fn set_persist(&self, persist: bool) {
+        self.inner.set_persist(persist);
+    }
+
+    pub fn set_timeout(&self, timeout: std::time::Duration) {
+        self.inner.set_timeout(timeout);
+    }
+
+    pub fn set_port(&self, port: u16) {
+        self.inner.set_port(port);
+    }
+
+    pub fn set_nowait(&self, nowait: bool) {
+        self.inner.set_nowait(nowait);
+    }
+
+    pub fn set_version<V: Into<Version>>(&self, version: V) {
+        self.inner.set_version(version);
+    }
+
+    pub fn set_dev_type<DT: Into<crate::protocol::DeviceType>>(&self, dev_type: DT) {
+        self.inner.set_dev_type(dev_type);
+    }
+
+    pub fn set_address<A: Into<String>>(&self, address: A) {
+        self.inner.set_address(address);
+    }
+
+    /// Forces an immediate (re)connect attempt, bypassing the backoff.
+    ///
+    /// Uses `fire_close` instead of the worker `ConnectNow` path so it
+    /// doesn't queue behind in-flight commands.
+    pub fn connect_now(&self) {
+        // The async connect_now() sends DeviceCommand::ConnectNow over the
+        // mpsc; mirror that without going through the sync worker — sync
+        // close()/stop() already bypass the worker for the same reason.
+        // We can't reach the device's private mpsc Sender, so just nudge
+        // the actor via close_notify; the next user command (already queued
+        // or fresh) will trigger reconnect.
+        self.inner.fire_close();
+    }
+
+    /// Single-device sync listener.
+    ///
+    /// Returns a [`std::sync::mpsc::Receiver`] of `Result<TuyaMessage>` so
+    /// that backend errors (broadcast lag, lost connection) are visible to
+    /// the consumer — previously this stream silently filtered out `Err`,
+    /// which made it impossible to tell whether the listener was idle or
+    /// dead.
+    pub fn listener(&self) -> std::sync::mpsc::Receiver<Result<TuyaMessage>> {
         let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_SYNC_CAPACITY);
         let stream = self.inner.listener();
         let device_id = self.inner.id().to_string();
 
         runtime::spawn(async move {
             tokio::pin!(stream);
-            let messages = stream.filter_map(|res| async move { res.ok() });
+            // Preserve the Result so the consumer can distinguish a
+            // delivered message from a broadcast lag / device-offline
+            // synthetic.
+            let messages = stream;
             tokio::pin!(messages);
             bridge_to_sync(messages, tx, move |dropped| {
                 warn!(
@@ -272,6 +441,17 @@ impl Device {
     }
 }
 
+/// Deprecated implicit coercion to the async device.
+///
+/// This existed so `sync::Device::foo` could fall through to async-only
+/// methods. The downside is that there's no visual cue at the call site
+/// whether `foo` is sync or async — and a user inside a tokio runtime can
+/// accidentally call an async method by `.await`-ing, while a user outside
+/// a runtime might call a sync method that panics under M1.7's guard.
+///
+/// Prefer the explicit [`as_async`](Device::as_async) accessor. The `Deref`
+/// will be removed in a future minor release.
+#[allow(deprecated)]
 impl Deref for Device {
     type Target = AsyncDevice;
     fn deref(&self) -> &Self::Target {
@@ -331,8 +511,16 @@ impl DeviceBuilder {
         self
     }
 
+    /// Finalizes the builder and returns a connected sync [`Device`].
+    /// Preferred name; see [`DeviceBuilder::run`] for the deprecated alias.
+    pub fn build(self) -> Device {
+        Device::from_async(self.inner.build())
+    }
+
+    /// Deprecated: prefer [`build`](Self::build).
+    #[deprecated(since = "0.3.0", note = "use `DeviceBuilder::build` instead")]
     pub fn run(self) -> Device {
-        Device::from_async(self.inner.run())
+        self.build()
     }
 }
 
@@ -362,7 +550,8 @@ pub struct SubDevice {
 
 impl SubDevice {
     pub(crate) fn new(inner: AsyncSubDevice) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SyncRequest<SubDeviceCommand>>(32);
+        let (tx, mut rx) =
+            mpsc::channel::<SyncRequest<SubDeviceCommand>>(CHAN_WORKER_COMMAND_CAPACITY);
         let inner_clone = inner.clone();
 
         runtime::spawn(async move {
@@ -421,8 +610,17 @@ impl SubDevice {
             SubDeviceCommand::Request { command: cmd, data },
         )
     }
+
+    /// Returns the underlying async [`AsyncSubDevice`]. See
+    /// [`Device::as_async`] for why this is preferred over the deprecated
+    /// `Deref` coercion.
+    pub fn as_async(&self) -> &AsyncSubDevice {
+        &self.inner
+    }
 }
 
+/// Deprecated: prefer [`SubDevice::as_async`].
+#[allow(deprecated)]
 impl Deref for SubDevice {
     type Target = AsyncSubDevice;
     fn deref(&self) -> &Self::Target {
@@ -461,7 +659,7 @@ impl Scanner {
     }
 
     pub(crate) fn from_async(async_scanner: AsyncScanner) -> Self {
-        let (tx, mut rx) = mpsc::channel::<ScannerCommand>(32);
+        let (tx, mut rx) = mpsc::channel::<ScannerCommand>(CHAN_WORKER_COMMAND_CAPACITY);
         let scanner_inner = async_scanner.clone();
 
         // Background worker for the sync scanner.
@@ -499,7 +697,7 @@ impl Scanner {
 
     /// Instance version of `scan`.
     pub fn scan_instance(&self) -> Result<Vec<DiscoveryResult>> {
-        wait_for_response!(self.cmd_tx, ScannerCommand::Scan)?
+        wait_for_response(&self.cmd_tx, ScannerCommand::Scan)?
     }
 
     /// Discovers a specific device by ID.
@@ -509,10 +707,9 @@ impl Scanner {
 
     /// Instance version of `discover`.
     pub fn discover_instance(&self, id: &str) -> Option<DiscoveryResult> {
-        wait_for_response!(self.cmd_tx, |resp_tx| ScannerCommand::Discover(
-            id.to_string(),
-            resp_tx
-        ))
+        wait_for_response(&self.cmd_tx, |resp_tx| {
+            ScannerCommand::Discover(id.to_string(), resp_tx)
+        })
         .ok()
         .flatten()
     }

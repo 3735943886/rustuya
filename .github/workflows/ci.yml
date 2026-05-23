@@ -25,6 +25,25 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+  supply-chain:
+    # Advisories + license/source policy. Non-blocking advisory failures by
+    # default — they're useful as a signal but shouldn't break unrelated PRs
+    # the moment a new RUSTSEC advisory is published. Tighten over time.
+    needs: [rust-checks]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit || true
+      - name: cargo audit
+        run: cargo audit --deny warnings || true
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny || true
+      - name: cargo deny check
+        run: cargo deny check advisories bans sources || true
+
   linux:
     needs: [rust-checks]
     runs-on: ${{ matrix.platform.runner }}

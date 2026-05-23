@@ -3,6 +3,20 @@
 //! Handles AES-128-ECB (v3.1, v3.3) and AES-128-GCM (v3.4, v3.5) encryption and decryption.
 
 use crate::error::{Result, TuyaError};
+
+/// Lowercase hex encoding of a byte slice. Replaces the `hex` crate
+/// dependency (M4.8) — the crate brought in no transitive deps and was
+/// used only for `encode`, so a four-line inline implementation is enough.
+#[must_use]
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(TABLE[(b >> 4) as usize] as char);
+        out.push(TABLE[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 use aes::Aes128;
 use aes_gcm::{
     Aes128Gcm, Nonce,

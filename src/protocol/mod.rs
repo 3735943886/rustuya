@@ -94,6 +94,81 @@ pub fn create_base_payload(
     payload
 }
 
+// ---------------------------------------------------------------------------
+// Shared payload-transformation helpers (M4.2)
+//
+// Common arms factored out of v3.1/v3.2/v3.3/v3.4/v3.5 `generate_payload`
+// implementations. Per-version differences (e.g. v3.2's DpQuery default-dps
+// injection, v3.1's DpQuery "keep all" stance) stay inline in the specific
+// version's match arm.
+// ---------------------------------------------------------------------------
+
+/// `UpdateDps` payload shape — identical across all currently-supported
+/// protocol versions: keep only `cid`, then insert `dpId` from `data` (or a
+/// default list).
+pub(crate) fn apply_update_dps(payload: &mut Map<String, Value>, data: Option<Value>) {
+    payload.retain(|k, _| k == "cid");
+    let d = data.unwrap_or_else(|| serde_json::json!([18, 19, 20]));
+    payload.insert("dpId".into(), d);
+}
+
+/// `Status` / `HeartBeat` strip — same across all versions: device doesn't
+/// echo `uid` or `t` on these.
+pub(crate) fn strip_status_heartbeat(payload: &mut Map<String, Value>) {
+    payload.remove("uid");
+    payload.remove("t");
+}
+
+/// v3.4/v3.5 modern `Control` / `ControlNew` envelope:
+/// `{ protocol: 5, t, data: { cid?, ctype?, dps? } }`
+pub(crate) fn modern_control_envelope(
+    t: u64,
+    cid: Option<&str>,
+    data: Option<Value>,
+) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert("protocol".into(), 5.into());
+    payload.insert("t".into(), t.into());
+
+    let mut data_obj = Map::new();
+    if let Some(c) = cid {
+        data_obj.insert("cid".into(), c.into());
+        data_obj.insert("ctype".into(), 0.into());
+    }
+    if let Some(d) = data {
+        data_obj.insert("dps".into(), d);
+    }
+    payload.insert("data".into(), Value::Object(data_obj));
+    payload
+}
+
+/// v3.4/v3.5 modern `LanExtStream` envelope: `{ reqType, data: {...rest} }`.
+pub(crate) fn modern_lan_ext_stream(data: Option<Value>) -> Map<String, Value> {
+    let mut payload = Map::new();
+    if let Some(Value::Object(mut data_obj)) = data {
+        if let Some(req_type) = data_obj.remove("reqType") {
+            payload.insert("reqType".into(), req_type);
+        }
+        payload.insert("data".into(), Value::Object(data_obj));
+    }
+    payload
+}
+
+/// v3.1/v3.2/v3.3 legacy `LanExtStream`: flatten data fields back onto the
+/// payload root (no `data` wrapper).
+pub(crate) fn legacy_lan_ext_stream(data: Option<Value>) -> Map<String, Value> {
+    let mut payload = Map::new();
+    if let Some(Value::Object(mut data_obj)) = data {
+        if let Some(req_type) = data_obj.remove("reqType") {
+            payload.insert("reqType".into(), req_type);
+        }
+        for (k, v) in data_obj {
+            payload.insert(k, v);
+        }
+    }
+    payload
+}
+
 pub mod dev22;
 pub mod v31;
 pub mod v32;

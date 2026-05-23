@@ -339,7 +339,7 @@ impl Device {
             builder = builder.timeout(Duration::from_secs_f64(secs));
         }
 
-        let inner = py.detach(|| builder.run());
+        let inner = py.detach(|| builder.build());
         Ok(Device { inner })
     }
 
@@ -593,7 +593,13 @@ pub fn maximize_fd_limit() -> PyResult<()> {
 #[pyclass]
 pub struct DeviceEventReceiver {
     id: String,
-    inner: Arc<Mutex<std::sync::mpsc::Receiver<::rustuya::protocol::TuyaMessage>>>,
+    inner: Arc<
+        Mutex<
+            std::sync::mpsc::Receiver<
+                Result<::rustuya::protocol::TuyaMessage, ::rustuya::error::TuyaError>,
+            >,
+        >,
+    >,
 }
 
 #[pymethods]
@@ -612,9 +618,25 @@ impl DeviceEventReceiver {
         py: Python<'py>,
         timeout_ms: Option<u64>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        match receive_event(py, &self.inner, timeout_ms)? {
-            Some(msg) => Ok(Some(message_to_dict(py, &self.id, &msg)?)),
-            None => Ok(None),
+        // After M3.6 the underlying channel carries Result; skip Err items
+        // here to preserve the historical "yields plain messages" iterator
+        // shape, but log them so they're not invisible. Bindings that want
+        // to react to errors can use unified_listener instead.
+        loop {
+            match receive_event(py, &self.inner, timeout_ms)? {
+                Some(Ok(msg)) => return Ok(Some(message_to_dict(py, &self.id, &msg)?)),
+                Some(Err(e)) => {
+                    log::warn!("Listener error for device {}: {}", self.id, e);
+                    if timeout_ms.is_some() {
+                        // With a timeout the caller expects at most one
+                        // recv attempt; propagating an error as None would
+                        // be misleading, so we keep looping until the
+                        // deadline naturally expires.
+                        continue;
+                    }
+                }
+                None => return Ok(None),
+            }
         }
     }
 }

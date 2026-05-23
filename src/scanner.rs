@@ -183,11 +183,14 @@ impl Drop for ScannerState {
 pub struct Scanner {
     inner: Arc<ScannerState>,
     /// Timeout for discovery
-    pub timeout: Duration,
-    /// Local address to bind to
-    pub bind_addr: String,
-    /// UDP ports to scan (default: 6666, 6667, 7000)
-    pub ports: Vec<u16>,
+    // Direct-mutation of these fields previously bypassed
+    // `ensure_passive_listener` — e.g. a user assigning `scanner.ports = …`
+    // would change `self.ports` without spawning receivers on the new ports.
+    // Make them private and route all mutation through the `set_*` methods
+    // (which run the listener reconciliation).
+    timeout: Duration,
+    bind_addr: String,
+    ports: Vec<u16>,
 }
 
 impl Default for Scanner {
@@ -318,7 +321,9 @@ impl Scanner {
     /// Decodes one UDP packet and folds it into the discovery cache.
     /// Extracted so first-start and shared-channel paths use identical logic.
     fn dispatch_packet(state: &Arc<ScannerState>, data: &[u8]) {
-        let Some(res) = parse_packet(data) else { return };
+        let Some(res) = parse_packet(data) else {
+            return;
+        };
         let mut guard = state.cache.write();
 
         // Keep memory clean by removing expired entries on every update.
@@ -438,6 +443,24 @@ impl Scanner {
         for task in self.inner.receiver_tasks.write().drain(..) {
             task.abort();
         }
+    }
+
+    /// Returns the discovery timeout this scanner uses.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Returns the bind address this scanner uses.
+    #[must_use]
+    pub fn bind_addr(&self) -> &str {
+        &self.bind_addr
+    }
+
+    /// Returns the UDP ports this scanner listens on.
+    #[must_use]
+    pub fn ports(&self) -> &[u16] {
+        &self.ports
     }
 
     /// Sets the discovery timeout.
@@ -740,7 +763,7 @@ impl Scanner {
         self.discover_device_internal(device_id, false, None).await
     }
 
-    pub async fn discover_device_internal(
+    pub(crate) async fn discover_device_internal(
         &self,
         device_id: &str,
         force_scan: bool,
@@ -968,7 +991,7 @@ fn parse_packet(data: &[u8]) -> Option<DiscoveryResult> {
                     ) {
                         trace!(
                             "unpack_message failed with key {:?}: {e}",
-                            key.map(hex::encode),
+                            key.map(crate::crypto::hex_encode),
                         );
                     }
                 }
@@ -1155,5 +1178,45 @@ mod tests {
         let third = state.current_cancel_token();
         assert!(!third.is_cancelled());
     }
-}
 
+    // M2.6 regression: concurrent scan_stream callers must not both claim
+    // the "active scan" slot via load-then-store. compare_exchange ensures
+    // exactly one wins; the rest join. Exercised at the AtomicBool level
+    // since spawning real discovery loops requires sockets.
+    #[test]
+    fn active_scanning_compare_exchange_is_single_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        let state = Arc::new(ScannerState::new());
+        let winners = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let s = state.clone();
+            let w = winners.clone();
+            handles.push(std::thread::spawn(move || {
+                if s.active_scanning
+                    .compare_exchange(false, true, O::SeqCst, O::SeqCst)
+                    .is_ok()
+                {
+                    w.fetch_add(1, O::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            winners.load(O::SeqCst),
+            1,
+            "exactly one caller should claim the active scan slot"
+        );
+        assert!(state.active_scanning.load(O::SeqCst));
+    }
+
+    // M5.4: scan_timeout_leaves_room invariant is covered above. Other
+    // scanner-integration items (set_ports delivering on new ports,
+    // stop+restart cycle) require real socket binding, which we don't do in
+    // unit tests; lifecycle-level coverage is in
+    // `packet_tx_lifecycle_persists_then_clears_on_stop` and
+    // `reset_cancel_token_yields_fresh_uncancelled_token` above.
+}
