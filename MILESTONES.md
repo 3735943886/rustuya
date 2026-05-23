@@ -243,3 +243,17 @@ currently triggering in production use — they're defense in depth.
 - [ ] **M6.4 — Tracing migration** *(deferred)* — replacing `log` with `tracing` touches 50+ sites and would shift the consumer-facing logging contract (subscribers must change). The current `log` facade integrates cleanly with `pyo3-log` in the bindings crate; switching to `tracing` would force a parallel change there too. Scoped as a single follow-up PR: it's a worthwhile diagnostics improvement (span-aware logs around the actor's connection/heartbeat/scanner cycles) but it doesn't fit in the hardening pass.
 - [x] **M6.5 — `CHANGELOG.md`** generated via `cliff.toml` (already configured) — include security/correctness items from M1 prominently.
 - [x] **M6.6 — `cargo deny` / `cargo audit`** in CI to track supply-chain.
+
+---
+
+## Pre-0.3.0-stable checklist
+
+Items to handle before promoting `0.3.0-rc.X` to a stable `0.3.0` tag.
+Collected here so they don't get lost between rc cycles.
+
+- [ ] **docs/rust-api.md**: `.run()` → `.build()` at [line 64](docs/rust-api.md#L64). The DeviceBuilder example still shows the deprecated terminal verb.
+- [ ] **docs/rust-api.md / docs/getting-started.md**: consider adding a "sync vs async" note that mirrors the new [`lib.rs` section](src/lib.rs) — currently the GitHub Pages site has no guidance on which facade to pick from a tokio context.
+- [ ] **docs/python-api.md**: review for `.run()` references in any embedded Rust snippets; the python-side API itself didn't change (`Device(...)` still works the same way).
+- [ ] **README.md**: light pass for any `0.2.x`-era assumptions; current README is mostly badges/links so probably nothing to change.
+- [ ] **Confirm at least one rc cycle passes with real-device verification** before tagging stable. The hardening changes were unit-tested but the actor's session-key / dev22 / scanner-IP-mismatch paths still rely on live devices for end-to-end coverage (the M5.1 mock-TCP work would close this gap).
+- [ ] **Optional**: bump MSRV claim in `Cargo.toml` if any of the new patterns require a newer compiler than the existing 0.2.x line. (`let ... else` and `if let chains` are used in places — check `rust-version`.)
