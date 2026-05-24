@@ -47,6 +47,65 @@ There is no public constructor and no builder: every consumer goes through
 the singleton, and every configurable knob (`set_timeout`, `set_ports`,
 `set_bind_address`) takes `&self` and mutates the singleton's interior state.
 
+### Passive vs active scan — design intent
+
+Tuya devices on a LAN do two things autonomously on UDP:
+
+1. They periodically *advertise themselves* via short broadcast packets on
+   ports 6666 (v3.1/3.2/3.3), 6667 (v3.4), and 7000 (v3.5).
+2. They *reply* to discovery probes sent to those same ports.
+
+rustuya's scanner is built around that asymmetry:
+
+- **Passive scan** is the always-on background listener that catches (1).
+  The receiver tasks are started eagerly at first `Scanner::get()`
+  (singleton init) and run for the lifetime of the process. The user pays
+  no per-scan cost — discovery just keeps populating the cache as devices
+  appear on the network. This is the path Device construction reaches
+  through when an `Auto` address needs to be resolved.
+- **Active scan** explicitly *sends* the discovery broadcasts to elicit
+  (2), then leans on the same passive infrastructure to receive the
+  responses. Triggered by `Scanner::scan()` / `scan_stream()` /
+  `discover_device()`. Because broadcasting is intrusive (a router-wide
+  packet that wakes every Tuya device), it's heavily throttled — see
+  cooldowns below.
+
+The reason they share infrastructure: a "response to our active
+broadcast" and "an unsolicited periodic advertisement" are the same
+packet shape on the wire. There's no point running two separate UDP
+read paths — a single dispatcher folds both into the same cache.
+
+```
+                  (1) periodic advertise           (2) reply to probe
+                          │                                │
+                          ▼                                ▼
+        ┌─────────────────────────────────────────────────────┐
+        │           UDP receiver tasks (per-port)             │
+        │       always-on; bound at singleton init             │
+        └───────────────────────┬─────────────────────────────┘
+                                ▼
+                ┌────────────────────────────────┐
+                │   shared mpsc (1024 capacity)   │
+                └───────────────┬────────────────┘
+                                ▼
+                ┌────────────────────────────────┐
+                │   dispatcher task (singular)    │
+                │ parse_packet → cache.write →    │
+                │ publish_discovery (watch++)     │
+                └───────────────┬────────────────┘
+                                ▼
+                    discovery_version watch channel
+                                │
+            ┌───────────────────┼────────────────────────┐
+            ▼                   ▼                        ▼
+   scan_stream consumer  discover_device     Device::wait_for_backoff
+   (yields cache items)   (waits for ID)     (scanner-bypass logic)
+
+   (the box on the right also has, alongside it, the *active scan*
+    discovery loop which writes broadcasts back into the UDP receiver
+    tasks' sockets — those sockets are full-duplex)
+```
+
 ### Singleton lifecycle
 
 - `Scanner::new()` is **eager**: it constructs the state and immediately
@@ -66,11 +125,44 @@ the singleton, and every configurable knob (`set_timeout`, `set_ports`,
 ### The shared packet channel
 
 One long-lived `mpsc<(Vec<u8>, SocketAddr)>` is shared across **all**
-receiver tasks. When `set_ports()` adds a port mid-flight, the new
-receiver task clones the existing sender — so its packets reach the same
-dispatcher. Before M1.2 each call to `spawn_receiver_tasks` created a
-fresh channel whose `rx` was never polled, silently dropping every packet
-on the newly-added port.
+receiver tasks. Capacity `PACKET_CHANNEL_CAPACITY = 1024` — sized to
+absorb a sub-millisecond burst of a few thousand simultaneous device
+replies (each `dispatch_packet` is microsecond-scale: parse + cache
+write + retain + publish). If the channel ever filled, the receiver's
+`tx.send().await` would park and back-pressure the UDP socket, which
+in turn causes the kernel buffer to drop packets — so the capacity is
+deliberately generous.
+
+When `set_ports()` adds a port mid-flight, the new receiver task clones
+the existing sender — so its packets reach the same dispatcher. Before
+M1.2 each call to `spawn_receiver_tasks` created a fresh channel whose
+`rx` was never polled, silently dropping every packet on the newly-added
+port.
+
+`ensure_passive_listener` is serialized by a `startup_guard: Mutex<()>`.
+Without it, two concurrent callers (`set_ports` racing the discovery-loop
+fallback) could end up spawning two dispatchers on disjoint mpsc
+channels — silently forking the cache-write path. `stop_passive_listener`
+and `set_bind_address` both take the same guard so they can't interleave
+with a reconcile in flight.
+
+### Port reconciliation
+
+`set_ports(new_list)` is **diff-based**: `compute_port_diff` figures
+out adds vs removes against the currently-bound socket map, and
+`reconcile_listener_locked` applies both. A port dropped from the list
+has its per-port `receiver_tasks` JoinHandle aborted and its socket
+removed from `state.sockets`. Per-port receiver task tracking
+(`HashMap<u16, JoinHandle>`) is the structural change that makes this
+possible; before it, receiver tasks lived in a flat `Vec` with no
+per-port handle.
+
+`set_bind_address` on an already-running listener aborts all per-port
+receivers and clears the socket map, but **keeps** the dispatcher and
+`packet_tx` alive — so the splice path in `reconcile_listener_locked`
+reuses them. Practical effect: in-flight UDP packets on the old sockets
+may be dropped during the rebind (μs window), but the discovery cache
+and all watch-channel subscribers see no discontinuity.
 
 ### Discovery notifications use `watch`, not `Notify`
 
@@ -107,11 +199,27 @@ the receive window for late replies.
 Other timers:
 
 - `GLOBAL_SCAN_COOLDOWN = 1800s` (30min) — minimum gap between full
-  active scans, scanner-wide.
-- `SCAN_THROTTLE_INTERVAL = 60s` — minimum gap between user-triggered
-  `discover_device` scans.
+  active scans triggered via `scan_stream` / `scan`. Callers within this
+  window get the existing cache only; no new broadcasts are sent.
+- `SCAN_THROTTLE_INTERVAL = 60s` — minimum gap between scans triggered
+  by `discover_device`. Both APIs ultimately invoke the same
+  `perform_discovery_loop` (a full LAN-wide broadcast), so the
+  asymmetry is intentional: `scan_stream` is the "give me everything"
+  bulk path and is restrictive; `discover_device` is the "I'm looking
+  for one device that just came online" path and is allowed to retry
+  more often. Concurrent `discover_device` calls for different IDs
+  during the same active scan share the scan rather than queueing —
+  they all subscribe to the same `discovery_version` watch channel
+  and yield as the cache fills.
 - `CACHE_TTL = 86400s` (24h) — entries older than this are dropped on the
   next cache write.
+
+A consequence worth knowing: after a single `scan_stream` call, the
+next 30 minutes of `scan_stream` calls return only cached devices
+without sending new broadcasts. If you specifically want a fresh sweep
+inside that window, force it by clearing the cache for the device of
+interest (`invalidate_cache(id)`) or by triggering `discover_device`
+which has the shorter throttle.
 
 ### Active-scan single-winner
 
@@ -120,6 +228,35 @@ loop. The "I am the active scanner" claim is a `compare_exchange` on
 `active_scanning: AtomicBool`. Losers fall through to subscribe to the
 discovery channel and yield results from the cache as they arrive.
 Regression test: [`active_scanning_compare_exchange_is_single_winner`](../src/scanner.rs#L1187).
+
+### Active-scan broadcast loop
+
+`perform_discovery_loop` is a small state machine:
+
+1. Snapshot the configured ports and pick up the sockets already bound
+   by the passive listener. If for some reason a configured port is
+   unbound (race window), trigger `ensure_passive_listener` once as a
+   fallback and try again.
+2. Drive a `tokio::time::interval(6s)`. Tokio's `interval` fires
+   immediately on first poll (default `Burst` behavior), so broadcasts
+   land at `t=0, 6s, 12s`.
+3. After `MAX_BROADCASTS = 3` sends, the loop switches to a plain
+   `sleep(remaining)` for the rest of the timeout window (rc.3
+   simplification — previously it kept spinning the select! and
+   skipping the tick, harmless but wasteful).
+4. The whole loop runs for `DEFAULT_SCAN_TIMEOUT = 18s`. The last 6s
+   (`t=12s..18s`) is the **receive margin** during which the passive
+   receivers are still picking up late device replies into the cache,
+   and `scan_stream_instance` consumers are still yielding them. When
+   the loop exits at `t=18s`, the spawning task sets
+   `active_scanning=false` and `publish_discovery()` — the wake-up
+   that lets consumers do one last cache drain before their stream
+   ends.
+
+The 6s receive margin is the load-bearing invariant —
+`scan_timeout_leaves_room_after_last_broadcast` pins it so a future
+tweak to `BROADCAST_INTERVAL` / `MAX_BROADCASTS` / `RECEIVE_MARGIN`
+can't silently destroy it.
 
 ### Local-IP discovery
 

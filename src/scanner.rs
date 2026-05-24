@@ -83,6 +83,15 @@ const GLOBAL_SCAN_COOLDOWN: Duration = Duration::from_secs(1800); // 30 minutes
 const SCAN_THROTTLE_INTERVAL: Duration = Duration::from_secs(60); // 60 seconds minimum gap between active scans
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
+/// Capacity of the shared mpsc that all receiver tasks feed into the
+/// dispatcher. Sized for the realistic worst case of a few thousand
+/// devices simultaneously broadcasting after an active scan: each
+/// `dispatch_packet` is microsecond-scale, so 1024 holds enough slack
+/// to absorb a sub-millisecond burst without the receiver's
+/// `tx.send().await` parking and back-pressuring the UDP socket (which
+/// would cause the kernel buffer to drop packets).
+const PACKET_CHANNEL_CAPACITY: usize = 1024;
+
 /// Sender half of the scanner's shared packet bus (one per dispatcher).
 type PacketSender = mpsc::Sender<(Vec<u8>, SocketAddr)>;
 /// Receiver half — paired with `PacketSender`, consumed by the dispatcher.
@@ -120,6 +129,16 @@ struct ScannerState {
     // The dispatcher is singular (one per shared mpsc); held separately so
     // per-port `receiver_tasks` removal doesn't accidentally touch it.
     dispatcher_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    // Serializes the *entire* `ensure_passive_listener` body. Without this,
+    // two threads calling concurrently (e.g. one via `set_ports`, another
+    // via a fallback path) could race between `listener_started.swap` and
+    // `*packet_tx.write() = Some(tx)` — the second thread would observe
+    // listener_started=true but packet_tx=None, fall into the rebuild
+    // fallback, and end up spawning a SECOND dispatcher on its own mpsc.
+    // The function is called rarely (init, set_ports, set_bind_address)
+    // so a coarse mutex is the right cost trade-off vs. a more delicate
+    // state machine.
+    startup_guard: parking_lot::Mutex<()>,
     // Live configuration. Previously these were `Scanner` fields and required a
     // `&mut Scanner` to mutate — which forced a separate `ScannerBuilder` path
     // that bound its own UDP sockets and competed with the singleton. Storing
@@ -143,6 +162,7 @@ impl ScannerState {
             packet_tx: RwLock::new(None),
             receiver_tasks: RwLock::new(HashMap::new()),
             dispatcher_task: RwLock::new(None),
+            startup_guard: parking_lot::Mutex::new(()),
             timeout: RwLock::new(DEFAULT_SCAN_TIMEOUT),
             bind_addr: RwLock::new("0.0.0.0".to_string()),
             ports: RwLock::new(vec![6666, 6667, 7000]),
@@ -258,7 +278,20 @@ impl Scanner {
     ///   left 6667 and 7000 still running.)
     /// - **Adds** sockets + receiver tasks for any port newly in `ports`.
     /// - **Spawns** the dispatcher on the first call.
+    ///
+    /// Acquires `startup_guard` for the duration so concurrent callers
+    /// (e.g. `set_ports` racing against the discovery-loop fallback) cannot
+    /// end up spawning duplicate dispatchers on disjoint mpsc channels —
+    /// that would silently fork the cache-write path.
     fn ensure_passive_listener(&self) {
+        let _guard = self.inner.startup_guard.lock();
+        self.reconcile_listener_locked();
+    }
+
+    /// Body of [`ensure_passive_listener`]; caller must hold `startup_guard`.
+    /// Split out so paths that already hold the guard (`set_bind_address`'s
+    /// abort-then-rebind sequence) don't re-acquire and deadlock.
+    fn reconcile_listener_locked(&self) {
         let state = &self.inner;
         let ports_snapshot: Vec<u16> = state.ports.read().clone();
         let current_ports: Vec<u16> = state.sockets.read().keys().copied().collect();
@@ -319,7 +352,8 @@ impl Scanner {
         //       the existing sender so new receivers feed the same dispatcher.
         if !state.listener_started.swap(true, Ordering::SeqCst) {
             let cancel_token = state.current_cancel_token();
-            let (tx, mut rx): (PacketSender, PacketReceiver) = mpsc::channel(100);
+            let (tx, mut rx): (PacketSender, PacketReceiver) =
+                mpsc::channel(PACKET_CHANNEL_CAPACITY);
             *state.packet_tx.write() = Some(tx.clone());
 
             let recv_tasks = Self::spawn_receiver_tasks(new_sockets, tx, cancel_token.clone());
@@ -348,11 +382,22 @@ impl Scanner {
                 Self::spawn_receiver_tasks(new_sockets, tx, state.current_cancel_token());
             state.receiver_tasks.write().extend(recv_tasks);
         } else {
-            // Should not happen: listener_started is true but no tx. Treat as a
-            // race against `stop_passive_listener` and rebuild from scratch.
+            // With `startup_guard` held, this branch (listener_started=true
+            // but packet_tx=None) is unreachable from concurrent calls —
+            // every state mutator funnels through the guard. If it ever
+            // fires, something mutated state directly outside the guard;
+            // recover by resetting and recursing through the locked helper.
+            debug_assert!(
+                false,
+                "ScannerState invariant violated: listener_started=true but packet_tx=None"
+            );
+            warn!(
+                "Passive listener state inconsistency (listener_started=true, packet_tx=None); \
+                 forcing rebuild"
+            );
             state.listener_started.store(false, Ordering::SeqCst);
             drop(new_sockets);
-            self.ensure_passive_listener();
+            self.reconcile_listener_locked();
         }
     }
 
@@ -467,6 +512,10 @@ impl Scanner {
     /// scanner can be started again later (e.g. via `set_ports` or another
     /// `scan()` call).
     pub fn stop_passive_listener(&self) {
+        // Hold `startup_guard` so a concurrent `ensure_passive_listener`
+        // can't see a half-torn-down state and start spinning up a new
+        // dispatcher on top of one we haven't finished cancelling.
+        let _guard = self.inner.startup_guard.lock();
         // Cancel-then-replace: receiver/dispatcher tasks observe the cancel
         // and exit; future starts pick up the fresh token.
         self.inner.reset_cancel_token();
@@ -523,10 +572,14 @@ impl Scanner {
     /// dropped).
     pub fn set_bind_address(&self, addr: &str) -> Result<()> {
         let new_addr = addr.to_string();
+        // Take the guard for the whole detect-clear-rebind sequence so a
+        // concurrent caller can't squeeze in between the clear and the
+        // rebind. `reconcile_listener_locked` runs under the same guard.
+        let _guard = self.inner.startup_guard.lock();
         let old_addr = {
-            let mut guard = self.inner.bind_addr.write();
-            let prev = guard.clone();
-            *guard = new_addr.clone();
+            let mut g = self.inner.bind_addr.write();
+            let prev = g.clone();
+            *g = new_addr.clone();
             prev
         };
         let listener_up = self.inner.listener_started.load(Ordering::SeqCst);
@@ -537,7 +590,7 @@ impl Scanner {
             );
             // Abort all per-port receivers and drop the old sockets, but keep
             // the dispatcher + packet_tx alive so the splice path in
-            // `ensure_passive_listener` reuses them — that means no cache
+            // `reconcile_listener_locked` reuses them — that means no cache
             // discontinuity and no need to re-spawn the dispatcher.
             {
                 let mut tasks = self.inner.receiver_tasks.write();
@@ -547,7 +600,7 @@ impl Scanner {
             }
             self.inner.sockets.write().clear();
         }
-        self.ensure_passive_listener();
+        self.reconcile_listener_locked();
         Ok(())
     }
 
@@ -957,15 +1010,22 @@ impl Scanner {
                 break;
             }
 
+            if broadcast_count >= MAX_BROADCASTS {
+                // All broadcasts sent. Just hold the loop alive for the
+                // receive window so late device replies have time to land
+                // in the cache before the spawned scan task exits and the
+                // stream consumer notices `active_scanning=false`.
+                sleep(remaining).await;
+                break;
+            }
+
             tokio::select! {
                 () = sleep(remaining) => break,
                 _ = broadcast_interval.tick() => {
-                    if broadcast_count < MAX_BROADCASTS {
-                        broadcast_count += 1;
-                        debug!("Sent broadcast {broadcast_count}/{MAX_BROADCASTS}");
-                        for (socket, port) in &target_sockets {
-                            let _ = self.send_discovery_broadcast(socket, *port).await;
-                        }
+                    broadcast_count += 1;
+                    debug!("Sent broadcast {broadcast_count}/{MAX_BROADCASTS}");
+                    for (socket, port) in &target_sockets {
+                        let _ = self.send_discovery_broadcast(socket, *port).await;
                     }
                 }
             }
