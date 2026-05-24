@@ -338,6 +338,12 @@ impl Device {
             tx: Some(tx),
         };
 
+        // Compute the initial-connect jitter synchronously so it reflects
+        // construction time, not when the spawned task happens to run. A
+        // single-device caller pays no jitter; bursty multi-device startup
+        // still gets the staggering it needs.
+        let initial_jitter = actor::record_construction_and_compute_jitter();
+
         let inner_weak = Arc::downgrade(&inner);
         let d_id = device.inner.id.clone();
         crate::runtime::spawn(async move {
@@ -349,7 +355,7 @@ impl Device {
                     () = cancel_token.cancelled() => {
                         debug!("Device {d_id} connection task stopped via token");
                     }
-                    () = d_task.run_connection_task(rx) => {
+                    () = d_task.run_connection_task(rx, initial_jitter) => {
                         debug!("Device {d_id} connection task finished");
                     }
                 }
@@ -537,6 +543,18 @@ impl Device {
             .await
     }
 
+    /// Waits for the next non-empty broadcast message from this device.
+    ///
+    /// Returns `Err(TuyaError::BroadcastLagged { skipped })` if the broadcast
+    /// bus skipped messages because we fell behind by more than its capacity
+    /// (currently 128). The skipped messages are permanently lost — the caller
+    /// should re-query device state (e.g. via [`Self::status`]) or accept the
+    /// gap. Previously this condition was silently swallowed and the next
+    /// valid message was returned as if nothing had been missed, which made
+    /// state-tracking consumers infer wrong values; rc.2 surfaces it.
+    ///
+    /// Returns `Err(TuyaError::Offline)` when the device is fully stopped and
+    /// the broadcast channel is closed.
     pub async fn receive(&self) -> Result<TuyaMessage> {
         use tokio::sync::broadcast::error::RecvError;
         let mut rx = self.inner.broadcast_tx.subscribe();
@@ -552,7 +570,7 @@ impl Device {
                         "Device {} receive() lagged, skipped {} broadcast messages",
                         self.inner.id, skipped
                     );
-                    continue;
+                    return Err(TuyaError::BroadcastLagged { skipped });
                 }
                 Err(RecvError::Closed) => return Err(TuyaError::Offline),
             }

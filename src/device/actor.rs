@@ -19,7 +19,7 @@ use log::{debug, error, info, trace, warn};
 use rand::Rng;
 use serde_json::Value;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -33,6 +33,53 @@ use super::{
     SLEEP_HEARTBEAT_CHECK, SLEEP_HEARTBEAT_DEFAULT, SLEEP_INACTIVITY_TIMEOUT, SLEEP_RECONNECT_MAX,
     SLEEP_RECONNECT_MIN, keys,
 };
+
+/// Tracks when the most-recent `Device` was constructed, in milliseconds since
+/// `UNIX_EPOCH`. Used by [`record_construction_and_compute_jitter`] so the
+/// 0–5s initial-connect jitter is only applied when multiple devices are being
+/// constructed in quick succession (the thundering-herd case it exists for).
+/// A single-device caller pays no jitter.
+static LAST_DEVICE_CONSTRUCT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// If another device was constructed within this window, the new device gets
+/// the full 0–5s jitter; otherwise the jitter is zero.
+const JITTER_QUIET_WINDOW: Duration = Duration::from_millis(100);
+
+/// Maximum value of the random initial-connect jitter.
+const JITTER_SPREAD: Duration = Duration::from_millis(5000);
+
+/// Pure decision: given the elapsed time since the previous device
+/// construction, return the jitter for this construction. Factored out from
+/// [`record_construction_and_compute_jitter`] so it can be unit-tested
+/// without racing the global atomic against parallel `Device::build` calls
+/// in other tests.
+fn jitter_for_elapsed(elapsed: Duration) -> Duration {
+    if elapsed >= JITTER_QUIET_WINDOW {
+        Duration::ZERO
+    } else {
+        let mut rng = rand::rng();
+        Duration::from_millis(u64::from(rng.next_u32()) % JITTER_SPREAD.as_millis() as u64)
+    }
+}
+
+/// Records that a device is being constructed *now* and returns the jitter
+/// that device should sleep before its first connect attempt.
+///
+/// Returns `Duration::ZERO` if no other device was constructed within
+/// [`JITTER_QUIET_WINDOW`] (single-device fast path); otherwise a uniform
+/// random duration in `0..JITTER_SPREAD`.
+///
+/// Called from `Device::with_builder` (synchronously) so the bookkeeping is
+/// based on construction wall-clock time, not on when the spawned task
+/// happens to run.
+pub(super) fn record_construction_and_compute_jitter() -> Duration {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let prev_ms = LAST_DEVICE_CONSTRUCT_MS.swap(now_ms, Ordering::Relaxed);
+    let elapsed_ms = now_ms.saturating_sub(prev_ms);
+    jitter_for_elapsed(Duration::from_millis(elapsed_ms))
+}
 
 pub(crate) enum DeviceCommand {
     // NOTE: `Disconnect` removed in M2.1. Use `close_notify` on DeviceInner for
@@ -143,21 +190,26 @@ impl Device {
 }
 
 impl Device {
-    pub(super) async fn run_connection_task(&self, mut rx: mpsc::Receiver<DeviceCommand>) {
-        let jitter = {
-            let mut rng = rand::rng();
-            Duration::from_millis(u64::from(rng.next_u32() % 5000))
-        };
-
-        debug!(
-            "Starting background connection task for device {} with {:?} initial jitter",
-            self.inner.id, jitter
-        );
-
-        // Stagger connection attempts
-        tokio::select! {
-            () = self.inner.cancel_token.cancelled() => return,
-            () = sleep(jitter) => {}
+    pub(super) async fn run_connection_task(
+        &self,
+        mut rx: mpsc::Receiver<DeviceCommand>,
+        initial_jitter: Duration,
+    ) {
+        if initial_jitter.is_zero() {
+            debug!(
+                "Starting background connection task for device {} with no initial jitter",
+                self.inner.id
+            );
+        } else {
+            debug!(
+                "Starting background connection task for device {} with {:?} initial jitter",
+                self.inner.id, initial_jitter
+            );
+            // Stagger connection attempts when multiple devices are starting.
+            tokio::select! {
+                () = self.inner.cancel_token.cancelled() => return,
+                () = sleep(initial_jitter) => {}
+            }
         }
 
         let mut heartbeat_interval = interval(SLEEP_HEARTBEAT_CHECK);
@@ -395,11 +447,28 @@ impl Device {
                 if !self.with_state(|s| s.persist) {
                     // persist=false has its own backoff state so that rapid user
                     // requests against an unreachable device don't translate into
-                    // a TCP SYN storm. failure_count is bumped on every failed
-                    // retry; ConnectNow still bypasses the wait.
+                    // a TCP SYN storm. ConnectNow always bypasses the cooldown.
+                    //
+                    // Cooldown semantics (rc.2):
+                    //   - On each failure we set `cooldown_until = now + backoff`.
+                    //   - While a Request arrives within that window, respond
+                    //     Offline immediately — don't queue it behind a fresh
+                    //     backoff sleep. This collapses bursts (10 simultaneous
+                    //     requests don't take 10× backoff to resolve).
+                    //   - A Request arriving AFTER the cooldown elapses gets a
+                    //     real retry attempt with no extra sleep.
+                    //   - ConnectNow clears the cooldown unconditionally.
+                    //
+                    // The previous design slept `backoff` *before each retry*,
+                    // which meant queued requests stacked their sleeps and the
+                    // 10th request could wait hours.
                     self.with_state_mut(|s| {
                         s.failure_count = s.failure_count.saturating_add(1);
                     });
+                    let initial_backoff = self.with_state(|s| {
+                        self.get_backoff_duration(s.failure_count.saturating_sub(1))
+                    });
+                    let mut cooldown_until = Some(Instant::now() + initial_backoff);
                     warn!(
                         "Connection failed (persist: false) for {}: {}. Waiting for next command.",
                         self.inner.id, e
@@ -407,30 +476,23 @@ impl Device {
 
                     loop {
                         match rx.recv().await {
-                            Some(DeviceCommand::ConnectNow) => break,
+                            Some(DeviceCommand::ConnectNow) => {
+                                // Bypass any active cooldown — user explicitly
+                                // asked for an immediate connect attempt.
+                                break;
+                            }
                             Some(cmd @ DeviceCommand::Request { .. }) => {
-                                // Space user-triggered retries with the same
-                                // exponential+jitter backoff used by the
-                                // persist=true path. Cancellation aborts the
-                                // sleep early; Disconnect during sleep is not
-                                // observed here (we re-enter rx.recv() next
-                                // iteration anyway).
-                                let backoff = self.with_state(|s| {
-                                    self.get_backoff_duration(s.failure_count.saturating_sub(1))
-                                });
-                                if !backoff.is_zero() {
-                                    debug!(
-                                        "persist=false: spacing {:?} before retry for {}",
-                                        backoff, self.inner.id
-                                    );
-                                    tokio::select! {
-                                        () = tokio::time::sleep(backoff) => {}
-                                        () = self.inner.cancel_token.cancelled() => {
-                                            cmd.respond(Err(TuyaError::Offline));
-                                            return None;
-                                        }
-                                    }
+                                if let Some(until) = cooldown_until
+                                    && Instant::now() < until
+                                {
+                                    cmd.respond(Err(TuyaError::Offline));
+                                    self.broadcast_error(ERR_OFFLINE, None);
+                                    continue;
                                 }
+                                // Cooldown elapsed (or was never set). Fall
+                                // through to retry; we'll either return Ok
+                                // from the success branch or overwrite
+                                // `cooldown_until` from the failure branch.
 
                                 let retry_result =
                                     timeout(self.timeout() * 2, self.connect_and_handshake(seqno))
@@ -456,6 +518,10 @@ impl Device {
                                     });
                                     cmd.respond(Err(err.clone()));
                                     self.broadcast_error(ERR_OFFLINE, None);
+                                    let next_backoff = self.with_state(|s| {
+                                        self.get_backoff_duration(s.failure_count.saturating_sub(1))
+                                    });
+                                    cooldown_until = Some(Instant::now() + next_backoff);
                                 }
                             }
                             None => return None,
@@ -1301,6 +1367,62 @@ impl Device {
             payload,
             prefix: get_protocol(self.version(), self.dev_type()).get_prefix(),
             ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for actor-level helpers that don't require a live TCP
+    //! connection. Heavier integration tests live in `device::listener::tests`.
+
+    use super::*;
+
+    // 0.3.0-rc.2: lock in the *decision* for initial-connect jitter. The
+    // original design unconditionally slept 0–5s before the first connect
+    // to spread out thundering-herd startups for fleets of 100s–1000s of
+    // devices; that was pure overhead in the single-device case. The
+    // contract: if the previous construction was more than JITTER_QUIET_WINDOW
+    // ago, return zero (single-device fast path); otherwise return a random
+    // value strictly under JITTER_SPREAD.
+    //
+    // We test `jitter_for_elapsed` (pure) rather than
+    // `record_construction_and_compute_jitter` (touches a global atomic)
+    // because the global is shared with every `Device::build` happening in
+    // other tests run in parallel.
+    #[test]
+    fn jitter_for_elapsed_zero_when_idle() {
+        // Anything ≥ JITTER_QUIET_WINDOW must skip jitter.
+        assert_eq!(jitter_for_elapsed(JITTER_QUIET_WINDOW), Duration::ZERO);
+        assert_eq!(
+            jitter_for_elapsed(JITTER_QUIET_WINDOW + Duration::from_millis(1)),
+            Duration::ZERO
+        );
+        assert_eq!(jitter_for_elapsed(Duration::from_secs(3600)), Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_for_elapsed_bursty_within_bounds() {
+        // Below JITTER_QUIET_WINDOW: bursty, must return strictly less than
+        // JITTER_SPREAD (the upper bound of the random range). We loop to
+        // sample across the RNG distribution.
+        for _ in 0..1000 {
+            let d = jitter_for_elapsed(Duration::from_millis(0));
+            assert!(
+                d < JITTER_SPREAD,
+                "bursty jitter {:?} must be < JITTER_SPREAD ({:?})",
+                d,
+                JITTER_SPREAD
+            );
+        }
+        for _ in 0..1000 {
+            let d = jitter_for_elapsed(JITTER_QUIET_WINDOW - Duration::from_millis(1));
+            assert!(
+                d < JITTER_SPREAD,
+                "edge-of-window jitter {:?} must be < JITTER_SPREAD ({:?})",
+                d,
+                JITTER_SPREAD
+            );
         }
     }
 }

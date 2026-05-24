@@ -733,4 +733,113 @@ mod tests {
             assert!(result.is_ok(), "drop-during-publish deadlocked or panicked");
         });
     }
+
+    // 0.3.0-rc.2: Device::receive() previously swallowed `Lagged(n)` from the
+    // broadcast bus and silently waited for the next message — a consumer
+    // tracking state changes via every push would never know it had missed
+    // any. Lock in the new contract: receive() returns
+    // `Err(TuyaError::BroadcastLagged { skipped })` so the caller can react
+    // (e.g. re-query state). `Device::listener()` continues to emit a
+    // synthetic `listener_lagged` event on the stream, which is the natural
+    // shape for a stream.
+    //
+    // Timing note: this uses `current_thread` runtime so the flood loop
+    // holds the only thread end-to-end and the receive() task cannot be
+    // preempted mid-flood (which would drain the bus before it overflows).
+    // The pre-flood `yield_now` lets receive()'s subscribe complete, and
+    // the post-flood `yield_now` hands the thread back so receive() can
+    // observe the overflow.
+    #[test]
+    fn receive_returns_broadcast_lagged_when_consumer_falls_behind() {
+        use crate::error::TuyaError;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let device = make_test_device("receive_lagged");
+            let recv_task = {
+                let d = device.clone();
+                tokio::spawn(async move { d.receive().await })
+            };
+            // Yield so the spawned task runs its subscribe + first await on
+            // recv. It will then park waiting for messages.
+            tokio::task::yield_now().await;
+
+            // Flood: 200 messages with capacity 128 ⇒ at least 72 dropped.
+            // On current_thread runtime the parked task cannot be polled
+            // mid-loop, so it sees the post-overflow state when we yield.
+            for i in 0..200u32 {
+                let payload = format!("{{\"n\":{i}}}");
+                let _ = device
+                    .inner
+                    .broadcast_tx
+                    .send(make_msg(0x0a, payload.as_bytes()));
+            }
+
+            let result = timeout(Duration::from_millis(500), recv_task)
+                .await
+                .expect("receive() should return within 500ms once flooded")
+                .expect("spawned task panicked");
+            match result {
+                Err(TuyaError::BroadcastLagged { skipped }) => {
+                    assert!(
+                        skipped > 0,
+                        "Lagged variant must carry a positive skip count"
+                    );
+                }
+                other => panic!(
+                    "expected Err(BroadcastLagged), got {other:?} — receive() \
+                     regressed to silently swallowing lagged broadcasts"
+                ),
+            }
+        });
+    }
+
+    // listener() side of the same property: stream yields a synthetic message
+    // with `reason: "listener_lagged"` and `skipped: n`. (We don't assert
+    // that the stream keeps yielding after the synthetic — broadcast retains
+    // the most-recent CHAN_BROADCAST_CAPACITY messages, so the post-lag
+    // yields would be those buffered floods, not a new message we send. The
+    // "stream stays alive after a wakeup" property is covered by other
+    // tests in this module.)
+    #[test]
+    fn listener_emits_synthetic_on_lag() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let device = make_test_device("listener_lagged");
+            let stream = device.listener();
+            tokio::pin!(stream);
+
+            // Flood with 200 messages without consuming any.
+            for i in 0..200u32 {
+                let payload = format!("{{\"n\":{i}}}");
+                let _ = device
+                    .inner
+                    .broadcast_tx
+                    .send(make_msg(0x0a, payload.as_bytes()));
+            }
+
+            // First yield must be the synthetic lagged message.
+            let got = timeout(Duration::from_millis(500), stream.next())
+                .await
+                .expect("stream should yield within 500ms")
+                .expect("stream not exhausted")
+                .expect("stream yielded transport Err");
+            let payload_str =
+                std::str::from_utf8(&got.payload).expect("synthetic payload must be UTF-8");
+            assert!(
+                payload_str.contains("listener_lagged"),
+                "expected synthetic listener_lagged payload, got {payload_str}"
+            );
+            assert!(
+                payload_str.contains("skipped"),
+                "synthetic payload must include `skipped` count, got {payload_str}"
+            );
+        });
+    }
 }

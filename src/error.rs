@@ -54,6 +54,17 @@ pub enum TuyaError {
 
     #[error("Device ID '{0}' not found")]
     DeviceNotFound(String),
+
+    /// The broadcast bus skipped messages because the consumer fell behind by
+    /// more than the bus capacity (currently 128 messages). The skipped
+    /// messages are permanently lost; the caller should re-query device state
+    /// or accept the gap. Surfaced by [`Device::receive`] and by the synthetic
+    /// `listener_lagged` event emitted by [`Device::listener`].
+    ///
+    /// [`Device::receive`]: crate::Device::receive
+    /// [`Device::listener`]: crate::Device::listener
+    #[error("Broadcast bus lagged, {skipped} messages lost")]
+    BroadcastLagged { skipped: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, TuyaError>;
@@ -115,6 +126,7 @@ impl TuyaError {
             TuyaError::KeyOrVersionError => ERR_KEY_OR_VER,
             TuyaError::DeviceNotFound(_) => ERR_JSON,
             TuyaError::Timeout => ERR_TIMEOUT,
+            TuyaError::BroadcastLagged { .. } => ERR_STATE,
         }
     }
 
