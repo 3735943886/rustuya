@@ -113,7 +113,13 @@ struct ScannerState {
     // `spawn_receiver_tasks` minted a fresh channel whose `rx` was never
     // polled, silently dropping every packet on the newly added port.)
     packet_tx: RwLock<Option<PacketSender>>,
-    receiver_tasks: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    // Per-port receiver tasks. Keyed by port so `set_ports` can selectively
+    // abort the receiver for a port being removed (rather than leaking it
+    // until full `stop_passive_listener`).
+    receiver_tasks: RwLock<HashMap<u16, tokio::task::JoinHandle<()>>>,
+    // The dispatcher is singular (one per shared mpsc); held separately so
+    // per-port `receiver_tasks` removal doesn't accidentally touch it.
+    dispatcher_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     // Live configuration. Previously these were `Scanner` fields and required a
     // `&mut Scanner` to mutate — which forced a separate `ScannerBuilder` path
     // that bound its own UDP sockets and competed with the singleton. Storing
@@ -135,7 +141,8 @@ impl ScannerState {
             cancel_token: RwLock::new(tokio_util::sync::CancellationToken::new()),
             sockets: RwLock::new(HashMap::new()),
             packet_tx: RwLock::new(None),
-            receiver_tasks: RwLock::new(Vec::new()),
+            receiver_tasks: RwLock::new(HashMap::new()),
+            dispatcher_task: RwLock::new(None),
             timeout: RwLock::new(DEFAULT_SCAN_TIMEOUT),
             bind_addr: RwLock::new("0.0.0.0".to_string()),
             ports: RwLock::new(vec![6666, 6667, 7000]),
@@ -183,10 +190,30 @@ impl ScannerState {
 impl Drop for ScannerState {
     fn drop(&mut self) {
         self.cancel_token.write().cancel();
-        for task in self.receiver_tasks.write().drain(..) {
+        for (_, task) in self.receiver_tasks.write().drain() {
             task.abort();
         }
+        if let Some(t) = self.dispatcher_task.write().take() {
+            t.abort();
+        }
     }
+}
+
+/// Pure helper: given a desired port list and the currently-bound set,
+/// return `(ports_to_add, ports_to_remove)`. Factored out so the
+/// reconciliation arithmetic can be unit-tested without binding sockets.
+fn compute_port_diff(desired: &[u16], current: &[u16]) -> (Vec<u16>, Vec<u16>) {
+    let to_add: Vec<u16> = desired
+        .iter()
+        .filter(|p| !current.contains(p))
+        .copied()
+        .collect();
+    let to_remove: Vec<u16> = current
+        .iter()
+        .filter(|p| !desired.contains(p))
+        .copied()
+        .collect();
+    (to_add, to_remove)
 }
 
 /// Discovers Tuya devices on the local network using UDP broadcast.
@@ -223,34 +250,51 @@ impl Scanner {
         scanner
     }
 
-    /// Ensures background passive listener is running.
+    /// Reconciles the running passive listener with the current `ports` /
+    /// `bind_addr` configuration:
+    ///
+    /// - **Removes** receivers and sockets for any port no longer in `ports`.
+    ///   (Previously omitted — a `set_ports(vec![6666])` after the default
+    ///   left 6667 and 7000 still running.)
+    /// - **Adds** sockets + receiver tasks for any port newly in `ports`.
+    /// - **Spawns** the dispatcher on the first call.
     fn ensure_passive_listener(&self) {
         let state = &self.inner;
         let ports_snapshot: Vec<u16> = state.ports.read().clone();
-        let mut ports_to_add = Vec::new();
-        {
-            let guard = state.sockets.read();
-            for &port in &ports_snapshot {
-                if !guard.contains_key(&port) {
-                    ports_to_add.push(port);
+        let current_ports: Vec<u16> = state.sockets.read().keys().copied().collect();
+        let (ports_to_add, ports_to_remove) = compute_port_diff(&ports_snapshot, &current_ports);
+
+        // Apply removals first so the listener_started branch below is decided
+        // against the post-removal socket set.
+        if !ports_to_remove.is_empty() {
+            let mut tasks = state.receiver_tasks.write();
+            let mut sockets = state.sockets.write();
+            for port in &ports_to_remove {
+                if let Some(task) = tasks.remove(port) {
+                    task.abort();
                 }
+                sockets.remove(port);
             }
+            debug!(
+                "Passive listener: removed receivers for ports {:?}",
+                ports_to_remove
+            );
         }
 
-        // If no new ports and already started, nothing to do
+        // If no new ports to add and already started, nothing more to do.
         if ports_to_add.is_empty() && state.listener_started.load(Ordering::SeqCst) {
             return;
         }
 
         let bind_addr = state.bind_addr.read().clone();
-        let mut new_sockets = Vec::new();
+        let mut new_sockets: Vec<(u16, Arc<UdpSocket>)> = Vec::new();
         {
             let mut guard = state.sockets.write();
             for port in ports_to_add {
                 if let Ok(socket) = Self::create_udp_socket(&bind_addr, port) {
                     let arc_socket = Arc::new(socket);
                     guard.insert(port, arc_socket.clone());
-                    new_sockets.push(arc_socket);
+                    new_sockets.push((port, arc_socket));
                 }
             }
         }
@@ -297,7 +341,7 @@ impl Scanner {
                 }
                 debug!("Background passive listener task stopped");
             });
-            state.receiver_tasks.write().push(dispatcher);
+            *state.dispatcher_task.write() = Some(dispatcher);
         } else if let Some(tx) = state.current_packet_tx() {
             // Listener already up — splice in receivers for the newly added ports.
             let recv_tasks =
@@ -349,12 +393,12 @@ impl Scanner {
     }
 
     fn spawn_receiver_tasks(
-        sockets: Vec<Arc<UdpSocket>>,
+        sockets: Vec<(u16, Arc<UdpSocket>)>,
         tx: PacketSender,
         cancel_token: tokio_util::sync::CancellationToken,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
+    ) -> Vec<(u16, tokio::task::JoinHandle<()>)> {
         let mut tasks = Vec::new();
-        for socket in sockets {
+        for (port, socket) in sockets {
             let tx = tx.clone();
             let socket = socket.clone();
             let ct = cancel_token.clone();
@@ -393,7 +437,7 @@ impl Scanner {
                     }
                 }
             });
-            tasks.push(task);
+            tasks.push((port, task));
         }
         tasks
     }
@@ -434,8 +478,11 @@ impl Scanner {
         // Best-effort: drop any receiver task handles we still own. Tasks
         // already woken by the cancel will finish on their own; this only
         // forces immediate abort for any that are stuck on a syscall.
-        for task in self.inner.receiver_tasks.write().drain(..) {
+        for (_, task) in self.inner.receiver_tasks.write().drain() {
             task.abort();
+        }
+        if let Some(t) = self.inner.dispatcher_task.write().take() {
+            t.abort();
         }
     }
 
@@ -468,9 +515,38 @@ impl Scanner {
         self.ensure_passive_listener();
     }
 
-    /// Sets the local bind address and starts receivers if the listener wasn't running.
+    /// Sets the local bind address. If the address actually changes and the
+    /// passive listener is already running, the existing receiver tasks are
+    /// aborted and the sockets re-bound to the new address. The dispatcher
+    /// task and the discovery cache survive the rebind (no events lost from
+    /// the consumer's POV; in-flight UDP packets on the old sockets may be
+    /// dropped).
     pub fn set_bind_address(&self, addr: &str) -> Result<()> {
-        *self.inner.bind_addr.write() = addr.to_string();
+        let new_addr = addr.to_string();
+        let old_addr = {
+            let mut guard = self.inner.bind_addr.write();
+            let prev = guard.clone();
+            *guard = new_addr.clone();
+            prev
+        };
+        let listener_up = self.inner.listener_started.load(Ordering::SeqCst);
+        if old_addr != new_addr && listener_up {
+            debug!(
+                "Rebinding passive listener sockets from {} to {}",
+                old_addr, new_addr
+            );
+            // Abort all per-port receivers and drop the old sockets, but keep
+            // the dispatcher + packet_tx alive so the splice path in
+            // `ensure_passive_listener` reuses them — that means no cache
+            // discontinuity and no need to re-spawn the dispatcher.
+            {
+                let mut tasks = self.inner.receiver_tasks.write();
+                for (_, task) in tasks.drain() {
+                    task.abort();
+                }
+            }
+            self.inner.sockets.write().clear();
+        }
         self.ensure_passive_listener();
         Ok(())
     }
@@ -1205,6 +1281,136 @@ mod tests {
             !src.contains(&forbidden_ty),
             "scanner.rs must not cache an Option<String> via OnceLock — that \
              would freeze the local IP for the process lifetime"
+        );
+    }
+
+    // 0.3.0-rc.2 follow-up: lock the port-diff arithmetic that
+    // `ensure_passive_listener` uses to decide which ports to bind/abort.
+    // Before this fix, the function only added new ports; ports removed
+    // from the configured list silently kept their receiver tasks alive.
+    #[test]
+    fn compute_port_diff_adds_only() {
+        let (add, remove) = compute_port_diff(&[6666, 6667, 7000], &[]);
+        assert_eq!(add, vec![6666, 6667, 7000]);
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn compute_port_diff_removes_only() {
+        let (add, remove) = compute_port_diff(&[6666], &[6666, 6667, 7000]);
+        assert!(add.is_empty());
+        // Ordering of HashMap-derived current isn't guaranteed in production,
+        // so compare as sets.
+        let removed: std::collections::HashSet<u16> = remove.into_iter().collect();
+        assert_eq!(
+            removed,
+            [6667u16, 7000]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn compute_port_diff_mixed_add_and_remove() {
+        let (add, remove) = compute_port_diff(&[6666, 8888], &[6666, 7000]);
+        assert_eq!(add, vec![8888]);
+        assert_eq!(remove, vec![7000]);
+    }
+
+    #[test]
+    fn compute_port_diff_no_change_returns_empty_both() {
+        let (add, remove) = compute_port_diff(&[6666, 7000], &[6666, 7000]);
+        assert!(add.is_empty());
+        assert!(remove.is_empty());
+    }
+
+    // Integration smoke: a real `set_ports` cycle that adds then removes ports
+    // should leave the `sockets` map in sync with the configured ports and
+    // abort the obsolete receiver task. Uses high ephemeral ports to avoid
+    // colliding with anything real on the test host.
+    #[test]
+    fn set_ports_add_then_remove_reconciles_socket_map() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Build an isolated Scanner (NOT the global singleton — we don't
+            // want to disrupt anyone else's state). We can't call
+            // `ScannerBuilder` anymore (removed in rc.2) but we can hand-roll
+            // an instance for testing.
+            let scanner = Scanner {
+                inner: Arc::new(ScannerState::new()),
+            };
+            // Use unlikely-to-be-bound high ports.
+            let port_a = 47770u16;
+            let port_b = 47771u16;
+            let port_c = 47772u16;
+
+            scanner.set_ports(vec![port_a, port_b]);
+            tokio::task::yield_now().await;
+            {
+                let sockets = scanner.inner.sockets.read();
+                assert!(sockets.contains_key(&port_a), "port_a should be bound");
+                assert!(sockets.contains_key(&port_b), "port_b should be bound");
+                assert_eq!(sockets.len(), 2);
+            }
+            {
+                let tasks = scanner.inner.receiver_tasks.read();
+                assert!(tasks.contains_key(&port_a));
+                assert!(tasks.contains_key(&port_b));
+            }
+
+            // Swap: drop port_b, add port_c.
+            scanner.set_ports(vec![port_a, port_c]);
+            tokio::task::yield_now().await;
+            {
+                let sockets = scanner.inner.sockets.read();
+                assert!(sockets.contains_key(&port_a), "port_a kept");
+                assert!(
+                    !sockets.contains_key(&port_b),
+                    "port_b must be removed from sockets map"
+                );
+                assert!(sockets.contains_key(&port_c), "port_c added");
+                assert_eq!(sockets.len(), 2);
+            }
+            {
+                let tasks = scanner.inner.receiver_tasks.read();
+                assert!(tasks.contains_key(&port_a));
+                assert!(
+                    !tasks.contains_key(&port_b),
+                    "port_b receiver task must be aborted and removed"
+                );
+                assert!(tasks.contains_key(&port_c));
+            }
+
+            // Drop everything: stop should clean up cleanly.
+            scanner.stop_passive_listener();
+            assert!(scanner.inner.sockets.read().is_empty());
+            assert!(scanner.inner.receiver_tasks.read().is_empty());
+            assert!(scanner.inner.dispatcher_task.read().is_none());
+        });
+    }
+
+    #[test]
+    fn compute_port_diff_full_swap() {
+        let (add, remove) = compute_port_diff(&[8888, 9999], &[6666, 7000]);
+        let added: std::collections::HashSet<u16> = add.into_iter().collect();
+        let removed: std::collections::HashSet<u16> = remove.into_iter().collect();
+        assert_eq!(
+            added,
+            [8888u16, 9999]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+        );
+        assert_eq!(
+            removed,
+            [6666u16, 7000]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
         );
     }
 }

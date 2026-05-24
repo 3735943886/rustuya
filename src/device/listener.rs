@@ -259,6 +259,13 @@ mod tests {
 
     /// Dropping the stream releases exactly the strong Arc<DeviceInner> it
     /// was holding — no Arc cycle, no leak.
+    ///
+    /// We pre-stop the device and poll until the background connection
+    /// task has released its Arc, so the baseline is deterministic.
+    /// Otherwise, with the rc.2 single-device jitter skip, the task can
+    /// upgrade its Arc *between* the baseline and the post-drop sample
+    /// and break the absolute-count assertion (the delta would still be
+    /// right, but the test asserts absolute equality).
     #[test]
     fn dropping_stream_releases_arc() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -267,7 +274,16 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let device = make_test_device("dropping_stream_arc");
+            device.fire_stop();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while Arc::strong_count(&device.inner) > 1 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             let baseline = Arc::strong_count(&device.inner);
+            assert_eq!(
+                baseline, 1,
+                "after stop, only the user-held Arc should remain (got {baseline})"
+            );
 
             let stream = device.listener();
             let with_stream = Arc::strong_count(&device.inner);
