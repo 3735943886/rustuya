@@ -114,6 +114,14 @@ struct ScannerState {
     // polled, silently dropping every packet on the newly added port.)
     packet_tx: RwLock<Option<PacketSender>>,
     receiver_tasks: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    // Live configuration. Previously these were `Scanner` fields and required a
+    // `&mut Scanner` to mutate — which forced a separate `ScannerBuilder` path
+    // that bound its own UDP sockets and competed with the singleton. Storing
+    // them here with interior mutability lets every setter take `&self` and
+    // route through the same global state.
+    timeout: RwLock<Duration>,
+    bind_addr: RwLock<String>,
+    ports: RwLock<Vec<u16>>,
 }
 
 impl ScannerState {
@@ -128,6 +136,9 @@ impl ScannerState {
             sockets: RwLock::new(HashMap::new()),
             packet_tx: RwLock::new(None),
             receiver_tasks: RwLock::new(Vec::new()),
+            timeout: RwLock::new(DEFAULT_SCAN_TIMEOUT),
+            bind_addr: RwLock::new("0.0.0.0".to_string()),
+            ports: RwLock::new(vec![6666, 6667, 7000]),
         }
     }
 
@@ -179,24 +190,14 @@ impl Drop for ScannerState {
 }
 
 /// Discovers Tuya devices on the local network using UDP broadcast.
+///
+/// `Scanner` is a process-wide singleton. Get a handle via [`Scanner::get`]
+/// and configure it via [`set_timeout`](Self::set_timeout) /
+/// [`set_ports`](Self::set_ports) / [`set_bind_address`](Self::set_bind_address)
+/// — all setters take `&self` and route through the same singleton.
 #[derive(Debug, Clone)]
 pub struct Scanner {
     inner: Arc<ScannerState>,
-    /// Timeout for discovery
-    // Direct-mutation of these fields previously bypassed
-    // `ensure_passive_listener` — e.g. a user assigning `scanner.ports = …`
-    // would change `self.ports` without spawning receivers on the new ports.
-    // Make them private and route all mutation through the `set_*` methods
-    // (which run the listener reconciliation).
-    timeout: Duration,
-    bind_addr: String,
-    ports: Vec<u16>,
-}
-
-impl Default for Scanner {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 static GLOBAL_SCANNER: OnceLock<Scanner> = OnceLock::new();
@@ -206,25 +207,17 @@ pub fn get() -> &'static Scanner {
     GLOBAL_SCANNER.get_or_init(Scanner::new)
 }
 
-/// Creates a new Scanner builder.
-pub fn builder() -> ScannerBuilder {
-    ScannerBuilder::new()
-}
-
 impl Scanner {
     /// Returns the global scanner instance.
     pub fn get() -> &'static Self {
         get()
     }
 
-    /// Creates a new Scanner with default settings.
+    /// Creates the singleton's underlying state and starts the passive listener.
     #[must_use]
     pub(crate) fn new() -> Self {
         let scanner = Self {
             inner: Arc::new(ScannerState::new()),
-            timeout: DEFAULT_SCAN_TIMEOUT,
-            bind_addr: "0.0.0.0".to_string(),
-            ports: vec![6666, 6667, 7000],
         };
         scanner.ensure_passive_listener();
         scanner
@@ -233,10 +226,11 @@ impl Scanner {
     /// Ensures background passive listener is running.
     fn ensure_passive_listener(&self) {
         let state = &self.inner;
+        let ports_snapshot: Vec<u16> = state.ports.read().clone();
         let mut ports_to_add = Vec::new();
         {
             let guard = state.sockets.read();
-            for &port in &self.ports {
+            for &port in &ports_snapshot {
                 if !guard.contains_key(&port) {
                     ports_to_add.push(port);
                 }
@@ -248,7 +242,7 @@ impl Scanner {
             return;
         }
 
-        let bind_addr = self.bind_addr.clone();
+        let bind_addr = state.bind_addr.read().clone();
         let mut new_sockets = Vec::new();
         {
             let mut guard = state.sockets.write();
@@ -269,7 +263,7 @@ impl Scanner {
         if new_sockets.is_empty() {
             warn!(
                 "Passive listener failed to bind to any ports: {:?}",
-                self.ports
+                ports_snapshot
             );
             return;
         }
@@ -448,58 +442,37 @@ impl Scanner {
     /// Returns the discovery timeout this scanner uses.
     #[must_use]
     pub fn timeout(&self) -> Duration {
-        self.timeout
+        *self.inner.timeout.read()
     }
 
     /// Returns the bind address this scanner uses.
     #[must_use]
-    pub fn bind_addr(&self) -> &str {
-        &self.bind_addr
+    pub fn bind_addr(&self) -> String {
+        self.inner.bind_addr.read().clone()
     }
 
     /// Returns the UDP ports this scanner listens on.
     #[must_use]
-    pub fn ports(&self) -> &[u16] {
-        &self.ports
+    pub fn ports(&self) -> Vec<u16> {
+        self.inner.ports.read().clone()
     }
 
     /// Sets the discovery timeout.
-    pub fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout = timeout;
+    pub fn set_timeout(&self, timeout: Duration) {
+        *self.inner.timeout.write() = timeout;
     }
 
-    /// Sets the UDP ports to scan.
-    pub fn set_ports(&mut self, ports: Vec<u16>) {
-        self.ports = ports;
+    /// Sets the UDP ports to scan and starts receivers for any newly added port.
+    pub fn set_ports(&self, ports: Vec<u16>) {
+        *self.inner.ports.write() = ports;
         self.ensure_passive_listener();
     }
 
-    /// Sets the local bind address.
-    pub fn set_bind_address(&mut self, addr: &str) -> Result<()> {
-        self.bind_addr = addr.to_string();
+    /// Sets the local bind address and starts receivers if the listener wasn't running.
+    pub fn set_bind_address(&self, addr: &str) -> Result<()> {
+        *self.inner.bind_addr.write() = addr.to_string();
         self.ensure_passive_listener();
         Ok(())
-    }
-
-    #[must_use]
-    pub fn with_timeout(&self, timeout: Duration) -> Self {
-        let mut s = self.clone();
-        s.set_timeout(timeout);
-        s
-    }
-
-    #[must_use]
-    pub fn with_ports(&self, ports: Vec<u16>) -> Self {
-        let mut s = self.clone();
-        s.set_ports(ports);
-        s
-    }
-
-    #[must_use]
-    pub fn with_bind_addr(&self, addr: String) -> Self {
-        let mut s = self.clone();
-        let _ = s.set_bind_address(&addr);
-        s
     }
 
     /// Returns a `watch` receiver that fires whenever any device is
@@ -529,11 +502,18 @@ impl Scanner {
         false
     }
 
-    /// Best-effort local-IP detection. Cached process-wide via `LOCAL_IP_CACHE`
-    /// so the (blocking) socket calls run at most once. Tries multiple
-    /// non-routing destinations so the lookup works in air-gapped LANs where
-    /// `8.8.8.8` is unreachable. UDP `connect()` only performs a kernel route
-    /// lookup; no packet is actually sent.
+    /// Best-effort local-IP detection. Tries multiple non-routing destinations
+    /// so the lookup works in air-gapped LANs where `8.8.8.8` is unreachable.
+    /// UDP `connect()` only performs a kernel route lookup; no packet is
+    /// actually sent.
+    ///
+    /// Intentionally **not cached**: an `OnceLock` here would freeze the local
+    /// IP at first call, so a host whose IP later changes (DHCP renewal, WiFi
+    /// switch, VPN up/down, container restart, …) would forever stamp the
+    /// stale address into v3.5 discovery broadcasts. The lookup is sub-
+    /// millisecond and only runs from `send_discovery_broadcast`, which fires
+    /// at most a few times per active scan and is itself throttled by the
+    /// 30-minute global scan cooldown — so the saved cost is negligible.
     fn discover_local_ip_blocking() -> Option<String> {
         // Each candidate covers a different network environment:
         //   - "8.8.8.8"        : internet-connected hosts (most common)
@@ -557,18 +537,9 @@ impl Scanner {
         None
     }
 
-    /// Returns the local LAN IP, computing it once per process. Safe to call
-    /// from an async context: the lookup is cached, so only the very first
-    /// invocation does any blocking work.
-    fn get_local_ip(&self) -> Option<String> {
-        static LOCAL_IP_CACHE: OnceLock<Option<String>> = OnceLock::new();
-        LOCAL_IP_CACHE
-            .get_or_init(Self::discover_local_ip_blocking)
-            .clone()
-    }
-
     async fn send_discovery_broadcast(&self, socket: &UdpSocket, port: u16) -> Result<()> {
-        let local_ip = self.get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+        let local_ip =
+            Self::discover_local_ip_blocking().unwrap_or_else(|| "0.0.0.0".to_string());
         debug!("Sending discovery broadcast on port {port} (local IP: {local_ip})");
 
         let (payload, prefix) = if port == 7000 {
@@ -630,7 +601,7 @@ impl Scanner {
         &self,
     ) -> impl futures_util::Stream<Item = DiscoveryResult> + Send + 'static {
         let state = self.inner.clone();
-        let timeout_dur = self.timeout;
+        let timeout_dur = *state.timeout.read();
         let start_time = Instant::now();
         let scanner = self.clone();
 
@@ -741,7 +712,8 @@ impl Scanner {
 
         info!(
             "Starting Tuya device scan (addr: {}, ports: {:?})...",
-            self.bind_addr, self.ports
+            self.inner.bind_addr.read(),
+            self.inner.ports.read()
         );
 
         let results: Vec<_> = self.scan_stream_instance().collect().await;
@@ -844,18 +816,19 @@ impl Scanner {
         // resolves immediately instead of hanging.
         let mut discovery_rx = state.subscribe_discoveries();
 
+        let timeout_dur = *state.timeout.read();
         loop {
             if let Some(res) = state.cache.read().get(device_id).cloned() {
                 return Some(res);
             }
 
             let elapsed = start_wait.elapsed();
-            if elapsed >= self.timeout || !state.active_scanning.load(Ordering::SeqCst) {
+            if elapsed >= timeout_dur || !state.active_scanning.load(Ordering::SeqCst) {
                 // One last check before giving up
                 return state.cache.read().get(device_id).cloned();
             }
 
-            let remaining = self.timeout.saturating_sub(elapsed);
+            let remaining = timeout_dur.saturating_sub(elapsed);
 
             if let Some(ct) = cancel {
                 tokio::select! {
@@ -871,11 +844,12 @@ impl Scanner {
 
     async fn perform_discovery_loop(self) -> Result<()> {
         let state = &self.inner;
+        let ports_snapshot: Vec<u16> = state.ports.read().clone();
         let mut target_sockets = Vec::new();
 
         {
             let guard = state.sockets.read();
-            for &port in &self.ports {
+            for &port in &ports_snapshot {
                 if let Some(socket) = guard.get(&port) {
                     target_sockets.push((socket.clone(), port));
                 }
@@ -886,7 +860,7 @@ impl Scanner {
             // If no sockets found in passive listener, try to ensure it's started for these ports
             self.ensure_passive_listener();
             let guard = state.sockets.read();
-            for &port in &self.ports {
+            for &port in &ports_snapshot {
                 if let Some(socket) = guard.get(&port) {
                     target_sockets.push((socket.clone(), port));
                 }
@@ -900,9 +874,10 @@ impl Scanner {
         let start = Instant::now();
         let mut broadcast_interval = interval(BROADCAST_INTERVAL);
         let mut broadcast_count = 0;
+        let timeout_dur = *state.timeout.read();
 
-        while start.elapsed() < self.timeout {
-            let remaining = self.timeout.saturating_sub(start.elapsed());
+        while start.elapsed() < timeout_dur {
+            let remaining = timeout_dur.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 break;
             }
@@ -1043,51 +1018,6 @@ fn parse_json(val: &Value) -> Option<DiscoveryResult> {
     })
 }
 
-/// Builder for creating a custom `Scanner`.
-#[derive(Debug, Default)]
-pub struct ScannerBuilder {
-    timeout: Option<Duration>,
-    bind_addr: Option<String>,
-    ports: Option<Vec<u16>>,
-}
-
-impl ScannerBuilder {
-    /// Creates a new `ScannerBuilder` with default settings.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Sets the timeout for discovery.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Sets the local address to bind to.
-    pub fn bind_addr<S: Into<String>>(mut self, addr: S) -> Self {
-        self.bind_addr = Some(addr.into());
-        self
-    }
-
-    /// Sets the UDP ports to scan.
-    pub fn ports(mut self, ports: Vec<u16>) -> Self {
-        self.ports = Some(ports);
-        self
-    }
-
-    /// Builds and returns a new `Scanner`.
-    pub fn build(self) -> Scanner {
-        let scanner = Scanner {
-            inner: Arc::new(ScannerState::new()),
-            timeout: self.timeout.unwrap_or(DEFAULT_SCAN_TIMEOUT),
-            bind_addr: self.bind_addr.unwrap_or_else(|| "0.0.0.0".to_string()),
-            ports: self.ports.unwrap_or_else(|| vec![6666, 6667, 7000]),
-        };
-        scanner.ensure_passive_listener();
-        scanner
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,4 +1149,63 @@ mod tests {
     // unit tests; lifecycle-level coverage is in
     // `packet_tx_lifecycle_persists_then_clears_on_stop` and
     // `reset_cancel_token_yields_fresh_uncancelled_token` above.
+
+    // 0.3.0-rc.2: Scanner config (`timeout`, `bind_addr`, `ports`) lives in
+    // `ScannerState` behind a lock so setters can take `&self`. Verifies the
+    // mutation is observable through the same `Arc<ScannerState>` — i.e.
+    // setting on one `Scanner` clone is visible from another, which is the
+    // property that makes `Scanner::get().set_*` work on the global.
+    #[test]
+    fn setters_take_self_and_share_state_across_clones() {
+        let inner = Arc::new(ScannerState::new());
+        let a = Scanner {
+            inner: inner.clone(),
+        };
+        let b = Scanner { inner };
+
+        // Default sanity.
+        assert_eq!(a.timeout(), DEFAULT_SCAN_TIMEOUT);
+        assert_eq!(a.bind_addr(), "0.0.0.0");
+        assert_eq!(a.ports(), vec![6666, 6667, 7000]);
+
+        // Mutation through `a` is visible from `b` (same Arc<ScannerState>).
+        // Note: we don't call `set_ports` / `set_bind_address` here because
+        // they trigger `ensure_passive_listener`, which needs real sockets.
+        // `set_timeout` is socket-free.
+        a.set_timeout(Duration::from_secs(42));
+        assert_eq!(b.timeout(), Duration::from_secs(42));
+
+        // Direct state mutation locks in that the other two fields are
+        // *stored* on shared state too (without triggering socket binds).
+        *a.inner.bind_addr.write() = "127.0.0.1".to_string();
+        *a.inner.ports.write() = vec![9999];
+        assert_eq!(b.bind_addr(), "127.0.0.1");
+        assert_eq!(b.ports(), vec![9999]);
+    }
+
+    // 0.3.0-rc.2: lock in that the local-IP lookup is *not* cached. A
+    // process-wide `OnceLock` over an `Option<String>` here would freeze the
+    // result at first call, breaking long-running processes whose host IP
+    // changes (DHCP, WiFi switch, VPN, container restart). The forbidden
+    // tokens are assembled at runtime so this very test doesn't trip itself.
+    #[test]
+    fn local_ip_lookup_is_not_cached() {
+        let src = include_str!("scanner.rs");
+        let forbidden_static = format!("LOCAL{}IP{}CACHE", "_", "_");
+        assert!(
+            !src.contains(&forbidden_static),
+            "scanner.rs must not reintroduce the local-IP cache static — see \
+             docs/technical-notes.md §Local-IP discovery for rationale"
+        );
+        // Belt-and-suspenders: also forbid OnceLock around the lookup result.
+        // OnceLock is still used legitimately for GLOBAL_SCANNER and tokio
+        // runtime; we only want to catch the "static once-cell of optional
+        // string" shape that the previous LOCAL_IP cache had.
+        let forbidden_ty = format!("Once{}<Option<String>>", "Lock");
+        assert!(
+            !src.contains(&forbidden_ty),
+            "scanner.rs must not cache an Option<String> via OnceLock — that \
+             would freeze the local IP for the process lifetime"
+        );
+    }
 }

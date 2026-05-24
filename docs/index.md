@@ -23,6 +23,7 @@ Rustuya is a high-performance, concurrency-friendly implementation of the Tuya L
 - [**Python Examples**](./python-examples.md) - Practical code examples for common Python use cases.
 - [**Design Philosophy**](./philosophy.md) - Core concepts and the underlying execution model.
 - [**Architecture**](./architecture.md) - System design and internal component breakdown.
+- [**Technical Notes**](./technical-notes.md) - Maintainer-facing notes on lifecycles, channels, timers, and other internals.
 - [**FAQ**](./faq.md) - Frequently asked questions and troubleshooting.
 
 ---

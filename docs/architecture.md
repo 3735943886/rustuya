@@ -23,3 +23,7 @@ Rustuya is designed with a layered architecture that separates network concerns,
 - **Runtime ([runtime.rs](https://github.com/3735943886/rustuya/blob/master/src/runtime.rs))**: Internal utilities for managing background tasks and timers.
 - **Sync ([sync.rs](https://github.com/3735943886/rustuya/blob/master/src/sync.rs))**: A blocking wrapper around the asynchronous core, providing a simple interface for synchronous environments.
 - **Python ([python/src/lib.rs](https://github.com/3735943886/rustuya/blob/master/python/src/lib.rs))**: PyO3-based bindings that expose the library's functionality to Python with native performance.
+
+---
+
+For maintainer-facing notes on how each component actually behaves at runtime — lifecycles, channels, timers, backoff math, the unified-listener model, and the small decisions that the layer overview glosses over — see [**Technical Notes**](./technical-notes.md).

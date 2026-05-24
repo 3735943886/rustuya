@@ -604,13 +604,24 @@ impl Scanner {
         SYNC_SCANNER.get_or_init(Self::new)
     }
 
-    /// Creates a new Scanner builder.
-    pub fn builder() -> ScannerBuilder {
-        ScannerBuilder::new()
-    }
-
     fn new() -> Self {
         Self::from_async(get_async_scanner().clone())
+    }
+
+    /// Sets the discovery timeout on the underlying global scanner.
+    pub fn set_timeout(&self, timeout: std::time::Duration) {
+        self.inner.set_timeout(timeout);
+    }
+
+    /// Sets the UDP ports on the underlying global scanner; starts receivers
+    /// for any newly added port.
+    pub fn set_ports(&self, ports: Vec<u16>) {
+        self.inner.set_ports(ports);
+    }
+
+    /// Sets the local bind address on the underlying global scanner.
+    pub fn set_bind_address(&self, addr: &str) -> Result<()> {
+        self.inner.set_bind_address(addr)
     }
 
     pub(crate) fn from_async(async_scanner: AsyncScanner) -> Self {
@@ -689,44 +700,6 @@ impl Scanner {
         });
 
         rx
-    }
-}
-
-/// Builder for creating a custom synchronous `Scanner`.
-pub struct ScannerBuilder {
-    inner: crate::scanner::ScannerBuilder,
-}
-
-impl Default for ScannerBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ScannerBuilder {
-    pub fn new() -> Self {
-        Self {
-            inner: crate::scanner::ScannerBuilder::new(),
-        }
-    }
-
-    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.inner = self.inner.timeout(timeout);
-        self
-    }
-
-    pub fn bind_addr<S: Into<String>>(mut self, addr: S) -> Self {
-        self.inner = self.inner.bind_addr(addr);
-        self
-    }
-
-    pub fn ports(mut self, ports: Vec<u16>) -> Self {
-        self.inner = self.inner.ports(ports);
-        self
-    }
-
-    pub fn build(self) -> Scanner {
-        Scanner::from_async(self.inner.build())
     }
 }
 
