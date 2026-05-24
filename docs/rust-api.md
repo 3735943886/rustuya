@@ -61,7 +61,7 @@ Direct interaction with individual Tuya devices.
       .address("192.168.1.100")
       .version(Version::V3_4)            // or "3.4".parse::<Version>()?
       .nowait(true)
-      .run();
+      .build();
   ```
 
 ### `device.status()`
