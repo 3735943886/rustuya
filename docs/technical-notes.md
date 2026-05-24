@@ -228,9 +228,13 @@ Two constants, both in [`src/device/mod.rs:27-31`](../src/device/mod.rs#L27-L31)
 - `SLEEP_HEARTBEAT_DEFAULT = 7s` — minimum gap since `last_sent` before
   we actually send a heartbeat.
 
-Net effect: heartbeats go out every 5–10 seconds of idleness, never
-back-to-back if the user is actively sending commands. Any successful
-send updates `last_sent`, so a busy device sees no heartbeat traffic at all.
+Net effect: heartbeats go out roughly **every 10 seconds** of idleness
+(every other 5s tick: the first tick after a send sees `last_sent`
+elapsed of 5s < 7s and skips; the second tick sees 10s ≥ 7s and fires,
+which updates `last_sent` — and the cycle repeats). Never back-to-back
+if the user is actively sending commands: any successful send updates
+`last_sent` via `update_last_sent` in `send_raw_to_stream`, so a busy
+device sees no heartbeat traffic at all.
 
 `process_heartbeat` ([`actor.rs:922`](../src/device/actor.rs#L922))
 short-circuits if `last_sent.elapsed() < SLEEP_HEARTBEAT_DEFAULT`.
@@ -266,7 +270,15 @@ even if our `write_half` thinks the TCP socket is still up.
 - `failure_count` is reset after **3 consecutive successes**
   ([`actor.rs:82-93`](../src/device/actor.rs#L82-L93)). One success
   isn't enough — that suppresses backoff oscillation when the device is
-  flapping.
+  flapping. **Operational consequence to be aware of:** the rule is
+  "3 in a row", and `success_count` is set back to 0 on any failure.
+  A device that succeeds 80% of the time but flakes the rest will
+  reliably get to `success_count = 2` and then trip back to 0 before
+  resetting `failure_count`, so its `failure_count` plateaus high and
+  its backoff stays long. This is intentional — a chronically flaky
+  device should not get the same short backoff as a freshly recovered
+  one — but it does mean "I see successes in the log, why is the
+  backoff still huge?" has a non-obvious answer.
 
 ### Scanner-triggered backoff bypass
 
