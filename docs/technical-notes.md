@@ -46,9 +46,6 @@ singleton** — `static GLOBAL_SCANNER: OnceLock<Scanner>`. `Scanner::get()` /
 There is no public constructor and no builder: every consumer goes through
 the singleton, and every configurable knob (`set_timeout`, `set_ports`,
 `set_bind_address`) takes `&self` and mutates the singleton's interior state.
-(A `ScannerBuilder` existed up through 0.3.0-rc.1 but spawned an independent
-instance that bound the same UDP ports — packets went to one socket
-nondeterministically, so it was removed.)
 
 ### Singleton lifecycle
 

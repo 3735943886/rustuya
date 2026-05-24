@@ -1398,7 +1398,10 @@ mod tests {
             jitter_for_elapsed(JITTER_QUIET_WINDOW + Duration::from_millis(1)),
             Duration::ZERO
         );
-        assert_eq!(jitter_for_elapsed(Duration::from_secs(3600)), Duration::ZERO);
+        assert_eq!(
+            jitter_for_elapsed(Duration::from_secs(3600)),
+            Duration::ZERO
+        );
     }
 
     #[test]

@@ -538,8 +538,7 @@ impl Scanner {
     }
 
     async fn send_discovery_broadcast(&self, socket: &UdpSocket, port: u16) -> Result<()> {
-        let local_ip =
-            Self::discover_local_ip_blocking().unwrap_or_else(|| "0.0.0.0".to_string());
+        let local_ip = Self::discover_local_ip_blocking().unwrap_or_else(|| "0.0.0.0".to_string());
         debug!("Sending discovery broadcast on port {port} (local IP: {local_ip})");
 
         let (payload, prefix) = if port == 7000 {
