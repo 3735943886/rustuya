@@ -6,10 +6,10 @@
 
 use ::rustuya::Version;
 use ::rustuya::protocol::DeviceType;
-use ::rustuya::sync::{
-    Device as SyncDevice, DeviceCommand, Scanner as SyncScanner, SubDevice as SyncSubDevice,
-    SubDeviceCommand, SyncRequest,
-};
+use ::rustuya::sync::{Device as SyncDevice, Scanner as SyncScanner, SubDevice as SyncSubDevice};
+// FFI dispatch types moved fully behind `sync::internal::*` in 0.3.0-rc.2
+// (the old top-level `sync::DeviceCommand` etc. re-exports are gone).
+use ::rustuya::sync::internal::{DeviceCommand, SubDeviceCommand, SyncRequest};
 use log::LevelFilter;
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;

@@ -217,20 +217,9 @@ impl DeviceBuilder {
     }
 
     /// Finalizes the builder and returns a connected [`Device`].
-    ///
-    /// This is the conventional builder terminal verb. The older
-    /// [`run`](Self::run) name is retained as a deprecated alias and will be
-    /// removed in a future minor release.
     #[must_use]
     pub fn build(self) -> Device {
         Device::with_builder(self)
-    }
-
-    /// Deprecated: prefer [`build`](Self::build).
-    #[must_use]
-    #[deprecated(since = "0.3.0", note = "use `DeviceBuilder::build` instead")]
-    pub fn run(self) -> Device {
-        self.build()
     }
 }
 

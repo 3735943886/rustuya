@@ -40,7 +40,6 @@ use futures_util::StreamExt;
 use log::warn;
 use serde::Serialize;
 use serde_json::Value;
-use std::ops::Deref;
 use std::sync::OnceLock;
 use std::sync::mpsc::TrySendError;
 use std::time::Duration;
@@ -74,30 +73,55 @@ const CHAN_UNIFIED_CAPACITY: usize = 2048;
 /// [`Device`] / [`SubDevice`] / [`Scanner`] facades instead.
 #[doc(hidden)]
 pub mod internal {
+    use super::Result;
     use super::get_runtime;
+    use serde_json::Value;
 
     pub fn get_sync_runtime() -> &'static tokio::runtime::Runtime {
         get_runtime()
     }
 
-    // Re-export the dispatch types for FFI bindings under one canonical path,
-    // so consumers don't have to mix `rustuya::sync::DeviceCommand` and
-    // `rustuya::sync::SubDeviceCommand` with `internal::get_sync_runtime`.
-    // The top-level paths are kept for backward compatibility and will be
-    // removed in a future minor release.
-    pub use super::{DeviceCommand, SubDeviceCommand, SyncRequest};
+    /// Sync-to-async dispatch envelope used by language bindings.
+    pub struct SyncRequest<C, R = Option<String>> {
+        pub command: C,
+        pub resp_tx: std::sync::mpsc::Sender<Result<R>>,
+    }
+
+    /// Command enum for the sync device dispatch worker. Constructed by
+    /// foreign bindings to interleave `blocking_send` with signal handling.
+    #[derive(Debug)]
+    pub enum DeviceCommand {
+        Status,
+        SetDps(Value),
+        SetValue(String, Value),
+        Request {
+            command: crate::protocol::CommandType,
+            data: Option<Value>,
+            cid: Option<String>,
+        },
+        SubDiscover,
+        Close,
+        Stop,
+    }
+
+    /// Command enum for the sync sub-device dispatch worker.
+    #[derive(Debug)]
+    pub enum SubDeviceCommand {
+        Status,
+        SetDps(Value),
+        SetValue(String, Value),
+        Request {
+            command: crate::protocol::CommandType,
+            data: Option<Value>,
+        },
+    }
 }
 
-/// Internal sync-to-async dispatch envelope used by language bindings.
-///
-/// Not part of the stable public API. Visible only because foreign-language
-/// bindings (e.g. pyo3) need to construct it directly to interleave
-/// `blocking_send` with signal handling.
-#[doc(hidden)]
-pub struct SyncRequest<C, R = Option<String>> {
-    pub command: C,
-    pub resp_tx: std::sync::mpsc::Sender<Result<R>>,
-}
+// Pull the FFI types into the sync module's local namespace so the rest of
+// the file reads naturally. The *only* public path to these types is now
+// `rustuya::sync::internal::*` — the old top-level `sync::DeviceCommand`
+// etc. are gone in 0.3.0-rc.2.
+use internal::{DeviceCommand, SubDeviceCommand, SyncRequest};
 
 /// Returns an error if the current thread is inside a tokio runtime context.
 ///
@@ -153,28 +177,6 @@ where
 }
 
 // --- Device ---
-
-/// Internal command enum for the sync device dispatch worker.
-///
-/// Not part of the stable public API. Foreign-language bindings (e.g. pyo3)
-/// construct these directly when they need to interleave `blocking_send`
-/// with signal handling; ordinary Rust callers should use the `Device`
-/// methods (`status()`, `set_dps()`, etc.) instead.
-#[doc(hidden)]
-#[derive(Debug)]
-pub enum DeviceCommand {
-    Status,
-    SetDps(Value),
-    SetValue(String, Value),
-    Request {
-        command: crate::protocol::CommandType,
-        data: Option<Value>,
-        cid: Option<String>,
-    },
-    SubDiscover,
-    Close,
-    Stop,
-}
 
 #[derive(Clone)]
 pub struct Device {
@@ -441,24 +443,6 @@ impl Device {
     }
 }
 
-/// Deprecated implicit coercion to the async device.
-///
-/// This existed so `sync::Device::foo` could fall through to async-only
-/// methods. The downside is that there's no visual cue at the call site
-/// whether `foo` is sync or async — and a user inside a tokio runtime can
-/// accidentally call an async method by `.await`-ing, while a user outside
-/// a runtime might call a sync method that panics under M1.7's guard.
-///
-/// Prefer the explicit [`as_async`](Device::as_async) accessor. The `Deref`
-/// will be removed in a future minor release.
-#[allow(deprecated)]
-impl Deref for Device {
-    type Target = AsyncDevice;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
 // --- DeviceBuilder ---
 
 pub struct DeviceBuilder {
@@ -516,29 +500,9 @@ impl DeviceBuilder {
     pub fn build(self) -> Device {
         Device::from_async(self.inner.build())
     }
-
-    /// Deprecated: prefer [`build`](Self::build).
-    #[deprecated(since = "0.3.0", note = "use `DeviceBuilder::build` instead")]
-    pub fn run(self) -> Device {
-        self.build()
-    }
 }
 
 // --- SubDevice ---
-
-/// Internal command enum for the sync sub-device dispatch worker.
-/// Not part of the stable public API; see [`DeviceCommand`].
-#[doc(hidden)]
-#[derive(Debug)]
-pub enum SubDeviceCommand {
-    Status,
-    SetDps(Value),
-    SetValue(String, Value),
-    Request {
-        command: crate::protocol::CommandType,
-        data: Option<Value>,
-    },
-}
 
 #[derive(Clone)]
 pub struct SubDevice {
@@ -615,15 +579,6 @@ impl SubDevice {
     /// [`Device::as_async`] for why this is preferred over the deprecated
     /// `Deref` coercion.
     pub fn as_async(&self) -> &AsyncSubDevice {
-        &self.inner
-    }
-}
-
-/// Deprecated: prefer [`SubDevice::as_async`].
-#[allow(deprecated)]
-impl Deref for SubDevice {
-    type Target = AsyncSubDevice;
-    fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
