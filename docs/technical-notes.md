@@ -1,11 +1,11 @@
 # Technical Notes
 
-Internal-design notes for maintainers. Things that aren't obvious from a
-single file but are worth knowing before changing behavior. The public API
+Design-level notes about how the runtime actually behaves — lifecycles,
+channels, timers, and the small decisions that aren't obvious from any
+single file. Useful before changing behavior, and equally useful if you
+just want a deeper picture than the high-level docs offer. The public API
 reference lives in [`rust-api.md`](rust-api.md) / [`python-api.md`](python-api.md);
-the high-level layering is in [`architecture.md`](architecture.md). This
-document is for **how the runtime actually behaves** — lifecycles, channels,
-timers, and the small decisions that the docs above gloss over.
+the layering overview is in [`architecture.md`](architecture.md).
 
 ---
 
