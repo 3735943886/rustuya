@@ -81,17 +81,17 @@ read paths — a single dispatcher folds both into the same cache.
                           ▼                                ▼
         ┌─────────────────────────────────────────────────────┐
         │           UDP receiver tasks (per-port)             │
-        │       always-on; bound at singleton init             │
+        │       always-on; bound at singleton init            │
         └───────────────────────┬─────────────────────────────┘
                                 ▼
                 ┌────────────────────────────────┐
-                │   shared mpsc (1024 capacity)   │
+                │   shared mpsc (1024 capacity)  │
                 └───────────────┬────────────────┘
                                 ▼
                 ┌────────────────────────────────┐
-                │   dispatcher task (singular)    │
-                │ parse_packet → cache.write →    │
-                │ publish_discovery (watch++)     │
+                │   dispatcher task (singular)   │
+                │ parse_packet → cache.write →   │
+                │ publish_discovery (watch++)    │
                 └───────────────┬────────────────┘
                                 ▼
                     discovery_version watch channel
