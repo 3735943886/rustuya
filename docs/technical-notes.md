@@ -168,20 +168,19 @@ and all watch-channel subscribers see no discontinuity.
 
 `Notify::notified()` had a narrow re-subscribe race: a publish that fired
 between two `notified().await` calls could be lost. The fix
-([`ScannerState::discovery_version`](../src/scanner.rs#L99)) is a
-`tokio::sync::watch::channel::<u64>`. Each cache update bumps the counter;
-subscribers `changed().await` and re-read the cache. The carried value is
-opaque — the *change itself* is the signal.
+(`ScannerState::discovery_version`) is a `tokio::sync::watch::channel::<u64>`.
+Each cache update bumps the counter; subscribers `changed().await` and
+re-read the cache. The carried value is opaque — the *change itself* is
+the signal.
 
 Subscribers are pre-marked-seen (`mark_unchanged()`) so only future updates
-resolve `changed()`. This pattern shows up in [`subscribe_discoveries`](../src/scanner.rs#L165),
-[`scan_stream_instance`](../src/scanner.rs#L657), and
-[`wait_for_backoff`](../src/device/actor.rs#L496).
+resolve `changed()`. This pattern shows up in `subscribe_discoveries`,
+`scan_stream_instance`, and `wait_for_backoff`.
 
 ### Timing invariants
 
-[`scanner.rs:62-80`](../src/scanner.rs#L62-L80) — discovery active-scan
-schedule:
+`scanner.rs` defines the discovery active-scan schedule near the top of
+the file:
 
 ```
 t=0       broadcast #1   (interval fires immediately on first tick)
@@ -192,9 +191,9 @@ t=18s     timeout        (RECEIVE_MARGIN of 6s after the last broadcast)
 
 `DEFAULT_SCAN_TIMEOUT` is **derived** from `BROADCAST_INTERVAL`,
 `MAX_BROADCASTS`, and `RECEIVE_MARGIN`. A unit test
-([`scan_timeout_leaves_room_after_last_broadcast`](../src/scanner.rs#L1099))
-pins the invariant so a future tweak to one constant can't silently destroy
-the receive window for late replies.
+(`scan_timeout_leaves_room_after_last_broadcast`) pins the invariant so a
+future tweak to one constant can't silently destroy the receive window
+for late replies.
 
 Other timers:
 
@@ -227,7 +226,7 @@ Multiple concurrent `scan_stream()` callers must not both start a discovery
 loop. The "I am the active scanner" claim is a `compare_exchange` on
 `active_scanning: AtomicBool`. Losers fall through to subscribe to the
 discovery channel and yield results from the cache as they arrive.
-Regression test: [`active_scanning_compare_exchange_is_single_winner`](../src/scanner.rs#L1187).
+Regression test: `active_scanning_compare_exchange_is_single_winner`.
 
 ### Active-scan broadcast loop
 
@@ -306,12 +305,20 @@ of them; each one starts a task on construction.
 
 ### Initial jitter
 
-The connection task sleeps a uniform random 0–5000 ms before its first
-connect attempt ([`actor.rs:147`](../src/device/actor.rs#L147)). This
-prevents a thundering herd when many devices are constructed
-back-to-back at process startup. Tests that measure Arc counts must
-account for this — see the note in
-[`unified_listener_cycle_does_not_leak_inner_arcs`](../src/device/listener.rs#L651).
+The connection task sleeps a *conditional* initial jitter before its
+first connect attempt (`record_construction_and_compute_jitter` in
+`device/actor.rs`):
+
+- If the previous `Device::new` happened **within `JITTER_QUIET_WINDOW =
+  100 ms`** of this one, the new task draws a uniform random duration in
+  `0..JITTER_SPREAD` (5000 ms) and sleeps it. This is the thundering-herd
+  guard for fleets being spun up back-to-back.
+- Otherwise (single-device case, or constructions spaced wider than
+  100 ms apart) the jitter is **zero** — the connect attempt runs
+  immediately. A single-device caller pays nothing.
+
+Tests that measure Arc counts must account for this — see the note in
+`unified_listener_cycle_does_not_leak_inner_arcs`.
 
 ### `Arc<DeviceInner>` ownership graph
 
@@ -341,9 +348,9 @@ that captured the token directly.
 Originally `close` was a `DeviceCommand::Disconnect` enqueued on the user
 mpsc. That made shutdown wait behind every queued user request. M2.1
 replaced it with `tokio::sync::Notify` on `DeviceInner`. The actor's
-`select!` ([`actor.rs:301`](../src/device/actor.rs#L301)) listens to
-`close_notify.notified()` alongside `rx.recv()` — so `close()` interrupts
-the current connection without draining the command queue.
+`select!` in `maintain_connection` listens to `close_notify.notified()`
+alongside `rx.recv()` — so `close()` interrupts the current connection
+without draining the command queue.
 
 `stop` fires the notify **first** (drop the connection promptly), then
 the cancel token (exit the outer loop). Ordering matters: cancelling
@@ -356,7 +363,7 @@ contexts don't have to remember to `.await` an immediate operation.
 
 ### Heartbeats
 
-Two constants, both in [`src/device/mod.rs:27-31`](../src/device/mod.rs#L27-L31):
+Two constants, both at the top of `src/device/mod.rs`:
 
 - `SLEEP_HEARTBEAT_CHECK = 5s` — how often the `select!` arm fires.
 - `SLEEP_HEARTBEAT_DEFAULT = 7s` — minimum gap since `last_sent` before
@@ -370,15 +377,15 @@ if the user is actively sending commands: any successful send updates
 `last_sent` via `update_last_sent` in `send_raw_to_stream`, so a busy
 device sees no heartbeat traffic at all.
 
-`process_heartbeat` ([`actor.rs:922`](../src/device/actor.rs#L922))
-short-circuits if `last_sent.elapsed() < SLEEP_HEARTBEAT_DEFAULT`.
-Heartbeats are sent **only when `persist=true`** — `persist=false`
-devices are torn down at the end of a request anyway.
+`process_heartbeat` short-circuits if
+`last_sent.elapsed() < SLEEP_HEARTBEAT_DEFAULT`. Heartbeats are sent
+**only when `persist=true`** — `persist=false` devices are torn down at
+the end of a request anyway.
 
-The interval uses `MissedTickBehavior::Skip` ([`actor.rs:164`](../src/device/actor.rs#L164)) —
-if the actor was busy for several ticks, we get **one** catch-up tick,
-not a flood. (`Burst` is the tokio default; it would queue up missed
-ticks and fire them all at once.)
+The heartbeat `Interval` uses `MissedTickBehavior::Skip` — if the actor
+was busy for several ticks, we get **one** catch-up tick, not a flood.
+(`Burst` is the tokio default; it would queue up missed ticks and fire
+them all at once.)
 
 ### Inactivity timeout
 
@@ -395,14 +402,14 @@ even if our `write_half` thinks the TCP socket is still up.
 
 ### Reconnect backoff
 
-`get_backoff_duration` ([`actor.rs:1247`](../src/device/actor.rs#L1247)):
+`get_backoff_duration`:
 
 - Base: `2^min(failure_count, 10) * SLEEP_RECONNECT_MIN` (16s base),
   capped at `SLEEP_RECONNECT_MAX` (4096s ≈ 68min).
 - Jitter: 70% fixed + 0–30% random. So `failure_count=2` gives
   `64s * (0.7 + rand(0, 0.3))` ≈ 44.8s–64s.
 - `failure_count` is reset after **3 consecutive successes**
-  ([`actor.rs:82-93`](../src/device/actor.rs#L82-L93)). One success
+  (`reset_failure_count`). One success
   isn't enough — that suppresses backoff oscillation when the device is
   flapping. **Operational consequence to be aware of:** the rule is
   "3 in a row", and `success_count` is set back to 0 on any failure.
@@ -448,8 +455,7 @@ The subtle bit: rapid user requests against an unreachable
 `persist=false` device used to translate into a TCP SYN storm — every
 request immediately retried `connect_and_handshake`. M1.5 added an
 exponential backoff *between user-triggered retries* in the
-`persist=false` arm of `try_connect_with_backoff`
-([`actor.rs:411-433`](../src/device/actor.rs#L411-L433)), using the same
+`persist=false` arm of `try_connect_with_backoff`, using the same
 `get_backoff_duration`. `ConnectNow` still bypasses the wait.
 
 ### `nowait` mode
@@ -478,28 +484,26 @@ seqno-based correlation is unreliable. `match_response` in
 - Callers that need strict correlation must serialize their own calls
   per `Device`, or use `Device::listener()` for unsolicited events.
 
-`NO_RESPONSE_CMDS` ([`mod.rs:49-54`](../src/device/mod.rs#L49-L54)):
-session-key negotiation commands and heartbeats. The actor doesn't wait
-for these.
+`NO_RESPONSE_CMDS` (in `src/device/mod.rs`): session-key negotiation
+commands and heartbeats. The actor doesn't wait for these.
 
-`MANDATORY_DATA_CMDS` ([`mod.rs:45`](../src/device/mod.rs#L45)):
-currently just `LanExtStream`. Empty-ACK responses for these commands
-are ignored — the caller wants the actual payload, not the ACK.
+`MANDATORY_DATA_CMDS` (same file): currently just `LanExtStream`.
+Empty-ACK responses for these commands are ignored — the caller wants
+the actual payload, not the ACK.
 
 ### Seqno is informational on the wire
 
-`*seqno = seqno.wrapping_add(1)` ([`actor.rs:957`](../src/device/actor.rs#L957)) —
-the field is informational (see above), so wrapping is benign and avoids
-a debug-build panic on a long-lived connection that crosses
-`u32::MAX`.
+`*seqno = seqno.wrapping_add(1)` (in `build_message`) — the field is
+informational (see above), so wrapping is benign and avoids a debug-build
+panic on a long-lived connection that crosses `u32::MAX`.
 
 ### `get_cipher` read-then-upgrade
 
 Cipher construction is amortized: `get_cipher` reads first
 (`parking_lot::RwLock::read`) and only upgrades to write if the cipher
-needs to be (re)created ([`actor.rs:1240-ish`](../src/device/actor.rs#L1240)).
-Before M2.3 this was a write-lock unconditionally, which serialized the
-reader and writer halves of every connection through cipher access.
+needs to be (re)created. Before M2.3 this was a write-lock unconditionally,
+which serialized the reader and writer halves of every connection through
+cipher access.
 
 ---
 
@@ -513,7 +517,7 @@ reader and writer halves of every connection through cipher access.
 | `CancellationToken` | per `DeviceInner` | n/a | shutdown signal for all tasks holding a clone |
 | `oneshot<Result<Option<TuyaMessage>>>` | per `Request` | 1 | response back to the request's caller |
 | `mpsc<TuyaError>` | per active connection | 1 | reader task → actor (transport errors) |
-| `mpsc<(Vec<u8>, SocketAddr)>` | scanner singleton | 100 | UDP receivers → dispatcher |
+| `mpsc<(Vec<u8>, SocketAddr)>` | scanner singleton | `PACKET_CHANNEL_CAPACITY = 1024` | UDP receivers → dispatcher |
 | `watch<u64>` | scanner singleton | n/a (single-value) | discovery notifications |
 | `std::sync::mpsc::sync_channel<...>` | per sync bridge | `CHAN_WORKER_COMMAND_CAPACITY` / `CHAN_UNIFIED_CAPACITY` | async → sync forwarder |
 
@@ -524,9 +528,8 @@ messages, `broadcast::Receiver::recv()` returns
 `Err(Lagged(n))` instead of the missed messages. `Device::listener()`
 turns that into a synthetic event with
 `payload = {"errorCode": ERR_STATE, "reason": "listener_lagged", "skipped": n}`
-([`listener.rs:39-50`](../src/device/listener.rs#L39-L50)) so the
-consumer can detect and react. `Device::receive()` continues silently
-(it has no event channel to inject into).
+so the consumer can detect and react. `Device::receive()` continues
+silently (it has no event channel to inject into).
 
 128 was picked as a reasonable compromise: tens of devices firing
 simultaneously can briefly burst above the consumer's drain rate without
@@ -539,31 +542,31 @@ hidden.
 
 ### Per-device listener
 
-`Device::listener()` ([`listener.rs:19`](../src/device/listener.rs#L19))
-returns an `impl Stream<Item = Result<TuyaMessage>> + Send + 'static`
-backed by a fresh `broadcast::Receiver` and a `Device` clone (one strong
-Arc). The stream's `select!` listens to both the broadcast and
+`Device::listener()` returns an
+`impl Stream<Item = Result<TuyaMessage>> + Send + 'static` backed by a
+fresh `broadcast::Receiver` and a `Device` clone (one strong Arc). The
+stream's `select!` listens to both the broadcast and
 `cancel_token.cancelled()` — without the cancel branch, the stream
 would only exit when `broadcast_tx` is dropped, which requires the very
 last `Arc<DeviceInner>` to disappear — and the stream itself holds one
 of those refs.
 
-Empty-payload messages are filtered out at the source ([`listener.rs:34-38`](../src/device/listener.rs#L34-L38))
-so the listener only sees real events.
+Empty-payload messages are filtered out at the source so the listener
+only sees real events.
 
 ### `unified_listener(Vec<Device>)` — async
 
-[`listener.rs:70`](../src/device/listener.rs#L70). A pure function that
+`unified_listener` in `src/device/listener.rs` is a pure function that
 maps each device's `listener()` into a `DeviceEvent { device_id, message }`
 and merges them with `futures_util::stream::select_all`. No spawn, no
 hidden state — the returned stream is a normal `impl Stream`. Dropping
 it releases every per-device subscription. Dropping one device
 mid-stream loses that sub-stream but doesn't kill the merged stream
-([test](../src/device/listener.rs#L468)).
+(regression test: `stopping_one_device_does_not_kill_unified_stream`).
 
 ### `unified_listener(Vec<sync::Device>)` — sync
 
-[`sync.rs:735`](../src/sync.rs#L735). Builds the async stream the same
+`unified_listener` in `src/sync.rs` builds the async stream the same
 way, then spawns a `bridge_to_sync` task on the library runtime that
 pumps items into a `std::sync::mpsc::sync_channel<Result<DeviceEvent>>`.
 The caller gets a `Receiver` they can `recv()` from any thread (no
@@ -603,7 +606,7 @@ status emission.
 ## 6. Sync wrapper
 
 [`src/sync.rs`](../src/sync.rs). Each `sync::Device` owns a long-lived
-worker task spawned on the library runtime ([`sync.rs:215`](../src/sync.rs#L215))
+worker task spawned on the library runtime (in `sync::Device::from_async`)
 that owns the underlying async `Device` and reads `SyncRequest`s from a
 tokio mpsc, then sends responses back via oneshot. Calling
 `sync::Device::status()` looks like a blocking call but is really:
@@ -651,8 +654,11 @@ also still work for backward compatibility but will be removed in a
 future minor.
 
 Python's GIL is **released** for the duration of any blocking sync call
-(`py.allow_threads(...)`). The Rust worker doesn't need the GIL, and
-other Python threads stay live.
+(`py.detach(...)` on the Rust side; `Python::attach(...)` is used when
+the binding briefly needs the GIL back, e.g. to call
+`py.check_signals()`). The Rust worker doesn't need the GIL, and other
+Python threads stay live. (pyo3 renamed the historic `allow_threads`
+helper to `detach` in 0.27; the doc snippet uses the current name.)
 
 ---
 
@@ -663,9 +669,9 @@ other Python threads stay live.
   If the scanner is in cooldown and has no cached entry, this can wait
   up to `Scanner::timeout` (default 18s).
 - **`Version::Auto`** is resolved opportunistically from a scanner hit
-  during address resolution ([`actor.rs:737-741`](../src/device/actor.rs#L737-L741)).
-  If the scanner never sees the device, version stays `Auto` and the
-  protocol defaults are used.
+  during address resolution (in `resolve_address`). If the scanner never
+  sees the device, version stays `Auto` and the protocol defaults are
+  used.
 - **`set_address`** sets `force_discovery = true`, so the next connect
   attempt will re-query the scanner even if there's a cached entry.
 - **Constructing many devices at startup** is expensive (one tokio task
