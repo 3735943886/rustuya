@@ -5,9 +5,77 @@
 [![Documentation](https://docs.rs/rustuya/badge.svg)](https://docs.rs/rustuya)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Rustuya is a Rust implementation of the Tuya Local API. It enables local control and monitoring of Tuya-compatible devices without cloud dependencies.
+Local-network control of Tuya-compatible devices, built in Rust with
+first-class Python bindings. Designed for fleets of hundreds to
+thousands of devices — a native Rust core handles the I/O while the
+Python facade releases the GIL on every blocking call, so threaded
+Python workers stay live.
 
-[Guide](https://3735943886.github.io/rustuya/)
+## Install
+
+**Rust**
+
+```bash
+cargo add rustuya
+```
+
+**Python**
+
+```bash
+pip install rustuya
+```
+
+## Quick start
+
+**Rust** (async; a sync wrapper lives at `rustuya::sync`)
+
+```rust
+use rustuya::Device;
+use futures_util::StreamExt;
+
+let dev = Device::builder("DEVICE_ID", "LOCAL_KEY")
+    .address("192.168.1.100")
+    .build();
+dev.set_value(1, true).await?;                  // turn on DP 1
+println!("{:?}", dev.status().await?);          // read current DPS
+
+let mut events = dev.listener();
+while let Some(msg) = events.next().await {     // real-time events
+    println!("{:?}", msg);
+}
+```
+
+**Python**
+
+```python
+from rustuya import Device
+
+dev = Device("DEVICE_ID", "LOCAL_KEY", address="192.168.1.100")
+dev.set_value(1, True)                # turn on DP 1
+print(dev.status())                   # read current DPS
+
+for msg in dev.listener():             # real-time events
+    print(msg)
+```
+
+## Features
+
+- Local-only — talks directly to devices over LAN, no Tuya Cloud
+- Rust core + Python bindings (PyO3) — same engine for both
+- Built for fleet scale — per-device background tasks with
+  automatic reconnection and exponential backoff
+- Full protocol coverage — Tuya 3.1 / 3.2 / 3.3 / 3.4 / 3.5 + device22
+
+See the [Guide](https://3735943886.github.io/rustuya/) for the full API
+reference, design philosophy, and architecture notes.
+
+## Credits
+
+The Tuya protocol layer in rustuya is derived from the specifications
+and error codes documented in
+[tinytuya](https://github.com/jasonacox/tinytuya):
+
+- [Protocol Reference](https://github.com/jasonacox/tinytuya/blob/master/PROTOCOL.md)
 
 ## License
 

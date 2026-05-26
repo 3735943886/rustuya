@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "rustuya"
 dynamic = ["version"]
-readme = "README-PYTHON.md"
+readme = "README.md"
 description = "A fast and concurrent Tuya Local API implementation in Rust"
 authors = [
     { name = "3735943886" }
