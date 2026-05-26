@@ -31,9 +31,9 @@ Direct interaction and control for individual Tuya devices.
   - `address` (str, *Optional*): IP address. Default is `"Auto"` (uses UDP discovery).
   - `version` (str, *Optional*): Protocol version. Default is `"Auto"`.
   - `dev_type` (str, *Optional*): Device architecture type.
-    - `None` (default): **Automatic detection**. Switches to `"device22"` if ID length is 22.
-    - `"default"`: Force standard Tuya device architecture (disables auto-detection).
-    - `"device22"`: Force specialized 22-character ID architecture.
+    - `None` (default): **Automatic detection** — switches to `"device22"` at runtime under certain protocol-level conditions.
+    - `"default"`: Force the standard Tuya device architecture (disables auto-detection).
+    - `"device22"`: Force the device22 protocol variant.
   - `persist` (bool, *Optional*): Whether to keep the TCP connection alive. Default is `True`.
   - `timeout` (float, *Optional*): Global timeout for network operations and responses in seconds (default: 10.0)
   - `nowait` (bool, *Optional*): If `True`, command methods return immediately after queuing. Default is `False`.
