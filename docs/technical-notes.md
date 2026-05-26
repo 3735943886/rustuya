@@ -76,7 +76,7 @@ packet shape on the wire. There's no point running two separate UDP
 read paths — a single dispatcher folds both into the same cache.
 
 ```
-        (1) periodic advertise           (2) reply to probe
+      (1) periodic advertise           (2) reply to probe
                 │                                │
                 ▼                                ▼
         ┌────────────────────────────────────────────────┐
@@ -99,7 +99,7 @@ read paths — a single dispatcher folds both into the same cache.
            ┌────────────────────┼────────────────────┐
            ▼                    ▼                    ▼
   scan_stream consumer   discover_device   Device::wait_for_backoff
-  (yields cache items)    (waits for ID)   (scanner-bypass logic)
+  (yields cache items)    (waits for ID)    (scanner-bypass logic)
 
    (the box on the right also has, alongside it, the *active scan*
     discovery loop which writes broadcasts back into the UDP receiver
