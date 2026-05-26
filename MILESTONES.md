@@ -251,7 +251,8 @@ currently triggering in production use — they're defense in depth.
 Items to handle before promoting `0.3.0-rc.X` to a stable `0.3.0` tag.
 Collected here so they don't get lost between rc cycles.
 
-- [ ] **docs/rust-api.md**: `.run()` → `.build()` at [line 64](docs/rust-api.md#L64). The DeviceBuilder example still shows the deprecated terminal verb.
+- [x] **docs/rust-api.md**: `.run()` → `.build()` at line 64. ✅ Done in rc.3 (the DeviceBuilder example now shows `.build()`).
+- [ ] **docs/getting-started.md**: bump `rustuya = "0.2"` (line 13) → `"0.3"` once 0.3.0 stable is tagged. Cargo will not resolve pre-release versions from a plain `"0.3"` requirement, so leaving the example at `"0.2"` during the rc cycle is intentional; flip it the moment stable ships.
 - [ ] **docs/rust-api.md / docs/getting-started.md**: consider adding a "sync vs async" note that mirrors the new [`lib.rs` section](src/lib.rs) — currently the GitHub Pages site has no guidance on which facade to pick from a tokio context.
 - [ ] **docs/python-api.md**: review for `.run()` references in any embedded Rust snippets; the python-side API itself didn't change (`Device(...)` still works the same way).
 - [ ] **README.md**: light pass for any `0.2.x`-era assumptions; current README is mostly badges/links so probably nothing to change.
