@@ -27,20 +27,16 @@ pip install rustuya
 
 ## Quick start
 
-**Rust** (async; a sync wrapper lives at `rustuya::sync`)
+**Rust**
 
 ```rust
-use rustuya::Device;
-use futures_util::StreamExt;
+use rustuya::sync::Device;
 
-let dev = Device::builder("DEVICE_ID", "LOCAL_KEY")
-    .address("192.168.1.100")
-    .build();
-dev.set_value(1, true).await?;                  // turn on DP 1
-println!("{:?}", dev.status().await?);          // read current DPS
+let dev = Device::new("DEVICE_ID", "LOCAL_KEY");
+dev.set_value(1, true)?;                        // turn on DP 1
+println!("{:?}", dev.status()?);                // read current DPS
 
-let mut events = dev.listener();
-while let Some(msg) = events.next().await {     // real-time events
+for msg in dev.listener() {                     // real-time events
     println!("{:?}", msg);
 }
 ```
@@ -50,11 +46,11 @@ while let Some(msg) = events.next().await {     // real-time events
 ```python
 from rustuya import Device
 
-dev = Device("DEVICE_ID", "LOCAL_KEY", address="192.168.1.100")
-dev.set_value(1, True)                # turn on DP 1
-print(dev.status())                   # read current DPS
+dev = Device("DEVICE_ID", "LOCAL_KEY")
+dev.set_value(1, True)                          # turn on DP 1
+print(dev.status())                             # read current DPS
 
-for msg in dev.listener():             # real-time events
+for msg in dev.listener():                      # real-time events
     print(msg)
 ```
 
