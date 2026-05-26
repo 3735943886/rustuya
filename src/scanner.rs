@@ -667,7 +667,17 @@ impl Scanner {
     }
 
     async fn send_discovery_broadcast(&self, socket: &UdpSocket, port: u16) -> Result<()> {
-        let local_ip = Self::discover_local_ip_blocking().unwrap_or_else(|| "0.0.0.0".to_string());
+        let local_ip = Self::discover_local_ip_blocking().unwrap_or_else(|| {
+            // All three candidate destinations failed a kernel route lookup —
+            // typically only happens on containers/namespaces with an empty
+            // routing table. v3.5 (port 7000) payloads carry this IP and some
+            // firmwares ignore broadcasts with `ip="0.0.0.0"`, so surface it.
+            warn!(
+                "Local IP detection failed for discovery broadcast on port {port}; \
+                 falling back to 0.0.0.0"
+            );
+            "0.0.0.0".to_string()
+        });
         debug!("Sending discovery broadcast on port {port} (local IP: {local_ip})");
 
         let (payload, prefix) = if port == 7000 {
