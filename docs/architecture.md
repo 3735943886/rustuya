@@ -16,7 +16,7 @@ Rustuya is designed with a layered architecture that separates network concerns,
 
 ## **Component Breakdown**
 
-- **Device ([device.rs](https://github.com/3735943886/rustuya/blob/master/src/device.rs))**: Represents a single physical Tuya device. Manages its own background connection task.
+- **Device ([device/](https://github.com/3735943886/rustuya/tree/master/src/device))**: Represents a single physical Tuya device. Manages its own background connection task.
 - **Protocol ([protocol/mod.rs](https://github.com/3735943886/rustuya/blob/master/src/protocol/mod.rs))**: Implements the Tuya protocol versions (3.1 to 3.5, and device22 variation).
 - **Crypto ([crypto.rs](https://github.com/3735943886/rustuya/blob/master/src/crypto.rs))**: Handles AES encryption and MD5/HMAC hashing required by the protocol.
 - **Scanner ([scanner.rs](https://github.com/3735943886/rustuya/blob/master/src/scanner.rs))**: Manages UDP discovery for finding devices on the local network.

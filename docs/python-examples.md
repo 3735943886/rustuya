@@ -106,7 +106,7 @@ for event in listener:
 
 ---
 
-## **6. Gateway & Sub-devices**
+## **5. Gateway & Sub-devices**
 To control sub-devices connected via a Zigbee/Bluetooth gateway.
 
 ```python
@@ -124,7 +124,7 @@ sub_dev.set_value(1, True)
 status = sub_dev.status()
 print(f"Sub-device status: {status}")
 
-# 5. Discover all sub-devices connected to the gateway
+# 4. Discover all sub-devices connected to the gateway
 print("Requesting sub-device discovery...")
 sub_devices = gateway.sub_discover()
 print(f"Found sub-devices: {sub_devices}")
@@ -132,7 +132,7 @@ print(f"Found sub-devices: {sub_devices}")
 
 ---
 
-## **7. Advanced Raw Requests**
+## **6. Advanced Raw Requests**
 Send custom commands using `CommandType`.
 
 ```python
@@ -151,7 +151,7 @@ dev.request(CommandType["DpQuery"], None)
 
 ---
 
-## **8. System Optimization**
+## **7. System Optimization**
 For high-performance applications managing many devices.
 
 ```python
