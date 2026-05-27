@@ -19,6 +19,16 @@ pub const PREFIX_6699: u32 = 0x00006699;
 pub const SUFFIX_55AA: u32 = 0x0000AA55;
 pub const SUFFIX_6699: u32 = 0x00009966;
 
+/// Upper bound on the wire-claimed payload length accepted by
+/// [`parse_header`]. Real Tuya LAN payloads are small (status/control are
+/// well under 1 KiB; bulk responses like sub-device lists or `LanExtStream`
+/// can be larger), so 256 KiB clears every legitimate frame while bounding
+/// the allocation a malformed or malicious 16-byte header can trigger in
+/// `read_full_packet` (which otherwise resizes a buffer to the claimed
+/// length before reading). Without this, a single header claiming a
+/// near-`u32::MAX` length is a memory-amplification DoS.
+pub const MAX_PAYLOAD_LEN: u32 = 256 * 1024;
+
 define_command_type! {
     ApConfig = 0x01,
     Active = 0x02,
@@ -460,6 +470,25 @@ pub fn pack_message(msg: &TuyaMessage, hmac_key: Option<&[u8]>) -> Result<Vec<u8
     Ok(data)
 }
 
+/// Validates a wire-supplied payload length against [`MAX_PAYLOAD_LEN`] and
+/// returns the framed total length (`payload_len + header_overhead`).
+///
+/// The bound check rejects a header claiming an implausible length before
+/// any allocation keyed off it; the `checked_add` guards the addition
+/// against `u32` overflow (belt-and-suspenders — the bound already keeps
+/// the sum far from `u32::MAX`, but this stays correct if the cap is ever
+/// raised).
+fn checked_total_length(payload_len: u32, header_overhead: u32) -> Result<u32> {
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(TuyaError::DecodeError(format!(
+            "Header claims payload length {payload_len} exceeds maximum {MAX_PAYLOAD_LEN}"
+        )));
+    }
+    payload_len
+        .checked_add(header_overhead)
+        .ok_or_else(|| TuyaError::DecodeError("Header length overflow".into()))
+}
+
 pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
     if data.len() < 16 {
         return Err(TuyaError::DecodeError("Header too short".into()));
@@ -473,7 +502,7 @@ pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
             let seqno = cursor.read_u32::<BigEndian>()?;
             let cmd = cursor.read_u32::<BigEndian>()?;
             let payload_len = cursor.read_u32::<BigEndian>()?;
-            let total_length = payload_len + 16;
+            let total_length = checked_total_length(payload_len, 16)?;
             Ok(TuyaHeader {
                 prefix,
                 seqno,
@@ -490,7 +519,7 @@ pub fn parse_header(data: &[u8]) -> Result<TuyaHeader> {
             let seqno = cursor.read_u32::<BigEndian>()?;
             let cmd = cursor.read_u32::<BigEndian>()?;
             let payload_len = cursor.read_u32::<BigEndian>()?;
-            let total_length = payload_len + 18 + 4;
+            let total_length = checked_total_length(payload_len, 18 + 4)?;
             Ok(TuyaHeader {
                 prefix,
                 seqno,

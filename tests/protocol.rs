@@ -2,7 +2,8 @@
 //! and v3.4/v3.5 (55AA + HMAC, 6699 + GCM) framing variants.
 
 use rustuya::protocol::{
-    PREFIX_55AA, PREFIX_6699, TuyaMessage, pack_message, parse_header, unpack_message,
+    MAX_PAYLOAD_LEN, PREFIX_55AA, PREFIX_6699, TuyaMessage, pack_message, parse_header,
+    unpack_message,
 };
 
 const KEY: &[u8] = b"0123456789abcdef";
@@ -117,4 +118,34 @@ fn parse_header_rejects_short_input() {
 fn parse_header_rejects_unknown_prefix() {
     let bytes = [0u8; 16];
     assert!(parse_header(&bytes).is_err());
+}
+
+/// Builds a minimal 16-byte 55AA header carrying `payload_len`; seqno and
+/// cmd are left zero. Used to exercise the length-bound guard.
+fn header_55aa(payload_len: u32) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&PREFIX_55AA.to_be_bytes());
+    b[12..16].copy_from_slice(&payload_len.to_be_bytes());
+    b
+}
+
+#[test]
+fn parse_header_accepts_max_payload_len() {
+    let header = parse_header(&header_55aa(MAX_PAYLOAD_LEN)).expect("boundary value parses");
+    assert_eq!(header.payload_len, MAX_PAYLOAD_LEN);
+    assert_eq!(header.total_length, MAX_PAYLOAD_LEN + 16);
+}
+
+#[test]
+fn parse_header_rejects_oversized_payload_len() {
+    let res = parse_header(&header_55aa(MAX_PAYLOAD_LEN + 1));
+    assert!(res.is_err(), "payload_len above the cap must be rejected");
+}
+
+#[test]
+fn parse_header_rejects_overflow_payload_len() {
+    // A near-u32::MAX length would overflow `payload_len + 16` and, without
+    // the bound, drive a multi-GB allocation in read_full_packet.
+    let res = parse_header(&header_55aa(u32::MAX));
+    assert!(res.is_err(), "u32::MAX length must be rejected, not overflow");
 }

@@ -400,6 +400,23 @@ The 30s vs 7s heartbeat gap: a healthy device replies to our heartbeat
 within sub-second, so 30s of total silence means the path is broken
 even if our `write_half` thinks the TCP socket is still up.
 
+### Frame length bound
+
+`read_full_packet` reads a 16/18-byte header, then `resize`s a buffer to
+the header's claimed `total_length` and `read_exact`s the rest. The
+claimed length is wire-supplied — a malformed or hostile 16-byte header
+can assert a payload up to `u32::MAX`, which without a bound would drive
+a multi-GB allocation (the `timeout` wrapper only stops us waiting
+*forever* for the bytes; it doesn't stop the allocation) and, separately,
+overflow `payload_len + header_overhead`.
+
+`parse_header` therefore rejects any frame whose claimed payload length
+exceeds `MAX_PAYLOAD_LEN` (256 KiB) and computes the total with
+`checked_add`. Real Tuya LAN frames are well under this — status/control
+are sub-1 KiB, and even bulk responses (sub-device lists, `LanExtStream`)
+clear it comfortably — so the cap only bites on garbage input. This is
+defense-in-depth, not a fix for any observed failure.
+
 ### Reconnect backoff
 
 `get_backoff_duration`:
