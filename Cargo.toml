@@ -23,7 +23,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 aes = "0.9"
-aes-gcm = "0.11.0-rc.3"
+aes-gcm = "0.11.0-rc.4"
 async-stream = "0.3"
 base64 = "0.22"
 byteorder = "1.5"
