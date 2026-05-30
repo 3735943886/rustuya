@@ -147,5 +147,8 @@ fn parse_header_rejects_overflow_payload_len() {
     // A near-u32::MAX length would overflow `payload_len + 16` and, without
     // the bound, drive a multi-GB allocation in read_full_packet.
     let res = parse_header(&header_55aa(u32::MAX));
-    assert!(res.is_err(), "u32::MAX length must be rejected, not overflow");
+    assert!(
+        res.is_err(),
+        "u32::MAX length must be rejected, not overflow"
+    );
 }
