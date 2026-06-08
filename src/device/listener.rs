@@ -119,6 +119,18 @@ mod tests {
             .build()
     }
 
+    /// Like [`make_test_device`] but without the background connection task, so
+    /// `Arc::strong_count` is deterministic (no actor churning the count from
+    /// another runtime thread). Use for tests that assert exact ref counts and
+    /// only inject via `broadcast_tx`.
+    fn make_bare_device(id: &str) -> Device {
+        Device::with_builder_no_actor(
+            Device::builder(id, b"0123456789abcdef".to_vec())
+                .address("203.0.113.1")
+                .persist(false),
+        )
+    }
+
     fn make_msg(cmd: u32, payload: &[u8]) -> TuyaMessage {
         TuyaMessage {
             seqno: 0,
@@ -260,12 +272,8 @@ mod tests {
     /// Dropping the stream releases exactly the strong Arc<DeviceInner> it
     /// was holding — no Arc cycle, no leak.
     ///
-    /// We pre-stop the device and poll until the background connection
-    /// task has released its Arc, so the baseline is deterministic.
-    /// Otherwise, with the rc.2 single-device jitter skip, the task can
-    /// upgrade its Arc *between* the baseline and the post-drop sample
-    /// and break the absolute-count assertion (the delta would still be
-    /// right, but the test asserts absolute equality).
+    /// Uses a bare device (no background actor) so the strong count is a stable
+    /// 1 at the start; the add/drop measurement is then exact with no waiting.
     #[test]
     fn dropping_stream_releases_arc() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -273,16 +281,11 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let device = make_test_device("dropping_stream_arc");
-            device.fire_stop();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while Arc::strong_count(&device.inner) > 1 && std::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            let device = make_bare_device("dropping_stream_arc");
             let baseline = Arc::strong_count(&device.inner);
             assert_eq!(
                 baseline, 1,
-                "after stop, only the user-held Arc should remain (got {baseline})"
+                "a freshly-built bare device holds exactly one Arc (got {baseline})"
             );
 
             let stream = device.listener();
@@ -448,31 +451,28 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let d1 = make_test_device("u_drop_d1");
-            let d2 = make_test_device("u_drop_d2");
+            // Bare devices (no background actor) → stable strong counts, so the
+            // before/during/after measurement is exact with no waiting.
+            let d1 = make_bare_device("u_drop_d1");
+            let d2 = make_bare_device("u_drop_d2");
 
-            // Stash strong count baseline: 1 (user holds d1) + 1 (background
-            // connection task) = 2 for each. Plus whatever the stream
-            // captures (1 more per device). After drop, the +1 per stream
-            // is released.
-            let arc_count_before = Arc::strong_count(&d1.inner);
+            let before = Arc::strong_count(&d1.inner);
+            assert_eq!(before, 1, "baseline should be the user-held Arc only");
 
             let stream = unified_listener(vec![d1.clone(), d2.clone()]);
-            let arc_count_during = Arc::strong_count(&d1.inner);
+            let during = Arc::strong_count(&d1.inner);
             assert!(
-                arc_count_during > arc_count_before,
-                "unified_listener should hold a strong ref while alive (before={arc_count_before}, during={arc_count_during})"
+                during > before,
+                "unified_listener should hold a strong ref while alive (before={before}, during={during})"
             );
 
             drop(stream);
-            // Tokio cooperative drop — give it a yield to actually finalize.
-            tokio::task::yield_now().await;
 
-            let arc_count_after = Arc::strong_count(&d1.inner);
-            assert!(
-                arc_count_after <= arc_count_before,
-                "dropping the unified stream must release the ref it held \
-                 (before={arc_count_before}, during={arc_count_during}, after={arc_count_after})"
+            let after = Arc::strong_count(&d1.inner);
+            assert_eq!(
+                after, before,
+                "dropping the unified stream must release exactly the ref it held \
+                 (before={before}, during={during}, after={after})"
             );
         });
     }
@@ -593,12 +593,15 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 let device = Arc::new(make_test_device("publish_consume"));
 
-                // 4 concurrent consumers.
+                // 4 concurrent consumers. Subscribe *all* of them up front
+                // (before the publisher sends) so none can miss the burst due to
+                // its task being scheduled late — `listener()` calls
+                // `broadcast_tx.subscribe()` eagerly, so holding the streams here
+                // guarantees every consumer is registered before message 0.
+                let streams: Vec<_> = (0..4).map(|_| device.listener()).collect();
                 let mut consumers = Vec::new();
-                for _ in 0..4 {
-                    let d = Arc::clone(&device);
+                for stream in streams {
                     consumers.push(tokio::spawn(async move {
-                        let stream = d.listener();
                         tokio::pin!(stream);
                         let mut count = 0;
                         // Read up to 100 messages or 2s, whichever first.
@@ -659,11 +662,6 @@ mod tests {
     /// Spawn 100 unified_listener streams in rapid succession, drop each
     /// immediately. Verifies per-device listener bookkeeping doesn't leak
     /// strong refs that pin DeviceInner forever.
-    ///
-    /// Baseline is taken after stopping the devices (so the background
-    /// connection task's Arc has been released and the count is stable);
-    /// otherwise the task waking from its initial jitter sleep mid-test
-    /// adds a +1 of "noise" that masks any real per-iteration leak.
     #[test]
     fn unified_listener_cycle_does_not_leak_inner_arcs() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -671,26 +669,16 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let d1 = make_test_device("ul_cycle_d1");
-            let d2 = make_test_device("ul_cycle_d2");
+            // Bare devices (no background actor) → stable baseline, so any
+            // growth across the loop is a real per-iteration leak.
+            let d1 = make_bare_device("ul_cycle_d1");
+            let d2 = make_bare_device("ul_cycle_d2");
 
-            // Stop and wait for the background tasks to release their Arcs,
-            // so baseline is deterministic.
-            d1.fire_stop();
-            d2.fire_stop();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while (Arc::strong_count(&d1.inner) > 1 || Arc::strong_count(&d2.inner) > 1)
-                && std::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
             let baseline1 = Arc::strong_count(&d1.inner);
             let baseline2 = Arc::strong_count(&d2.inner);
 
-            // listener() on a stopped device returns a stream that would
-            // exit immediately on first poll, but we never poll it — we
-            // just construct and drop. The Drop path is what we're
-            // exercising.
+            // We construct each unified stream and immediately drop it without
+            // ever polling it — the Drop path is what we're exercising.
             for _ in 0..100 {
                 let s = unified_listener(vec![d1.clone(), d2.clone()]);
                 drop(s);

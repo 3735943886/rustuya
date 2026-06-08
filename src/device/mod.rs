@@ -295,6 +295,15 @@ impl Device {
     }
 
     pub(crate) fn with_builder(builder: DeviceBuilder) -> Self {
+        let (device, rx) = Self::assemble(builder);
+        device.spawn_connection_task(rx);
+        device
+    }
+
+    /// Builds the `Device` and its channels but does **not** spawn the
+    /// background connection task. Used by `with_builder` (which then spawns)
+    /// and by the test-only [`Device::with_builder_no_actor`].
+    fn assemble(builder: DeviceBuilder) -> (Self, mpsc::Receiver<DeviceCommand>) {
         let (addr, ip) = match builder.address.as_str() {
             "" | ADDR_AUTO => (ADDR_AUTO.to_string(), String::new()),
             _ => (builder.address.clone(), builder.address),
@@ -338,14 +347,22 @@ impl Device {
             tx: Some(tx),
         };
 
+        (device, rx)
+    }
+
+    /// Spawns the long-running background connection task on the library's
+    /// dedicated runtime. The task holds only a `Weak<DeviceInner>` (upgraded
+    /// for the duration of a connection attempt), so dropping the last `Device`
+    /// clone tears it down via [`DeviceInner::drop`] / the cancel token.
+    fn spawn_connection_task(&self, rx: mpsc::Receiver<DeviceCommand>) {
         // Compute the initial-connect jitter synchronously so it reflects
         // construction time, not when the spawned task happens to run. A
         // single-device caller pays no jitter; bursty multi-device startup
         // still gets the staggering it needs.
         let initial_jitter = actor::record_construction_and_compute_jitter();
 
-        let inner_weak = Arc::downgrade(&inner);
-        let d_id = device.inner.id.clone();
+        let inner_weak = Arc::downgrade(&self.inner);
+        let d_id = self.inner.id.clone();
         crate::runtime::spawn(async move {
             if let Some(inner) = inner_weak.upgrade() {
                 let cancel_token = inner.cancel_token.clone();
@@ -361,7 +378,18 @@ impl Device {
                 }
             }
         });
-        device
+    }
+
+    /// Test-only constructor that builds a fully-formed `Device` **without**
+    /// spawning the background connection task. The actor runs on a separate
+    /// runtime thread and would otherwise add nondeterministic
+    /// `Arc::strong_count` churn; tests that assert exact ref counts (or that
+    /// only inject via `broadcast_tx`) use this so the count is stable with no
+    /// polling. The `rx` end of the command channel is dropped — these devices
+    /// don't service user commands.
+    #[cfg(test)]
+    pub(crate) fn with_builder_no_actor(builder: DeviceBuilder) -> Self {
+        Self::assemble(builder).0
     }
 
     #[must_use]
