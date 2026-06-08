@@ -44,6 +44,33 @@ jobs:
       - name: cargo deny check
         run: cargo deny check advisories bans sources || true
 
+  python-integration:
+    # End-to-end tests of the Python extension against the tuyamock device
+    # emulator (PyPI), exercising the real wire path — connection, framing,
+    # encryption, the v3.4/v3.5 session-key handshake, and the device22 dialect
+    # — with no physical hardware. tuyamock is installed unpinned (latest); if
+    # an upstream release ever breaks this, pin it here.
+    needs: [rust-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Create venv and install deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin pytest tuyamock
+      - name: Build & install rustuya extension into the venv
+        working-directory: python
+        env:
+          VIRTUAL_ENV: ${{ github.workspace }}/.venv
+        run: ../.venv/bin/maturin develop --release
+      - name: Run tuyamock integration tests
+        working-directory: python
+        run: ../.venv/bin/pytest tests -v
+
   linux:
     needs: [rust-checks]
     runs-on: ${{ matrix.platform.runner }}
