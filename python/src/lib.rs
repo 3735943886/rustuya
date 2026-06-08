@@ -305,7 +305,7 @@ pub struct Device {
 #[pymethods]
 impl Device {
     #[new]
-    #[pyo3(signature = (id, local_key, address="Auto", version="Auto", dev_type=None, persist=true, timeout=None, nowait=false))]
+    #[pyo3(signature = (id, local_key, address="Auto", version="Auto", dev_type=None, persist=true, timeout=None, nowait=false, port=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         py: Python<'_>,
@@ -317,6 +317,7 @@ impl Device {
         persist: bool,
         timeout: Option<f64>,
         nowait: bool,
+        port: Option<u16>,
     ) -> PyResult<Self> {
         let v = Version::from_str(version).map_err(|_| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid version: {}", version))
@@ -327,6 +328,10 @@ impl Device {
             .version(v)
             .persist(persist)
             .nowait(nowait);
+
+        if let Some(p) = port {
+            builder = builder.port(p);
+        }
 
         if let Some(dt_str) = dev_type {
             let dt = DeviceType::from_str(dt_str).map_err(|_| {
