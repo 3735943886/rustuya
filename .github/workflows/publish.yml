@@ -155,6 +155,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     needs: [linux, windows, macos, sdist, changelog]
+    environment: pypi
     permissions:
       id-token: write
       contents: write
