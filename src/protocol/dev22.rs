@@ -21,9 +21,14 @@ impl TuyaProtocol for ProtocolDev22 {
     }
 
     fn get_effective_command(&self, command: CommandType) -> u32 {
+        // device22 is a *dialect layered on top of* the base version, not a
+        // replacement. Only the standard status query is remapped (rejected by
+        // the device → retried via `CONTROL_NEW`); every other command keeps
+        // the base version's command mapping (e.g. v3.4/v3.5 still remap
+        // `Control` → `ControlNew`).
         match command {
             CommandType::DpQuery => CommandType::ControlNew as u32,
-            cmd => cmd as u32,
+            cmd => self.base.get_effective_command(cmd),
         }
     }
 
@@ -35,48 +40,29 @@ impl TuyaProtocol for ProtocolDev22 {
         cid: Option<&str>,
         t: u64,
     ) -> Result<(u32, Value)> {
-        let cmd_to_send = self.get_effective_command(command);
-        let mut payload =
-            create_base_payload(device_id, cid, data.clone(), Some(t.to_string().into()));
-
-        match command {
-            CommandType::UpdateDps => {
-                payload.retain(|k, _| k == "cid");
-                let d = data.unwrap_or_else(|| serde_json::json!([18, 19, 20]));
-                payload.insert("dpId".into(), d);
-            }
-            CommandType::Control | CommandType::ControlNew => {
-                payload.remove("gwId");
-            }
-            CommandType::DpQuery => {
-                payload.remove("gwId");
-                if payload.get("dps").is_none() {
-                    payload.insert("dps".into(), serde_json::json!({"1": null}));
-                }
-            }
-            CommandType::DpQueryNew => {
-                payload.remove("gwId");
-            }
-            CommandType::LanExtStream => {
-                payload = data
-                    .unwrap_or_else(|| serde_json::json!({}))
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default();
-                if let Some(c) = cid {
-                    payload.insert("cid".into(), c.into());
-                    payload.insert("ctype".into(), 0.into());
-                }
-            }
-            CommandType::Status | CommandType::HeartBeat => {
-                payload.remove("uid");
-                payload.remove("t");
-            }
-            _ => {
-                // Default: gwId, devId, uid, cid, t, dps
-            }
+        // device22 only overrides the status query: the device rejects the
+        // standard `DpQuery`/`DpQueryNew`, so we ask for the requested dps via
+        // `CONTROL_NEW` instead. This dialect shape is the same regardless of
+        // the base version (it mirrors tinytuya's `device22` payload_dict
+        // override, which is merged on top of every version template).
+        //
+        // Everything else delegates to the base version protocol so that
+        // version-specific behaviour (e.g. the v3.4/v3.5 modern `Control`
+        // envelope) is preserved. tinytuya's `device22` template only carries a
+        // `DP_QUERY` override, so all other commands fall through to the
+        // version's own shape — this matches that.
+        if command != CommandType::DpQuery {
+            return self.base.generate_payload(device_id, command, data, cid, t);
         }
 
+        let mut payload =
+            create_base_payload(device_id, cid, data.clone(), Some(t.to_string().into()));
+        payload.remove("gwId");
+        if payload.get("dps").is_none() {
+            payload.insert("dps".into(), serde_json::json!({"1": null}));
+        }
+
+        let cmd_to_send = CommandType::ControlNew as u32;
         let payload_obj = Value::Object(payload);
         trace!("dev22 generated payload (cmd {cmd_to_send}): {payload_obj}");
 

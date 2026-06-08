@@ -2,7 +2,7 @@ use crate::crypto::TuyaCipher;
 use crate::error::Result;
 use crate::protocol::{
     CommandType, NO_PROTOCOL_HEADER_CMDS, TuyaProtocol, Version, apply_update_dps,
-    create_base_payload, legacy_lan_ext_stream, strip_status_heartbeat,
+    create_base_payload, lan_ext_stream_envelope, strip_status_heartbeat,
 };
 use log::trace;
 use serde_json::Value;
@@ -39,21 +39,20 @@ impl TuyaProtocol for ProtocolV32 {
         let mut payload =
             create_base_payload(device_id, cid, data.clone(), Some(t.to_string().into()));
 
-        // Payload formation follows device22 (ProtocolDev22)
+        // v3.2 shares v3.3's framing/payload shape. The device22 status-query
+        // dialect (v3.2 is always device22 — see `get_protocol`) is supplied by
+        // the `ProtocolDev22` wrapper, which intercepts `DpQuery`; this bare
+        // profile therefore treats `DpQuery` like v3.3 (keep the base payload).
         match command {
             CommandType::UpdateDps => apply_update_dps(&mut payload, data),
             CommandType::Control | CommandType::ControlNew | CommandType::DpQueryNew => {
                 payload.remove("gwId");
             }
             CommandType::DpQuery => {
-                // v3.2 differs from v3.1/v3.3: drop gwId and default `dps`.
-                payload.remove("gwId");
-                if payload.get("dps").is_none() {
-                    payload.insert("dps".into(), serde_json::json!({"1": null}));
-                }
+                // Keep gwId/devId/uid/cid/t/dps unchanged (same as v3.3).
             }
             CommandType::LanExtStream => {
-                payload = legacy_lan_ext_stream(data);
+                payload = lan_ext_stream_envelope(data);
             }
             CommandType::Status | CommandType::HeartBeat => strip_status_heartbeat(&mut payload),
             _ => {

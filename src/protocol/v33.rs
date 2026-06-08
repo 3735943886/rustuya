@@ -2,7 +2,7 @@ use crate::crypto::TuyaCipher;
 use crate::error::Result;
 use crate::protocol::{
     CommandType, NO_PROTOCOL_HEADER_CMDS, TuyaProtocol, Version, apply_update_dps,
-    create_base_payload, legacy_lan_ext_stream, strip_status_heartbeat,
+    create_base_payload, lan_ext_stream_envelope, strip_status_heartbeat,
 };
 use log::trace;
 use serde_json::Value;
@@ -48,7 +48,7 @@ impl TuyaProtocol for ProtocolV33 {
                 // v3.3 keeps gwId/devId/uid/cid/t/dps unchanged.
             }
             CommandType::LanExtStream => {
-                payload = legacy_lan_ext_stream(data);
+                payload = lan_ext_stream_envelope(data);
             }
             CommandType::Status | CommandType::HeartBeat => strip_status_heartbeat(&mut payload),
             _ => {

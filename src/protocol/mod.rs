@@ -152,29 +152,19 @@ pub(crate) fn modern_control_envelope(
     payload
 }
 
-/// v3.4/v3.5 modern `LanExtStream` envelope: `{ reqType, data: {...rest} }`.
-pub(crate) fn modern_lan_ext_stream(data: Option<Value>) -> Map<String, Value> {
+/// `LanExtStream` envelope — `{ reqType, data: {...rest} }`. Hoists `reqType`
+/// out of the caller-supplied `data` to the payload root and wraps the
+/// remaining fields under `data`. This shape is version-independent: tinytuya
+/// defines `LAN_EXT_STREAM` only once (no per-version override), so v3.1–v3.5
+/// all emit the same structure (see `Device::sub_discover`, which is the real
+/// caller).
+pub(crate) fn lan_ext_stream_envelope(data: Option<Value>) -> Map<String, Value> {
     let mut payload = Map::new();
     if let Some(Value::Object(mut data_obj)) = data {
         if let Some(req_type) = data_obj.remove("reqType") {
             payload.insert("reqType".into(), req_type);
         }
         payload.insert("data".into(), Value::Object(data_obj));
-    }
-    payload
-}
-
-/// v3.1/v3.2/v3.3 legacy `LanExtStream`: flatten data fields back onto the
-/// payload root (no `data` wrapper).
-pub(crate) fn legacy_lan_ext_stream(data: Option<Value>) -> Map<String, Value> {
-    let mut payload = Map::new();
-    if let Some(Value::Object(mut data_obj)) = data {
-        if let Some(req_type) = data_obj.remove("reqType") {
-            payload.insert("reqType".into(), req_type);
-        }
-        for (k, v) in data_obj {
-            payload.insert(k, v);
-        }
     }
     payload
 }
@@ -344,7 +334,12 @@ pub fn get_protocol(version: Version, dev_type: DeviceType) -> Box<dyn TuyaProto
         _ => Box::new(v33::ProtocolV33),
     };
 
-    if dev_type == DeviceType::Device22 {
+    // v3.2 is *always* device22: tinytuya's `set_version(3.2)` forces
+    // `dev_type = "device22"` ("3.2 behaves like 3.3 with device22"), so a real
+    // v3.2 device answers the status query only via the device22 dialect
+    // (`DpQuery` sent as `ControlNew`, requesting specific dps). Apply the
+    // wrapper regardless of the requested dev_type.
+    if dev_type == DeviceType::Device22 || version == Version::V3_2 {
         Box::new(dev22::ProtocolDev22::new(base))
     } else {
         base
