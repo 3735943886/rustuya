@@ -7,7 +7,13 @@ Cargo.lock
 # Python
 /dist/
 */dist/
-*.py
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+/venv/
+build/
 
 # OS
 Thumbs.db
