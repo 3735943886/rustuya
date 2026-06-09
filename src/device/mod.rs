@@ -246,11 +246,13 @@ pub(super) struct DeviceInner {
 
 impl Drop for DeviceInner {
     fn drop(&mut self) {
+        // Deliberately NO logging here. A `log` call routes through pyo3-log,
+        // which takes the Python GIL; a Drop running on a tokio worker during
+        // interpreter shutdown would then re-enter Python from a non-Python
+        // thread — the same hazard the panic hook hit (rc.7). The atexit handler
+        // sets the log level Off to defuse it, but Drop must not depend on that
+        // ordering. The only work here is cancelling the connection task.
         self.cancel_token.cancel();
-        debug!(
-            "DeviceInner for {} dropped, cancelling connection task",
-            self.id
-        );
     }
 }
 
