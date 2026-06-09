@@ -595,6 +595,21 @@ pub fn maximize_fd_limit() -> PyResult<()> {
     })
 }
 
+/// Sets the global cap on concurrent connection establishment (TCP connect +
+/// handshake). Bounds connect storms when a large fleet comes online or
+/// reconnects en masse. Call before creating devices; returns False if the
+/// limiter was already initialized (no-op). `n` is clamped to >= 1.
+#[pyfunction]
+pub fn set_connect_concurrency(n: usize) -> bool {
+    ::rustuya::set_connect_concurrency(n)
+}
+
+/// Returns the effective connect-concurrency limit (the default if unset).
+#[pyfunction]
+pub fn connect_concurrency() -> usize {
+    ::rustuya::connect_concurrency()
+}
+
 #[pyclass]
 pub struct DeviceEventReceiver {
     id: String,
@@ -668,6 +683,8 @@ fn rustuya(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(unified_listener, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(maximize_fd_limit, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(set_connect_concurrency, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(connect_concurrency, m)?)?;
 
     let atexit = py.import("atexit")?;
     atexit.call_method1("register", (m.getattr("_rustuya_atexit")?,))?;

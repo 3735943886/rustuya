@@ -50,7 +50,7 @@ pub mod sync;
 pub use device::{Device, DeviceBuilder};
 pub use error::TuyaError;
 pub use protocol::{CommandType, Version};
-pub use runtime::maximize_fd_limit;
+pub use runtime::{connect_concurrency, maximize_fd_limit, set_connect_concurrency};
 pub use scanner::Scanner;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

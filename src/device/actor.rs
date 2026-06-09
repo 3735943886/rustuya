@@ -421,7 +421,7 @@ impl Device {
                 self.wait_for_backoff(rx, b).await?;
             }
 
-            let result = timeout(self.timeout() * 2, self.connect_and_handshake(seqno)).await;
+            let result = self.establish_connection(seqno).await;
             if let Ok(Ok(s)) = result {
                 self.with_state_mut(|s| {
                     s.state = ConnectionState::Connected;
@@ -494,9 +494,7 @@ impl Device {
                                 // from the success branch or overwrite
                                 // `cooldown_until` from the failure branch.
 
-                                let retry_result =
-                                    timeout(self.timeout() * 2, self.connect_and_handshake(seqno))
-                                        .await;
+                                let retry_result = self.establish_connection(seqno).await;
 
                                 if let Ok(Ok(s)) = retry_result {
                                     self.with_state_mut(|s| {
@@ -691,6 +689,31 @@ impl Device {
     // -------------------------------------------------------------------------
     // Protocol Implementation & Handshake
     // -------------------------------------------------------------------------
+
+    /// Optional connect-storm guard around [`Self::connect_and_handshake`].
+    ///
+    /// If a cap was opted into via `set_connect_concurrency`, acquires a global
+    /// establishment permit BEFORE the connect timeout so a queued device waits
+    /// its turn instead of burning its timeout while waiting; otherwise there is
+    /// no cap (the default). The connect + handshake then run under the timeout.
+    /// The permit (when present) is dropped the moment this returns —
+    /// establishment is the expensive part (TCP + crypto + a round trip); the
+    /// resulting idle connection is cheap and must not hold a permit, or fleets
+    /// larger than the permit count would deadlock. Applies to both the initial
+    /// connect and every reconnect (a network blip's mass reconnect is the same
+    /// storm).
+    ///
+    /// Returns the same shape as the bare `timeout(..)` it replaces:
+    /// `Ok(Ok(stream))` on success, `Ok(Err(e))` on a connect error, and
+    /// `Err(Elapsed)` on timeout.
+    async fn establish_connection(
+        &self,
+        seqno: &mut u32,
+    ) -> std::result::Result<Result<TcpStream>, tokio::time::error::Elapsed> {
+        // Held across establishment, released on return (None = no cap engaged).
+        let _permit = crate::runtime::connect_permit().await;
+        timeout(self.timeout() * 2, self.connect_and_handshake(seqno)).await
+    }
 
     async fn connect_and_handshake(&self, seqno: &mut u32) -> Result<TcpStream> {
         let addr = self.resolve_address().await?;

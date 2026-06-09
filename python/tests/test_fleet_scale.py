@@ -61,6 +61,20 @@ def test_fleet_scale_concurrent_connections():
     # still proving fleet scale (a few % is scheduling jitter, not a defect).
     min_connected = int(n * 0.95)
 
+    # Connect-storm guard (opt-in): cap concurrent establishment well below the
+    # fleet size. The limiter is process-global and fixed on first use; in the
+    # CI `-m fleet` step this test is the first to touch it, so the cap engages.
+    #
+    # That all `n` devices connect under only `cap` establishment permits is the
+    # key correctness check: permits MUST be released after each handshake. If a
+    # permit were held for the connection's lifetime, only `cap` devices would
+    # ever connect and the rest would deadlock forever.
+    assert rustuya.set_connect_concurrency(50), (
+        "limiter must not be pre-initialized in the `-m fleet` pytest process"
+    )
+    cap = rustuya.connect_concurrency()
+    assert 0 < cap < n, f"connect cap {cap} must be engaged and below fleet size {n}"
+
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     stop = ctx.Event()
