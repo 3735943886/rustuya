@@ -69,7 +69,14 @@ jobs:
         run: ../.venv/bin/maturin develop --release
       - name: Run tuyamock integration tests
         working-directory: python
-        run: ../.venv/bin/pytest tests -v
+        run: ../.venv/bin/pytest tests -v -m "not fleet"
+      - name: Fleet-scale concurrent-connection test (1000 devices)
+        # 1000 device actors held concurrently, with the single-connection mocks
+        # split across processes (~100 each) so the mock host's GIL isn't the
+        # bottleneck. Exercises rustuya's fleet path end-to-end; tolerant of a
+        # few stragglers on a noisy shared runner (see the test for rationale).
+        working-directory: python
+        run: ../.venv/bin/pytest tests -v -m fleet
 
   linux:
     needs: [rust-checks]
