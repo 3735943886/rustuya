@@ -38,7 +38,14 @@ pub fn install_panic_logging() {
                 .unwrap_or("<non-string panic payload>");
             let thread = std::thread::current();
             let thread_name = thread.name().unwrap_or("<unnamed>");
-            log::error!(
+            // Write to raw stderr, NOT the `log` facade. `log` may be backed by
+            // pyo3-log, which acquires the Python GIL to forward the record — and
+            // re-entering Python from a panicking non-Python thread (e.g. a tokio
+            // worker, especially during interpreter shutdown) is fatal: CPython
+            // force-terminates the thread, whose unwind hits the `panic = "abort"`
+            // nounwind boundary and aborts/SEGVs inside the hook itself, masking
+            // the very panic we are trying to report.
+            eprintln!(
                 "rustuya: PANIC on thread '{}' at {} — {}\nbacktrace:\n{}",
                 thread_name,
                 location,

@@ -21,7 +21,19 @@ impl Device {
         let mut rx = self.inner.broadcast_tx.subscribe();
         let device = self.clone();
         let cancel = self.inner.cancel_token.clone();
+        // Replay the latched current status first. A `broadcast_error` sent
+        // before this `subscribe()` reaches no receivers and is lost, so a
+        // device that connected before its listener attached would stay
+        // unobserved ("online"/unknown) with no retry. Replaying the latch makes
+        // the listener's first item reflect the device's current status
+        // regardless of subscribe-vs-broadcast ordering.
+        let latched = device.inner.state.read().last_status.clone();
         async_stream::stream! {
+            if let Some(msg) = latched
+                && !msg.payload.is_empty()
+            {
+                yield Ok(msg);
+            }
             loop {
                 tokio::select! {
                     // Honor explicit stop() while waiting on the broadcast.

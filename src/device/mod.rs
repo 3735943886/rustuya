@@ -144,6 +144,12 @@ pub(super) struct DeviceState {
     pub(super) last_reported_discovered_ip: Option<String>,
     pub(super) last_scanner_bypass_at: Option<Instant>,
     pub(super) scanner_bypass_failures: u32,
+    /// Latches the most recent status/error broadcast (`broadcast_error`) so a
+    /// listener that subscribes *after* it was sent can still recover it. Tokio
+    /// broadcast only delivers to receivers present at send time, so without
+    /// this a device that connects before its listener subscribes loses its
+    /// `ERR_SUCCESS` and is reported stuck "online"/unknown with no retry.
+    pub(super) last_status: Option<TuyaMessage>,
 }
 
 pub struct DeviceBuilder {
@@ -330,6 +336,7 @@ impl Device {
             last_reported_discovered_ip: None,
             last_scanner_bypass_at: None,
             scanner_bypass_failures: 0,
+            last_status: None,
         };
 
         let inner = Arc::new(DeviceInner {

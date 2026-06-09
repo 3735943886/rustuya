@@ -112,10 +112,13 @@ impl Device {
     }
 
     pub(super) fn broadcast_error(&self, code: u32, payload: Option<Value>) {
-        let _ = self
-            .inner
-            .broadcast_tx
-            .send(self.error_helper(code, payload));
+        let msg = self.error_helper(code, payload);
+        // Latch before sending so a listener subscribing AFTER this point can
+        // replay it (see Device::listener). A tokio broadcast `send` reaches
+        // only receivers present at send time, so a device that connects before
+        // its listener subscribes would otherwise lose its ERR_SUCCESS forever.
+        self.inner.state.write().last_status = Some(msg.clone());
+        let _ = self.inner.broadcast_tx.send(msg);
     }
 
     fn update_last_received(&self) {
