@@ -582,6 +582,24 @@ impl Device {
 
     /// Waits for the next non-empty broadcast message from this device.
     ///
+    /// This is a **one-shot** call: it subscribes, awaits the next message, and
+    /// returns. It is NOT a lossless continuous stream.
+    ///
+    /// # Do not poll in a loop
+    ///
+    /// `loop { dev.receive().await }` (the tinytuya `receive()`-loop idiom) can
+    /// drop messages. `receive()` re-subscribes on every call, so any message
+    /// broadcast in the gap between one call returning and the next call
+    /// subscribing reaches no receiver and is lost — tokio broadcast only
+    /// delivers to receivers present at send time. (It can also return
+    /// [`TuyaError::BroadcastLagged`] if pushes outpace the consumer.)
+    ///
+    /// For lossless continuous consumption use [`listener`](Self::listener),
+    /// which subscribes **once** and stays subscribed for the life of the
+    /// stream (and replays the latched current state on attach). Reach for
+    /// `receive()` only when you genuinely want a single next event. To read
+    /// the current state on demand, use [`status`](Self::status).
+    ///
     /// Returns `Err(TuyaError::BroadcastLagged { skipped })` if the broadcast
     /// bus skipped messages because we fell behind by more than its capacity
     /// (currently 128). The skipped messages are permanently lost — the caller
