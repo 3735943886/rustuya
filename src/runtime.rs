@@ -10,6 +10,46 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
+/// Installs a process-global panic hook that logs every panic's thread,
+/// location (`file:line:col`), message, and a backtrace via the `log` facade
+/// (so it reaches `pyo3-log` / a consumer subscriber) **before** the default
+/// hook runs. Opt-in and idempotent; the previous hook is chained, not
+/// replaced.
+///
+/// Intended for diagnosing intermittent panics in background tasks: a panic on
+/// a runtime worker would otherwise print to raw stderr (and, under a release
+/// build with `panic = "abort"` + `strip`, leave little behind). The panic
+/// *location* is recorded even in stripped builds (it doesn't need symbols);
+/// the backtrace is best-effort. Call once at startup, before creating devices.
+pub fn install_panic_logging() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic payload>");
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("<unnamed>");
+            log::error!(
+                "rustuya: PANIC on thread '{}' at {} — {}\nbacktrace:\n{}",
+                thread_name,
+                location,
+                msg,
+                std::backtrace::Backtrace::force_capture()
+            );
+            prev(info);
+        }));
+    });
+}
+
 /// Optional global limit on how many devices may be *establishing* a connection
 /// (TCP connect + session-key handshake) at the same instant — a connect-storm
 /// guard. When a large fleet comes online, or reconnects en masse after a

@@ -610,6 +610,15 @@ pub fn connect_concurrency() -> usize {
     ::rustuya::connect_concurrency()
 }
 
+/// Installs a panic hook that logs every panic's thread, location, message, and
+/// backtrace via the logging facade (so it surfaces through `pyo3-log`).
+/// Opt-in, idempotent, chains the previous hook. Useful for diagnosing
+/// intermittent panics in background connection tasks. Call once at startup.
+#[pyfunction]
+pub fn install_panic_logging() {
+    ::rustuya::install_panic_logging();
+}
+
 #[pyclass]
 pub struct DeviceEventReceiver {
     id: String,
@@ -685,6 +694,7 @@ fn rustuya(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(maximize_fd_limit, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(set_connect_concurrency, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(connect_concurrency, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(install_panic_logging, m)?)?;
 
     let atexit = py.import("atexit")?;
     atexit.call_method1("register", (m.getattr("_rustuya_atexit")?,))?;
