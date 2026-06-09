@@ -351,6 +351,49 @@ mod tests {
         });
     }
 
+    /// Lost-wakeup regression (rc.7): a listener that subscribes AFTER a status
+    /// was broadcast must STILL observe it.
+    ///
+    /// `broadcast_error` latches the status into `DeviceState.last_status`;
+    /// `listener()` replays that latch as its first item. A tokio broadcast
+    /// `send` reaches only the receivers present at send time, so without the
+    /// latch a device that connected (emitting `ERR_SUCCESS`) before its
+    /// listener subscribed would lose that status forever and stay reported
+    /// "online"/unknown with no retry — the cause of permanent stragglers in a
+    /// large fleet onboarding. Pre-fix this test would time out (nothing
+    /// yielded); the latch makes the first item reflect current status
+    /// regardless of subscribe-vs-broadcast ordering.
+    #[test]
+    fn listener_replays_latched_status_when_subscribed_after_broadcast() {
+        use crate::error::ERR_SUCCESS;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let device = make_bare_device("latch_replay");
+
+            // Status broadcast BEFORE any listener exists. The broadcast itself
+            // reaches no receivers (the race); only the latch survives.
+            device.broadcast_error(ERR_SUCCESS, None);
+            let expected = device.error_helper(ERR_SUCCESS, None).payload;
+            assert!(!expected.is_empty(), "ERR_SUCCESS status must be non-empty");
+
+            // Subscribe AFTER the broadcast — the first item must be the replay.
+            let stream = device.listener();
+            tokio::pin!(stream);
+            let got = timeout(Duration::from_millis(200), stream.next())
+                .await
+                .expect("listener must replay latched status within 200ms (lost-wakeup regression)")
+                .expect("stream not exhausted")
+                .expect("stream yielded Err");
+            assert_eq!(
+                got.payload, expected,
+                "first item of a late-subscribing listener must be the latched status"
+            );
+        });
+    }
+
     /// Multiple concurrent listeners on one device all see the same events.
     #[test]
     fn multiple_listeners_fan_out() {
