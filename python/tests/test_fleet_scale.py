@@ -128,3 +128,149 @@ def test_fleet_scale_concurrent_connections():
         stop.set()
         for p in procs:
             p.join(timeout=5)
+
+
+@pytest.mark.fleet
+def test_fleet_keepalive_then_set():
+    """Hold 500 devices through a 30s idle on automatic heartbeat alone, then
+    a concurrent set_value on every one must get a response back.
+
+    Steps: connect 500 devices and bundle them into one ``unified_listener``;
+    sit idle for 30s; fire ``set_value`` on all 500 at once.
+
+    What it proves: the actor's heartbeat keepalive (sent every ~7s) sustains a
+    full fleet across an idle window — without it, the 30s read
+    inactivity-timeout would tear each connection down — and that after the idle
+    every device is still reachable. A reconnect surfaces on the unified stream
+    as a fresh "Connection Successful" (cmd 0) event, so zero such events during
+    the idle window is the keepalive proof. Mocks are split across processes so
+    the harness GIL isn't the bottleneck (see module docstring).
+
+    Tunables (env): ``RUSTUYA_KEEPALIVE_N`` (default 500),
+    ``RUSTUYA_KEEPALIVE_PER`` (mocks/process, default 50),
+    ``RUSTUYA_KEEPALIVE_IDLE`` (seconds, default 30).
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import rustuya  # lazy: keep it out of the spawned workers' import graph
+
+    n = int(os.environ.get("RUSTUYA_KEEPALIVE_N", "500"))
+    per = int(os.environ.get("RUSTUYA_KEEPALIVE_PER", "50"))
+    idle = int(os.environ.get("RUSTUYA_KEEPALIVE_IDLE", "30"))
+    # Tolerate a few stragglers on a noisy shared CI runner; locally this is a
+    # clean n/n with zero reconnects.
+    min_ok = int(n * 0.95)
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    stop = ctx.Event()
+    nproc = (n + per - 1) // per
+    procs = []
+
+    try:
+        for i in range(nproc):
+            k = min(per, n - i * per)
+            p = ctx.Process(
+                target=_mock_worker, args=(k, VERSION, LOCAL_KEY, q, stop), daemon=True
+            )
+            p.start()
+            procs.append(p)
+
+        ports = []
+        for _ in range(nproc):
+            ports.extend(q.get(timeout=90))
+        assert len(ports) == n, f"expected {n} mock ports, got {len(ports)}"
+
+        try:
+            rustuya.maximize_fd_limit()
+        except Exception:
+            pass
+
+        devices = [
+            rustuya.Device(
+                f"{i:020d}", LOCAL_KEY, address="127.0.0.1",
+                version=VERSION, port=ports[i], persist=True, timeout=10.0,
+            )
+            for i in range(n)
+        ]
+        try:
+            # Bundle every device into a single unified listener stream and
+            # count any (re)connect events that occur during the idle window.
+            receiver = rustuya.unified_listener(devices)
+            reconnects = set()
+            phase = {"idle": False}
+            lock = threading.Lock()
+            lstop = threading.Event()
+
+            def drain():
+                while not lstop.is_set():
+                    ev = receiver.recv(300)
+                    if ev is None:
+                        continue
+                    if isinstance(ev, dict) and ev.get("cmd") == 0:
+                        with lock:
+                            if phase["idle"]:
+                                reconnects.add(ev.get("id"))
+
+            lt = threading.Thread(target=drain, daemon=True)
+            lt.start()
+
+            # Connect the fleet.
+            deadline = time.time() + 120
+            connected = 0
+            while time.time() < deadline:
+                connected = sum(1 for d in devices if d.is_connected)
+                if connected >= n:
+                    break
+                time.sleep(1.0)
+            assert connected >= min_ok, (
+                f"only {connected}/{n} devices connected (need >= {min_ok})"
+            )
+
+            # Idle: automatic heartbeat must keep the connections alive.
+            with lock:
+                phase["idle"] = True
+            time.sleep(idle)
+            with lock:
+                phase["idle"] = False
+                recon = len(reconnects)
+
+            still = sum(1 for d in devices if d.is_connected)
+            assert still >= min_ok, (
+                f"only {still}/{n} devices still connected after {idle}s idle "
+                f"(need >= {min_ok}) — heartbeat keepalive failed"
+            )
+            assert recon <= n - min_ok, (
+                f"{recon} devices reconnected during the idle window — "
+                f"heartbeat did not sustain the connections"
+            )
+
+            # set_value on all devices at once; each success is a response.
+            errors = []
+
+            def do_set(d):
+                try:
+                    return d.set_value("1", False) is not None
+                except Exception as e:  # noqa: BLE001
+                    errors.append(repr(e))
+                    return False
+
+            with ThreadPoolExecutor(max_workers=min(n, 512)) as ex:
+                responses = sum(ex.map(do_set, devices))
+            assert responses >= min_ok, (
+                f"only {responses}/{n} set_value responses after idle "
+                f"(errors={len(errors)}: {errors[:3]})"
+            )
+
+            lstop.set()
+        finally:
+            for d in devices:
+                try:
+                    d.stop()
+                except Exception:
+                    pass
+    finally:
+        stop.set()
+        for p in procs:
+            p.join(timeout=5)

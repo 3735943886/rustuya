@@ -70,11 +70,13 @@ jobs:
       - name: Run tuyamock integration tests
         working-directory: python
         run: ../.venv/bin/pytest tests -v -m "not fleet"
-      - name: Fleet-scale concurrent-connection test (1000 devices)
-        # 1000 device actors held concurrently, with the single-connection mocks
-        # split across processes (~100 each) so the mock host's GIL isn't the
-        # bottleneck. Exercises rustuya's fleet path end-to-end; tolerant of a
-        # few stragglers on a noisy shared runner (see the test for rationale).
+      - name: Fleet-scale tests (1000-device connect + 500-device heartbeat keepalive)
+        # rustuya's fleet path end-to-end: (1) hold 1000 device actors connected
+        # concurrently; (2) keep 500 alive through a 30s idle on automatic
+        # heartbeat alone, bundled in one unified listener, then set_value all of
+        # them and confirm a response from each. The single-connection mocks are
+        # split across processes so the mock host's GIL isn't the bottleneck.
+        # Tolerant of a few stragglers on a noisy shared runner (see the tests).
         working-directory: python
         run: ../.venv/bin/pytest tests -v -m fleet
 
