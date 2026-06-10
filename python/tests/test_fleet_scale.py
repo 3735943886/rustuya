@@ -131,20 +131,32 @@ def test_fleet_scale_concurrent_connections():
 
 
 @pytest.mark.fleet
-def test_fleet_keepalive_then_set():
+@pytest.mark.parametrize("nowait", [False, True], ids=["wait", "nowait"])
+def test_fleet_keepalive_then_set(nowait):
     """Hold 500 devices through a 30s idle on automatic heartbeat alone, then
-    a concurrent set_value on every one must get a response back.
+    a concurrent set_value on every one, in both response modes.
 
     Steps: connect 500 devices and bundle them into one ``unified_listener``;
     sit idle for 30s; fire ``set_value`` on all 500 at once.
 
-    What it proves: the actor's heartbeat keepalive (sent every ~7s) sustains a
-    full fleet across an idle window — without it, the 30s read
-    inactivity-timeout would tear each connection down — and that after the idle
-    every device is still reachable. A reconnect surfaces on the unified stream
-    as a fresh "Connection Successful" (cmd 0) event, so zero such events during
-    the idle window is the keepalive proof. Mocks are split across processes so
-    the harness GIL isn't the bottleneck (see module docstring).
+    What it proves:
+
+    * **Heartbeat keepalive** — the actor's heartbeat (sent every ~7s) sustains
+      a full fleet across the idle window; without it the 30s read
+      inactivity-timeout would tear each connection down. A reconnect surfaces
+      on the unified stream as a fresh "Connection Successful" (cmd 0) event, so
+      zero of those during the idle window is the keepalive proof.
+    * **set_value response paths** — two modes, parametrized:
+        - ``nowait=False`` (default): each ``set_value`` waits for and returns
+          the device's response, so all 500 returns are non-None.
+        - ``nowait=True``: ``set_value`` is fire-and-forget (returns None
+          immediately); the responses instead arrive asynchronously on the
+          unified listener, so we count distinct responding devices there. This
+          is the only way to observe responses in nowait mode, which is exactly
+          why the listener bundle matters here.
+
+    Mocks are split across processes so the harness GIL isn't the bottleneck
+    (see module docstring).
 
     Tunables (env): ``RUSTUYA_KEEPALIVE_N`` (default 500),
     ``RUSTUYA_KEEPALIVE_PER`` (mocks/process, default 50),
@@ -191,27 +203,31 @@ def test_fleet_keepalive_then_set():
             rustuya.Device(
                 f"{i:020d}", LOCAL_KEY, address="127.0.0.1",
                 version=VERSION, port=ports[i], persist=True, timeout=10.0,
+                nowait=nowait,
             )
             for i in range(n)
         ]
         try:
-            # Bundle every device into a single unified listener stream and
-            # count any (re)connect events that occur during the idle window.
+            # Bundle every device into a single unified listener stream. During
+            # the idle window we count (re)connect events (cmd 0); during the
+            # post-set "collect" window we count distinct responding devices.
             receiver = rustuya.unified_listener(devices)
-            reconnects = set()
-            phase = {"idle": False}
+            reconnects, responders = set(), set()
+            phase = {"name": "connect"}
             lock = threading.Lock()
             lstop = threading.Event()
 
             def drain():
                 while not lstop.is_set():
                     ev = receiver.recv(300)
-                    if ev is None:
+                    if ev is None or not isinstance(ev, dict):
                         continue
-                    if isinstance(ev, dict) and ev.get("cmd") == 0:
-                        with lock:
-                            if phase["idle"]:
-                                reconnects.add(ev.get("id"))
+                    did, cmd = ev.get("id"), ev.get("cmd")
+                    with lock:
+                        if phase["name"] == "idle" and cmd == 0:
+                            reconnects.add(did)
+                        elif phase["name"] == "collect":
+                            responders.add(did)
 
             lt = threading.Thread(target=drain, daemon=True)
             lt.start()
@@ -230,10 +246,10 @@ def test_fleet_keepalive_then_set():
 
             # Idle: automatic heartbeat must keep the connections alive.
             with lock:
-                phase["idle"] = True
+                phase["name"] = "idle"
             time.sleep(idle)
             with lock:
-                phase["idle"] = False
+                phase["name"] = "collect"
                 recon = len(reconnects)
 
             still = sum(1 for d in devices if d.is_connected)
@@ -246,22 +262,39 @@ def test_fleet_keepalive_then_set():
                 f"heartbeat did not sustain the connections"
             )
 
-            # set_value on all devices at once; each success is a response.
+            # set_value on all devices at once.
             errors = []
 
             def do_set(d):
                 try:
-                    return d.set_value("1", False) is not None
+                    return d.set_value("1", False)
                 except Exception as e:  # noqa: BLE001
                     errors.append(repr(e))
-                    return False
+                    return "ERR"
 
             with ThreadPoolExecutor(max_workers=min(n, 512)) as ex:
-                responses = sum(ex.map(do_set, devices))
-            assert responses >= min_ok, (
-                f"only {responses}/{n} set_value responses after idle "
-                f"(errors={len(errors)}: {errors[:3]})"
-            )
+                returns = list(ex.map(do_set, devices))
+            assert not errors, f"{len(errors)} set_value errors: {errors[:3]}"
+
+            if nowait:
+                # Fire-and-forget: every call returns None; the responses arrive
+                # asynchronously on the unified listener instead.
+                assert all(r is None for r in returns), (
+                    "nowait=True set_value must return None (fire-and-forget)"
+                )
+                time.sleep(5)  # let responses stream in on the listener
+                with lock:
+                    resp = len(responders)
+                assert resp >= min_ok, (
+                    f"only {resp}/{n} responses arrived on the unified listener "
+                    f"(need >= {min_ok})"
+                )
+            else:
+                # Waited: each call returns the device's response.
+                responses = sum(1 for r in returns if r is not None)
+                assert responses >= min_ok, (
+                    f"only {responses}/{n} set_value responses (need >= {min_ok})"
+                )
 
             lstop.set()
         finally:
