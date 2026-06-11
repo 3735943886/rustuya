@@ -70,17 +70,19 @@ jobs:
       - name: Run tuyamock integration tests
         working-directory: python
         run: ../.venv/bin/pytest tests -v -m "not fleet"
-      - name: Fleet-scale tests v3.4 (1000-device connect + 500-device heartbeat keepalive)
-        # rustuya's fleet path end-to-end on v3.4 (a session-key handshake per
-        # connection): (1) hold 1000 device actors connected concurrently;
-        # (2) keep 500 alive through a 30s idle on automatic heartbeat alone,
-        # bundled in one unified listener, then set_value all of them (both
-        # nowait modes) and confirm a response from each. The single-connection
-        # mocks are split across processes so the mock host's GIL isn't the
-        # bottleneck. 100% required — every device must succeed.
+      - name: Fleet-scale tests (1000-device connect on v3.4 + 500-device keepalive/set on v3.5)
+        # rustuya's fleet path end-to-end, split across both session-key
+        # handshakes in one run: (1) hold 1000 device actors connected
+        # concurrently over the v3.4 HMAC handshake; (2) over the v3.5 GCM
+        # handshake, keep 500 alive through a 30s idle on automatic heartbeat
+        # alone, bundled in one unified listener, then set_value all of them
+        # (both nowait modes) and confirm a response from each. The
+        # single-connection mocks are split across processes so the mock host's
+        # GIL isn't the bottleneck. 100% required — every device must succeed.
         working-directory: python
         env:
           RUSTUYA_FLEET_VERSION: "3.4"
+          RUSTUYA_KEEPALIVE_VERSION: "3.5"
         run: ../.venv/bin/pytest tests -v -m fleet
 
   linux:

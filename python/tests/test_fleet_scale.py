@@ -149,6 +149,10 @@ def test_fleet_keepalive_then_set(nowait):
     n = int(os.environ.get("RUSTUYA_KEEPALIVE_N", "500"))
     per = int(os.environ.get("RUSTUYA_KEEPALIVE_PER", "50"))
     idle = int(os.environ.get("RUSTUYA_KEEPALIVE_IDLE", "30"))
+    # Independent version knob so CI can run the connect storm on one handshake
+    # (v3.4/HMAC) and the keepalive+set hot path on another (v3.5/GCM) in a
+    # single run. Defaults to the module VERSION so local runs are unchanged.
+    version = os.environ.get("RUSTUYA_KEEPALIVE_VERSION", VERSION)
     # Require a clean 100%: all connect, all stay connected (zero reconnects),
     # all respond.
     min_ok = n
@@ -163,7 +167,7 @@ def test_fleet_keepalive_then_set(nowait):
         for i in range(nproc):
             k = min(per, n - i * per)
             p = ctx.Process(
-                target=_mock_worker, args=(k, VERSION, LOCAL_KEY, q, stop), daemon=True
+                target=_mock_worker, args=(k, version, LOCAL_KEY, q, stop), daemon=True
             )
             p.start()
             procs.append(p)
@@ -181,7 +185,7 @@ def test_fleet_keepalive_then_set(nowait):
         devices = [
             rustuya.Device(
                 f"{i:020d}", LOCAL_KEY, address="127.0.0.1",
-                version=VERSION, port=ports[i], persist=True, timeout=10.0,
+                version=version, port=ports[i], persist=True, timeout=10.0,
                 nowait=nowait,
             )
             for i in range(n)
