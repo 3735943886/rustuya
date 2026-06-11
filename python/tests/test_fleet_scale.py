@@ -54,9 +54,8 @@ def test_fleet_scale_concurrent_connections():
 
     n = int(os.environ.get("RUSTUYA_FLEET_N", "1000"))
     per = int(os.environ.get("RUSTUYA_FLEET_PER", "100"))
-    # Tolerate a small number of stragglers on a noisy shared CI runner while
-    # still proving fleet scale (a few % is scheduling jitter, not a defect).
-    min_connected = int(n * 0.95)
+    # Require a clean 100%: every device must connect.
+    min_connected = n
 
     # Connect-storm guard (opt-in): cap concurrent establishment well below the
     # fleet size. The limiter is process-global and fixed on first use; in the
@@ -150,9 +149,9 @@ def test_fleet_keepalive_then_set(nowait):
     n = int(os.environ.get("RUSTUYA_KEEPALIVE_N", "500"))
     per = int(os.environ.get("RUSTUYA_KEEPALIVE_PER", "50"))
     idle = int(os.environ.get("RUSTUYA_KEEPALIVE_IDLE", "30"))
-    # Tolerate a few stragglers on a noisy shared CI runner; locally this is a
-    # clean n/n with zero reconnects.
-    min_ok = int(n * 0.95)
+    # Require a clean 100%: all connect, all stay connected (zero reconnects),
+    # all respond.
+    min_ok = n
 
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
@@ -237,7 +236,7 @@ def test_fleet_keepalive_then_set(nowait):
                 f"only {still}/{n} devices still connected after {idle}s idle "
                 f"(need >= {min_ok}) — heartbeat keepalive failed"
             )
-            assert recon <= n - min_ok, (
+            assert recon == 0, (
                 f"{recon} devices reconnected during the idle window — "
                 f"heartbeat did not sustain the connections"
             )
