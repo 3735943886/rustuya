@@ -1,14 +1,8 @@
-"""Fleet-scale concurrent-connection test.
+"""Fleet-scale tests against the tuyamock emulator.
 
-tuyamock is single-connection-per-instance and runs one OS thread per instance,
-so co-locating ~1000 of them in ONE Python process saturates the GIL on a few
-cores and the mocks cannot service their peers — an artifact of the *harness*,
-not of rustuya (which holds 1000+ concurrent connections against any peer that
-keeps up). To load-test the real thing, the mocks are split across SEPARATE
-PROCESSES (~``PER`` per process) so the GIL is divided across processes.
-
-This exercises rustuya's fleet path — 1000 independent device actors connecting
-and being held concurrently — end to end against real sockets.
+The mocks are split across separate processes (~``PER`` each) in case the GIL
+becomes a bottleneck with many mocks in one process at high device counts — a
+harness concern, not a rustuya limit.
 
 Tunables (env): ``RUSTUYA_FLEET_N`` (default 1000), ``RUSTUYA_FLEET_PER``
 (mocks per worker process, default 100).
@@ -21,7 +15,10 @@ import multiprocessing as mp
 import pytest
 
 LOCAL_KEY = "thisisarealkey00"
-VERSION = "3.3"  # v3.3 needs no session handshake: connection-holding at scale
+# Default v3.3 (no session handshake) keeps the fleet path the focus; override
+# with RUSTUYA_FLEET_VERSION to exercise the v3.4/v3.5 session-key handshake at
+# scale.
+VERSION = os.environ.get("RUSTUYA_FLEET_VERSION", "3.3")
 
 
 def _mock_worker(k, version, local_key, q, stop):
@@ -133,34 +130,17 @@ def test_fleet_scale_concurrent_connections():
 @pytest.mark.fleet
 @pytest.mark.parametrize("nowait", [False, True], ids=["wait", "nowait"])
 def test_fleet_keepalive_then_set(nowait):
-    """Hold 500 devices through a 30s idle on automatic heartbeat alone, then
-    a concurrent set_value on every one, in both response modes.
+    """Connect 500 devices into one unified listener, idle 30s, then set_value all.
 
-    Steps: connect 500 devices and bundle them into one ``unified_listener``;
-    sit idle for 30s; fire ``set_value`` on all 500 at once.
+    Checks that automatic heartbeat keeps the whole fleet alive across the idle
+    window (zero reconnects — a reconnect shows on the stream as a cmd-0
+    "Connection Successful"), then exercises both set_value response modes:
+    ``nowait=False`` returns each device's response directly; ``nowait=True`` is
+    fire-and-forget (returns None) so the responses are counted on the unified
+    listener instead.
 
-    What it proves:
-
-    * **Heartbeat keepalive** — the actor's heartbeat (sent every ~7s) sustains
-      a full fleet across the idle window; without it the 30s read
-      inactivity-timeout would tear each connection down. A reconnect surfaces
-      on the unified stream as a fresh "Connection Successful" (cmd 0) event, so
-      zero of those during the idle window is the keepalive proof.
-    * **set_value response paths** — two modes, parametrized:
-        - ``nowait=False`` (default): each ``set_value`` waits for and returns
-          the device's response, so all 500 returns are non-None.
-        - ``nowait=True``: ``set_value`` is fire-and-forget (returns None
-          immediately); the responses instead arrive asynchronously on the
-          unified listener, so we count distinct responding devices there. This
-          is the only way to observe responses in nowait mode, which is exactly
-          why the listener bundle matters here.
-
-    Mocks are split across processes so the harness GIL isn't the bottleneck
-    (see module docstring).
-
-    Tunables (env): ``RUSTUYA_KEEPALIVE_N`` (default 500),
-    ``RUSTUYA_KEEPALIVE_PER`` (mocks/process, default 50),
-    ``RUSTUYA_KEEPALIVE_IDLE`` (seconds, default 30).
+    Tunables (env): ``RUSTUYA_KEEPALIVE_N`` (500), ``RUSTUYA_KEEPALIVE_PER`` (50),
+    ``RUSTUYA_KEEPALIVE_IDLE`` (30s).
     """
     import threading
     from concurrent.futures import ThreadPoolExecutor
