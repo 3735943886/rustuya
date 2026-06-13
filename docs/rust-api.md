@@ -15,6 +15,22 @@ Depending on the application architecture, select the appropriate import path:
   use rustuya::sync::{Device, Scanner};
   ```
 
+#### Choosing sync vs async
+
+Both facades wrap the same internal actor and reach the same backing Tokio
+runtime — the `sync` types are just blocking bridges. Pick by the context you
+call from:
+
+| When you're calling from… | Use |
+|---|---|
+| A non-async program (CLI, sync binary, scripting helpers) | `rustuya::sync::{Device, SubDevice, Scanner}` |
+| Inside a `tokio` runtime (`#[tokio::main]`, `tokio::spawn`, axum, etc.) | `rustuya::{Device, DeviceBuilder, Scanner}` (async) |
+
+Calling the **sync** API from inside a Tokio runtime is **not** supported: the
+wrappers use `blocking_send`, which would otherwise panic. Since v0.3.0 a
+runtime guard turns that into a clear error, but choose the right facade up
+front rather than relying on the guard.
+
 ---
 
 ## **1. System Optimization**

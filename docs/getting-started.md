@@ -30,6 +30,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+> This example uses the blocking `rustuya::sync` facade. Inside a `tokio`
+> runtime, use the async `rustuya::{Device, Scanner}` types instead — see
+> [sync vs async](./rust-api.md#choosing-sync-vs-async).
+
 ---
 
 ## **Python Installation**
