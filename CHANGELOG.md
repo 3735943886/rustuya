@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file, curated by
 hand. This file is the single source of truth: the GitHub Release notes for
 each tag are the matching `## [version]` section extracted from here.
 
+## [0.3.0-rc.9] — 2026-06-29
+
+### Dependencies
+
+- **`aes-gcm` 0.11.0 final.** The requirement moves from `0.11.0-rc.4` to
+  `0.11` now that the crate has cut its stable release; combined with the
+  already-stable `aead` 0.6.1 / `aes` 0.9 / `cipher` 0.5, the entire dependency
+  tree is now free of pre-release crates. No code change — the GCM (v3.5) and
+  ECB (v3.4) crypto paths are unchanged; this is the last pre-release dependency
+  cleared before `0.3.0` stable.
+
 ## [0.3.0-rc.8] — 2026-06-29
 
 ### Fixes

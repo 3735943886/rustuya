@@ -1,6 +1,6 @@
 [package]
 name = "rustuya"
-version = "0.3.0-rc.8"
+version = "0.3.0-rc.9"
 authors = ["3735943886"]
 edition = "2024"
 rust-version = "1.88"
@@ -24,7 +24,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 aes = "0.9"
-aes-gcm = "0.11.0-rc.4"
+aes-gcm = "0.11"
 async-stream = "0.3"
 base64 = "0.22"
 byteorder = "1.5"
