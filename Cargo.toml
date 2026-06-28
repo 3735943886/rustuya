@@ -1,6 +1,6 @@
 [package]
 name = "rustuya"
-version = "0.3.0-rc.7"
+version = "0.3.0-rc.8"
 authors = ["3735943886"]
 edition = "2024"
 rust-version = "1.88"

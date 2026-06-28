@@ -726,7 +726,13 @@ impl Device {
             "Connecting to device {} at {}:{}",
             self.inner.id, addr, port
         );
-        let mut stream = timeout(self.timeout(), TcpStream::connect(format!("{addr}:{port}")))
+        // Pass (host, port) as a tuple rather than `format!("{addr}:{port}")`:
+        // tuple resolution (getaddrinfo) handles IPv6 literals without manual
+        // bracketing, link-local zone ids (`fe80::1%eth0`), and NAT64-synthesized
+        // addresses (`64:ff9b::c0a8:132`) — all of which the string form mangles
+        // into an unparseable `host:port`. IPv4 literals and hostnames are
+        // unaffected.
+        let mut stream = timeout(self.timeout(), TcpStream::connect((addr.as_str(), port)))
             .await
             .map_err(|_| TuyaError::Timeout)?
             .map_err(|e| match e.kind() {

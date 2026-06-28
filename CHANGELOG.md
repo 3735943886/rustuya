@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file, curated by
 hand. This file is the single source of truth: the GitHub Release notes for
 each tag are the matching `## [version]` section extracted from here.
 
+## [0.3.0-rc.8] — 2026-06-29
+
+### Fixes
+
+- **Device connect accepts IPv6 literals, link-local zone ids, and
+  NAT64-synthesized addresses.** The connect path built its target with
+  `format!("{addr}:{port}")`, which mangles an IPv6 literal (`2001:db8::5` →
+  the unparseable `2001:db8::5:6668`). It now passes `(host, port)` as a tuple
+  so resolution (getaddrinfo) handles bracketless IPv6, link-local zones
+  (`fe80::1%eth0`), and NAT64 addresses (`64:ff9b::c0a8:132`). IPv4 literals
+  and hostnames are unaffected. Note: device **discovery** remains IPv4-only —
+  the Tuya LAN scan is a UDP broadcast (`255.255.255.255`), which has no IPv6
+  equivalent and no NAT64 path; on an IPv6-only LAN, connect by explicit
+  address (e.g. a NAT64-synthesized one) instead of relying on the scanner.
+
 ## [0.3.0-rc.7] — 2026-06-09
 
 ### Fleet scale / fixes
