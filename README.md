@@ -62,6 +62,27 @@ for msg in dev.listener():                      # real-time events
   automatic reconnection and exponential backoff
 - Full protocol coverage — Tuya 3.1 / 3.2 / 3.3 / 3.4 / 3.5 + device22
 
+### Tested at fleet scale
+
+Large-scale behavior is exercised against real mock devices — a 1000-device
+[tuyamock](https://github.com/3735943886/tuyamock) fleet (mocks spread across
+processes so the Python GIL isn't the bottleneck) with actual TCP connections
+and handshakes, not just unit mocks:
+
+- **This repo** stands up the 1000-device fleet and asserts every connection
+  establishes without deadlock under a bounded connect-concurrency cap, in CI
+  ([`python/tests/test_fleet_scale.py`](python/tests/test_fleet_scale.py)).
+- The downstream [rustuya-bridge](https://github.com/3735943886/rustuya-bridge)
+  goes further end-to-end: a 1000-device fleet onboards cleanly with zero
+  retained orphans after a mass clear, and a separate test holds the fleet idle
+  for 30s to prove the heartbeat keeps every connection alive (witnessed
+  mock-side) before fanning a single name-addressed command out to the whole
+  fleet.
+
+It isn't an exhaustive real-hardware fleet test, but standing up a large mock
+fleet and driving real connections through it is more than local-Tuya libraries
+typically ship.
+
 See the [Guide](https://3735943886.github.io/rustuya/) for the full API
 reference, design philosophy, and architecture notes.
 
