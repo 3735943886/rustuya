@@ -65,9 +65,8 @@ for msg in dev.listener():                      # real-time events
 ### Tested at fleet scale
 
 Large-scale behavior is exercised against real mock devices — a 1000-device
-[tuyamock](https://github.com/3735943886/tuyamock) fleet (mocks spread across
-processes so the Python GIL isn't the bottleneck) with actual TCP connections
-and handshakes, not just unit mocks:
+[tuyamock](https://github.com/3735943886/tuyamock) fleet with actual TCP
+connections and handshakes, not just unit mocks:
 
 - **This repo** stands up the 1000-device fleet and asserts every connection
   establishes without deadlock under a bounded connect-concurrency cap, in CI
@@ -79,9 +78,9 @@ and handshakes, not just unit mocks:
   mock-side) before fanning a single name-addressed command out to the whole
   fleet.
 
-It isn't an exhaustive real-hardware fleet test, but standing up a large mock
-fleet and driving real connections through it is more than local-Tuya libraries
-typically ship.
+It proves the fleet machinery (bounded connect with no deadlock, heartbeat
+survival, fan-out) holds with 1000 concurrent devices over real sockets, end to
+end.
 
 See the [Guide](https://3735943886.github.io/rustuya/) for the full API
 reference, design philosophy, and architecture notes.
