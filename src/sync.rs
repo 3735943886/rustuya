@@ -624,6 +624,15 @@ impl Scanner {
         self.inner.set_bind_address(addr)
     }
 
+    /// Sets the explicit source IPs the active discovery broadcast is sent from
+    /// on the underlying global scanner. Empty (the default) auto-detects the
+    /// source via a route lookup; configure one IP per subnet to actively probe
+    /// on a multi-homed host. Affects sending only. See
+    /// [`rustuya::Scanner::set_discovery_sources`](crate::Scanner::set_discovery_sources).
+    pub fn set_discovery_sources(&self, sources: Vec<std::net::IpAddr>) {
+        self.inner.set_discovery_sources(sources);
+    }
+
     pub(crate) fn from_async(async_scanner: AsyncScanner) -> Self {
         let (tx, mut rx) = mpsc::channel::<ScannerCommand>(CHAN_WORKER_COMMAND_CAPACITY);
         let scanner_inner = async_scanner.clone();
