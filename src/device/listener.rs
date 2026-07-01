@@ -16,7 +16,8 @@ impl Device {
     /// [`unified_listener`]), the device's background connection task stays
     /// alive too — even if the caller dropped their original `Device` handle.
     /// To force shutdown, call [`Device::stop`].
-    pub fn listener(&self) -> impl Stream<Item = Result<TuyaMessage>> + Send + 'static {
+    pub fn listener(&self) -> impl Stream<Item = Result<TuyaMessage>> + Send + Unpin + 'static {
+        use futures_util::StreamExt;
         use tokio::sync::broadcast::error::RecvError;
         let mut rx = self.inner.broadcast_tx.subscribe();
         let device = self.clone();
@@ -66,6 +67,7 @@ impl Device {
                 }
             }
         }
+        .boxed()
     }
 }
 
@@ -81,7 +83,7 @@ pub struct DeviceEvent {
 /// Merges multiple device listeners into a single stream of events.
 pub fn unified_listener(
     devices: Vec<Device>,
-) -> impl Stream<Item = Result<DeviceEvent>> + Send + 'static {
+) -> impl Stream<Item = Result<DeviceEvent>> + Send + Unpin + 'static {
     use futures_util::StreamExt;
     use futures_util::stream::select_all;
 
@@ -167,8 +169,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let device = make_test_device("listener_yields");
-            let stream = device.listener();
-            tokio::pin!(stream);
+            let mut stream = device.listener();
 
             let msg = make_msg(0x0a, b"{\"hello\":\"world\"}");
             let _ = device.inner.broadcast_tx.send(msg.clone());
@@ -191,8 +192,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let device = make_test_device("listener_filters");
-            let stream = device.listener();
-            tokio::pin!(stream);
+            let mut stream = device.listener();
 
             let _ = device.inner.broadcast_tx.send(make_msg(0x0a, b""));
             let _ = device.inner.broadcast_tx.send(make_msg(0x0a, b"{\"k\":1}"));
@@ -218,8 +218,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let device = make_test_device("listener_exits_on_stop");
-            let stream = device.listener();
-            tokio::pin!(stream);
+            let mut stream = device.listener();
 
             // No messages — stream is parked on rx.recv(). Fire stop and the
             // cancel branch of the select! should win.
@@ -246,8 +245,7 @@ mod tests {
         rt.block_on(async {
             let device = make_test_device("listener_survives_drop");
             let weak_inner = Arc::downgrade(&device.inner);
-            let stream = device.listener();
-            tokio::pin!(stream);
+            let mut stream = device.listener();
 
             // Send first while the device clone is alive.
             let _ = device.inner.broadcast_tx.send(make_msg(0x0a, b"a"));
@@ -380,8 +378,7 @@ mod tests {
             assert!(!expected.is_empty(), "ERR_SUCCESS status must be non-empty");
 
             // Subscribe AFTER the broadcast — the first item must be the replay.
-            let stream = device.listener();
-            tokio::pin!(stream);
+            let mut stream = device.listener();
             let got = timeout(Duration::from_millis(200), stream.next())
                 .await
                 .expect("listener must replay latched status within 200ms (lost-wakeup regression)")
@@ -403,16 +400,13 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let device = make_test_device("listener_fanout");
-            let s1 = device.listener();
-            let s2 = device.listener();
-            let s3 = device.listener();
-            tokio::pin!(s1);
-            tokio::pin!(s2);
-            tokio::pin!(s3);
+            let mut s1 = device.listener();
+            let mut s2 = device.listener();
+            let mut s3 = device.listener();
 
             let _ = device.inner.broadcast_tx.send(make_msg(0x0a, b"shared"));
 
-            for stream in [&mut s1.as_mut(), &mut s2.as_mut(), &mut s3.as_mut()] {
+            for stream in [&mut s1, &mut s2, &mut s3] {
                 let got = timeout(Duration::from_millis(200), stream.next())
                     .await
                     .unwrap()
@@ -440,8 +434,7 @@ mod tests {
             // If broadcast_tx accumulated unbounded receivers we'd see
             // memory blow up or a panic from broadcast::Sender. Reaching
             // here = pass. Also verify the device is still functional:
-            let stream = device.listener();
-            tokio::pin!(stream);
+            let mut stream = device.listener();
             let _ = device.inner.broadcast_tx.send(make_msg(0x0a, b"alive"));
             let got = timeout(Duration::from_millis(200), stream.next())
                 .await
@@ -471,8 +464,7 @@ mod tests {
             let d1_keep = d1.clone();
             let d2_keep = d2.clone();
 
-            let stream = unified_listener(vec![d1, d2]);
-            tokio::pin!(stream);
+            let mut stream = unified_listener(vec![d1, d2]);
 
             let _ = d1_keep.inner.broadcast_tx.send(make_msg(0x0a, b"from1"));
             let _ = d2_keep.inner.broadcast_tx.send(make_msg(0x0a, b"from2"));
@@ -547,8 +539,7 @@ mod tests {
             let d1_keep = d1.clone();
             let d2_keep = d2.clone();
 
-            let stream = unified_listener(vec![d1, d2]);
-            tokio::pin!(stream);
+            let mut stream = unified_listener(vec![d1, d2]);
 
             // Stop d1.
             d1_keep.fire_stop();
@@ -655,9 +646,8 @@ mod tests {
                 // guarantees every consumer is registered before message 0.
                 let streams: Vec<_> = (0..4).map(|_| device.listener()).collect();
                 let mut consumers = Vec::new();
-                for stream in streams {
+                for mut stream in streams {
                     consumers.push(tokio::spawn(async move {
-                        tokio::pin!(stream);
                         let mut count = 0;
                         // Read up to 100 messages or 2s, whichever first.
                         loop {
@@ -871,8 +861,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let device = make_test_device("listener_lagged");
-            let stream = device.listener();
-            tokio::pin!(stream);
+            let mut stream = device.listener();
 
             // Flood with 200 messages without consuming any.
             for i in 0..200u32 {

@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file, curated by
 hand. This file is the single source of truth: the GitHub Release notes for
 each tag are the matching `## [version]` section extracted from here.
 
+## [0.3.0-rc.10] — 2026-07-01
+
+### API
+
+- **`listener()` and `unified_listener()` now return `Unpin` streams — no
+  `pin!` needed at call sites.** `Device::listener()` previously returned a bare
+  `async_stream` generator (`!Unpin`), so consuming it with `StreamExt::next()`
+  required a `tokio::pin!` / `std::pin::pin!` first, while `unified_listener()`
+  was already `Unpin` by way of `select_all` — an inconsistency between the two.
+  `listener()` now boxes its stream (`.boxed()`) and both signatures advertise
+  `+ Unpin`, so `while let Some(msg) = dev.listener().next().await` compiles
+  directly. The `+ Unpin` bound is now part of the public contract, guarding
+  against a future refactor silently dropping it. Cost is one heap allocation
+  per subscription (not per message); message throughput is unchanged.
+
+### Documentation
+
+- Quick start gains a **Rust (async)** example alongside the sync and Python
+  snippets, showing the `#[tokio::main]` + `listener().next().await` pattern.
+
 ## [0.3.0-rc.9] — 2026-06-29
 
 ### Dependencies

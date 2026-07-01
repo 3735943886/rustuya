@@ -27,7 +27,7 @@ pip install rustuya
 
 ## Quick start
 
-**Rust**
+**Rust (sync)**
 
 ```rust
 use rustuya::sync::Device;
@@ -38,6 +38,26 @@ println!("{:?}", dev.status()?);                // read current DPS
 
 for msg in dev.listener() {                     // real-time events
     println!("{:?}", msg);
+}
+```
+
+**Rust (async)** — inside a `tokio` runtime
+
+```rust
+use rustuya::Device;
+use futures_util::StreamExt;
+
+#[tokio::main]
+async fn main() -> Result<(), rustuya::TuyaError> {
+    let dev = Device::new("DEVICE_ID", "LOCAL_KEY");
+    dev.set_value(1, true).await?;              // turn on DP 1
+    println!("{:?}", dev.status().await?);      // read current DPS
+
+    let mut listener = dev.listener();
+    while let Some(msg) = listener.next().await {   // real-time events
+        println!("{:?}", msg);
+    }
+    Ok(())
 }
 ```
 
