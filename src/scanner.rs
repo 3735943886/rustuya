@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -230,6 +230,36 @@ impl Drop for ScannerState {
     }
 }
 
+/// Resolves a configured bind-address string to the IP the listener socket
+/// should actually bind to, plus whether it had to be widened.
+///
+/// The listener must receive limited-broadcast (`255.255.255.255`) discovery
+/// packets, but a socket bound to a specific unicast IP does **not** receive
+/// them (verified on Linux) — so binding the listener to a concrete address
+/// silently disables passive discovery. To avoid that footgun, a concrete
+/// (non-unspecified, non-loopback) unicast address is widened to the family
+/// wildcard (`0.0.0.0` / `::`). `0.0.0.0`/`::` are already wildcards, and
+/// loopback is left exact because it's a deliberate unicast/mock-testing
+/// choice where no broadcast is expected. Returns `None` if unparseable.
+///
+/// Pinning the *source* of active-scan broadcasts is a separate concern,
+/// handled by [`Scanner::set_discovery_sources`].
+fn effective_bind_ip(configured: &str) -> Option<(IpAddr, bool)> {
+    let ip: IpAddr = configured.parse().ok()?;
+    let keep_exact = match ip {
+        IpAddr::V4(v4) => v4.is_unspecified() || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback(),
+    };
+    if keep_exact {
+        return Some((ip, false));
+    }
+    let wildcard = match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    Some((wildcard, true))
+}
+
 /// Pure helper: given a desired port list and the currently-bound set,
 /// return `(ports_to_add, ports_to_remove)`. Factored out so the
 /// reconciliation arithmetic can be unit-tested without binding sockets.
@@ -331,11 +361,24 @@ impl Scanner {
         }
 
         let bind_addr = state.bind_addr.read().clone();
+        let Some((bind_ip, widened)) = effective_bind_ip(&bind_addr) else {
+            warn!("Invalid scanner bind address {bind_addr:?}; cannot bind listener sockets");
+            return;
+        };
+        if widened {
+            warn!(
+                "Scanner bind address {bind_addr} is a specific unicast IP; a socket bound to it \
+                 does not receive limited-broadcast (255.255.255.255) discovery packets. \
+                 Listening on the {} wildcard instead so passive discovery keeps working. To pin \
+                 the source of active-scan broadcasts, use set_discovery_sources().",
+                if bind_ip.is_ipv4() { "0.0.0.0" } else { "::" }
+            );
+        }
         let mut new_sockets: Vec<(u16, Arc<UdpSocket>)> = Vec::new();
         {
             let mut guard = state.sockets.write();
             for port in ports_to_add {
-                if let Ok(socket) = Self::create_udp_socket(&bind_addr, port) {
+                if let Ok(socket) = Self::create_udp_socket(bind_ip, port) {
                     let arc_socket = Arc::new(socket);
                     guard.insert(port, arc_socket.clone());
                     new_sockets.push((port, arc_socket));
@@ -498,10 +541,12 @@ impl Scanner {
         tasks
     }
 
-    fn create_udp_socket(bind_addr: &str, port: u16) -> Result<UdpSocket> {
-        let addr: SocketAddr = format!("{bind_addr}:{port}")
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    fn create_udp_socket(bind_ip: IpAddr, port: u16) -> Result<UdpSocket> {
+        // `bind_ip` is already normalized by `effective_bind_ip` (a concrete
+        // unicast address is widened to the wildcard so broadcast reception
+        // works). Build the SocketAddr directly — no string formatting, which
+        // also sidesteps the IPv6-literal bracket issue.
+        let addr = SocketAddr::new(bind_ip, port);
 
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         let _ = socket.set_reuse_address(true);
@@ -629,6 +674,18 @@ impl Scanner {
     /// task and the discovery cache survive the rebind (no events lost from
     /// the consumer's POV; in-flight UDP packets on the old sockets may be
     /// dropped).
+    ///
+    /// # Broadcast reception
+    ///
+    /// The listener needs to receive limited-broadcast (`255.255.255.255`)
+    /// discovery packets, but a socket bound to a *specific* unicast IP does
+    /// not receive them. So a concrete (non-loopback) unicast address is
+    /// transparently widened to the family wildcard (`0.0.0.0` / `::`) — with
+    /// a warning — rather than silently disabling passive discovery.
+    /// `0.0.0.0`/`::` and loopback are used exactly as given. To pin the
+    /// *source* of active-scan broadcasts (e.g. per subnet on a multi-homed
+    /// host), use [`set_discovery_sources`](Self::set_discovery_sources)
+    /// instead, which affects sending only.
     pub fn set_bind_address(&self, addr: &str) -> Result<()> {
         let new_addr = addr.to_string();
         // Take the guard for the whole detect-clear-rebind sequence so a
@@ -1495,6 +1552,45 @@ mod tests {
     // `ensure_passive_listener` uses to decide which ports to bind/abort.
     // Before this fix, the function only added new ports; ports removed
     // from the configured list silently kept their receiver tasks alive.
+    // footgun fix: a socket bound to a specific unicast IP does not receive
+    // limited-broadcast discovery packets, silently disabling passive
+    // discovery. `effective_bind_ip` widens a concrete unicast address to the
+    // family wildcard while keeping unspecified/loopback exact.
+    #[test]
+    fn effective_bind_ip_widens_only_concrete_unicast() {
+        // Unspecified stays exact, not flagged as widened.
+        assert_eq!(
+            effective_bind_ip("0.0.0.0"),
+            Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), false))
+        );
+        assert_eq!(
+            effective_bind_ip("::"),
+            Some((IpAddr::V6(Ipv6Addr::UNSPECIFIED), false))
+        );
+
+        // Loopback is a deliberate unicast/mock choice — kept exact.
+        assert_eq!(
+            effective_bind_ip("127.0.0.1"),
+            Some(("127.0.0.1".parse().unwrap(), false))
+        );
+
+        // Concrete routable unicast is widened to the wildcard (the footgun).
+        assert_eq!(
+            effective_bind_ip("192.168.1.50"),
+            Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), true))
+        );
+        assert_eq!(
+            effective_bind_ip("10.0.0.87"),
+            Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), true))
+        );
+        let (v6, widened) = effective_bind_ip("2001:db8::1").unwrap();
+        assert_eq!(v6, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert!(widened);
+
+        // Garbage is rejected.
+        assert_eq!(effective_bind_ip("not-an-ip"), None);
+    }
+
     #[test]
     fn compute_port_diff_adds_only() {
         let (add, remove) = compute_port_diff(&[6666, 6667, 7000], &[]);
