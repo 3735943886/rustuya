@@ -172,3 +172,17 @@ UDP-based device discovery on the local network.
       println!("Found device: {} at {}", device.id, device.ip);
   }
   ```
+
+### Advanced configuration (multi-homed hosts)
+
+Every knob below takes `&self` and mutates the shared global scanner state; they exist on both the async `Scanner` and `rustuya::sync::Scanner`.
+
+- **`set_bind_address(addr: &str)`** — bind address for the passive listener. A concrete unicast IP is **transparently widened to the family wildcard** (`0.0.0.0` / `::`) with a warning, because a socket bound to a specific unicast address does not receive limited-broadcast (`255.255.255.255`) discovery packets. `0.0.0.0`/`::` and loopback are used exactly as given.
+- **`set_discovery_sources(sources: Vec<IpAddr>)` / `discovery_sources()`** — explicit source IP(s) for the **active** discovery broadcast. Empty (the default) auto-detects the source via a kernel route lookup. On a multi-homed host, configure one IPv4 per subnet you want to actively probe: each is used as the send socket's bind source (so the broadcast egresses the right interface) and as the v3.5 payload `ip` (so devices reply to a reachable address). Sending only — the passive listener still receives unsolicited broadcasts on every interface. IPv4-only.
+  ```rust
+  let scanner = Scanner::get(); // sync facade; async: Scanner::new()
+  scanner.set_discovery_sources(vec![
+      "192.168.1.10".parse().unwrap(),
+      "10.0.20.5".parse().unwrap(),
+  ]);
+  ```

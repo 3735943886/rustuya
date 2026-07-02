@@ -23,7 +23,7 @@ To handle high-concurrency environments with many device connections, use this u
 Direct interaction and control for individual Tuya devices.
 
 ### `Device()`
-- **Definition**: `Device(id, local_key, address="Auto", version="Auto", dev_type=None, persist=True, timeout=None, nowait=False)`
+- **Definition**: `Device(id, local_key, address="Auto", version="Auto", dev_type=None, persist=True, timeout=None, nowait=False, port=None)`
 - **Description**: Creates a new device handle.
 - **Arguments**:
   - `id` (str, **Required**): The unique device ID.
@@ -37,6 +37,7 @@ Direct interaction and control for individual Tuya devices.
   - `persist` (bool, *Optional*): Whether to keep the TCP connection alive. Default is `True`.
   - `timeout` (float, *Optional*): Global timeout for network operations and responses in seconds (default: 10.0)
   - `nowait` (bool, *Optional*): If `True`, command methods return immediately after queuing. Default is `False`.
+  - `port` (int, *Optional*): TCP port of the device. Default is `None` (uses the protocol default, `6668`).
 - **Example**:
   ```python
   from rustuya import Device

@@ -33,8 +33,10 @@ Consequences:
   or when the relevant `Arc` reaches zero strong refs.
 
 `runtime::maximize_fd_limit()` raises `RLIMIT_NOFILE` to the hard limit on
-Unix. Called by the Python bindings on module init; not called automatically
-from the Rust side (consumers may have their own fd policy).
+Unix. It is **exposed** to the Python bindings as `rustuya.maximize_fd_limit()`
+but is **not** called automatically — neither at module import nor from the
+Rust side — since consumers may have their own fd policy. At fleet scale
+(hundreds/thousands of devices) call it yourself before opening connections.
 
 ---
 
@@ -661,7 +663,9 @@ spawns its own `bridge_to_sync` task. Mirrors the design of
 [`python/src/lib.rs`](../python/src/lib.rs). Thin pyo3 wrappers over
 `sync::*`. Module init:
 
-- Calls `runtime::maximize_fd_limit()` (best effort).
+- Imports `logging` and installs the `pyo3-log` bridge (see below).
+- Registers `maximize_fd_limit()` as a callable — it is **not** invoked at
+  import; consumers call it explicitly (see §2).
 - Installs the `pyo3-log` bridge so Rust `log` records surface as Python
   `logging` records.
 

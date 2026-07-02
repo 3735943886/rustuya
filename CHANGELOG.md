@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file, curated by
 hand. This file is the single source of truth: the GitHub Release notes for
 each tag are the matching `## [version]` section extracted from here.
 
+## [0.3.0] — 2026-07-02
+
+Stable release of the 0.3.0 line — the culmination of the `0.3.0-rc.1`
+through `0.3.0-rc.10` hardening cycle. The changes below are the ones that
+landed after `rc.10`, plus the minimum-version and API items worth calling
+out for anyone upgrading from 0.2.x. The per-rc sections that follow retain
+the full incremental history.
+
+### Added
+
+- **`Scanner::set_discovery_sources()` / `discovery_sources()`** (on both the
+  async `Scanner` and `sync::Scanner`) — pin the explicit source IP(s) the
+  *active* discovery broadcast is sent from. Empty (the default) auto-detects
+  the source via a kernel route lookup, unchanged from before. On a
+  multi-homed host — or when the default route differs from the IoT subnet
+  (e.g. a VPN is up) — configure one IPv4 per subnet you want to actively
+  probe: each is used as the send socket's bind source (so the broadcast
+  egresses the right interface) and as the v3.5 payload `ip` (so devices reply
+  to a reachable address). Sending only — the passive listener stays bound to
+  `0.0.0.0`, so unsolicited broadcasts are still received on every interface.
+  IPv4-only, matching discovery.
+
+### Changed
+
+- **`Scanner::set_bind_address()` now widens a concrete unicast IP to the
+  family wildcard.** A socket bound to a specific unicast address does not
+  receive limited-broadcast (`255.255.255.255`) discovery packets, so binding
+  the listener to a concrete IP silently disabled passive discovery. Such an
+  address is now transparently widened to `0.0.0.0` / `::` (with a warning)
+  instead of failing quietly; `0.0.0.0`/`::` and loopback are used exactly as
+  given. To pin the *source* of active-scan broadcasts, use
+  `set_discovery_sources()` instead (see above).
+
+### Minimum versions
+
+- **MSRV is now Rust 1.88** (`rust-version` in both `Cargo.toml` files). The
+  binding constraint is let-chains, stabilized in edition-2024 + Rust 1.88.
+- **Python bindings: minimum Python is now 3.8** (pyo3 0.28 → 0.29, plus
+  `pythonize`); wheels are built `abi3-py38`.
+
+### Highlights from the rc cycle (see the sections below for detail)
+
+- Defense-in-depth hardening across the actor, listener, scanner, and crypto
+  paths (rc.1–rc.9).
+- `listener()` / `unified_listener()` return `Unpin` streams — no `pin!` at
+  call sites (rc.10).
+- Dependency tree is free of pre-release crates (aes-gcm 0.11.0 final, rc.9).
+- End-to-end coverage against the tuyamock device emulator in CI, no physical
+  hardware required (rc.4).
+
 ## [0.3.0-rc.10] — 2026-07-01
 
 ### API
