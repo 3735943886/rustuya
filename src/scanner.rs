@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -147,6 +147,16 @@ struct ScannerState {
     timeout: RwLock<Duration>,
     bind_addr: RwLock<String>,
     ports: RwLock<Vec<u16>>,
+    // Explicit source IPs for the *active* discovery broadcast. Empty by
+    // default, in which case the source is auto-detected via a route lookup
+    // (see `discover_local_ip_blocking`). When non-empty, each configured IP
+    // is used as (a) the bind source of a dedicated send socket — so the
+    // broadcast egresses that IP's interface — and (b) the `ip` field of the
+    // v3.5 payload, so the device replies to a reachable address. This lets a
+    // multi-homed host actively elicit devices on more than the default-route
+    // subnet WITHOUT any interface enumeration. Send-only: the passive
+    // listener stays bound to `0.0.0.0` so broadcast *reception* is unaffected.
+    discovery_sources: RwLock<Vec<IpAddr>>,
 }
 
 impl ScannerState {
@@ -166,6 +176,7 @@ impl ScannerState {
             timeout: RwLock::new(DEFAULT_SCAN_TIMEOUT),
             bind_addr: RwLock::new("0.0.0.0".to_string()),
             ports: RwLock::new(vec![6666, 6667, 7000]),
+            discovery_sources: RwLock::new(Vec::new()),
         }
     }
 
@@ -217,6 +228,36 @@ impl Drop for ScannerState {
             t.abort();
         }
     }
+}
+
+/// Resolves a configured bind-address string to the IP the listener socket
+/// should actually bind to, plus whether it had to be widened.
+///
+/// The listener must receive limited-broadcast (`255.255.255.255`) discovery
+/// packets, but a socket bound to a specific unicast IP does **not** receive
+/// them (verified on Linux) — so binding the listener to a concrete address
+/// silently disables passive discovery. To avoid that footgun, a concrete
+/// (non-unspecified, non-loopback) unicast address is widened to the family
+/// wildcard (`0.0.0.0` / `::`). `0.0.0.0`/`::` are already wildcards, and
+/// loopback is left exact because it's a deliberate unicast/mock-testing
+/// choice where no broadcast is expected. Returns `None` if unparseable.
+///
+/// Pinning the *source* of active-scan broadcasts is a separate concern,
+/// handled by [`Scanner::set_discovery_sources`].
+fn effective_bind_ip(configured: &str) -> Option<(IpAddr, bool)> {
+    let ip: IpAddr = configured.parse().ok()?;
+    let keep_exact = match ip {
+        IpAddr::V4(v4) => v4.is_unspecified() || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback(),
+    };
+    if keep_exact {
+        return Some((ip, false));
+    }
+    let wildcard = match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    Some((wildcard, true))
 }
 
 /// Pure helper: given a desired port list and the currently-bound set,
@@ -320,11 +361,24 @@ impl Scanner {
         }
 
         let bind_addr = state.bind_addr.read().clone();
+        let Some((bind_ip, widened)) = effective_bind_ip(&bind_addr) else {
+            warn!("Invalid scanner bind address {bind_addr:?}; cannot bind listener sockets");
+            return;
+        };
+        if widened {
+            warn!(
+                "Scanner bind address {bind_addr} is a specific unicast IP; a socket bound to it \
+                 does not receive limited-broadcast (255.255.255.255) discovery packets. \
+                 Listening on the {} wildcard instead so passive discovery keeps working. To pin \
+                 the source of active-scan broadcasts, use set_discovery_sources().",
+                if bind_ip.is_ipv4() { "0.0.0.0" } else { "::" }
+            );
+        }
         let mut new_sockets: Vec<(u16, Arc<UdpSocket>)> = Vec::new();
         {
             let mut guard = state.sockets.write();
             for port in ports_to_add {
-                if let Ok(socket) = Self::create_udp_socket(&bind_addr, port) {
+                if let Ok(socket) = Self::create_udp_socket(bind_ip, port) {
                     let arc_socket = Arc::new(socket);
                     guard.insert(port, arc_socket.clone());
                     new_sockets.push((port, arc_socket));
@@ -487,10 +541,12 @@ impl Scanner {
         tasks
     }
 
-    fn create_udp_socket(bind_addr: &str, port: u16) -> Result<UdpSocket> {
-        let addr: SocketAddr = format!("{bind_addr}:{port}")
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    fn create_udp_socket(bind_ip: IpAddr, port: u16) -> Result<UdpSocket> {
+        // `bind_ip` is already normalized by `effective_bind_ip` (a concrete
+        // unicast address is widened to the wildcard so broadcast reception
+        // works). Build the SocketAddr directly — no string formatting, which
+        // also sidesteps the IPv6-literal bracket issue.
+        let addr = SocketAddr::new(bind_ip, port);
 
         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         let _ = socket.set_reuse_address(true);
@@ -504,6 +560,27 @@ impl Scanner {
         // UdpSocket::from_std requires an active Tokio reactor.
         // If we're called from a thread without one (e.g. sync examples),
         // we must enter the global background runtime.
+        let _guard = crate::runtime::get_runtime().enter();
+        Ok(UdpSocket::from_std(std_socket)?)
+    }
+
+    /// Creates a broadcast-enabled UDP socket bound to a specific source IP and
+    /// an ephemeral port, for the configured-source active-broadcast path.
+    ///
+    /// Binding the source (rather than reusing the `0.0.0.0` listener socket)
+    /// pins which interface a `255.255.255.255` broadcast egresses on a
+    /// multi-homed host. The ephemeral source port is irrelevant to discovery:
+    /// devices reply to the payload `ip` at the discovery port, which the
+    /// `0.0.0.0` listener receives.
+    fn create_send_socket(source_ip: IpAddr) -> Result<UdpSocket> {
+        let addr = SocketAddr::new(source_ip, 0);
+        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+        let _ = socket.set_reuse_address(true);
+        let _ = socket.set_broadcast(true);
+        socket.bind(&SockAddr::from(addr))?;
+        socket.set_nonblocking(true)?;
+
+        let std_socket: std::net::UdpSocket = socket.into();
         let _guard = crate::runtime::get_runtime().enter();
         Ok(UdpSocket::from_std(std_socket)?)
     }
@@ -564,12 +641,51 @@ impl Scanner {
         self.ensure_passive_listener();
     }
 
+    /// Returns the explicit source IPs used for the active discovery broadcast.
+    /// Empty means "auto-detect the source via a route lookup" (the default).
+    #[must_use]
+    pub fn discovery_sources(&self) -> Vec<IpAddr> {
+        self.inner.discovery_sources.read().clone()
+    }
+
+    /// Sets the explicit source IPs the active discovery broadcast is sent from.
+    ///
+    /// By default this is empty and the source is auto-detected via a kernel
+    /// route lookup — correct for a single-subnet host, but on a multi-homed
+    /// host (or when the default route differs from the IoT subnet, e.g. a VPN
+    /// is up) it only elicits devices on the default-route subnet and stamps
+    /// that subnet's address into the v3.5 payload.
+    ///
+    /// Configure one IP per local subnet you want to actively probe. Each is
+    /// used as the send socket's bind source (so the broadcast leaves the right
+    /// interface) and as the v3.5 payload `ip` (so the device replies to a
+    /// reachable address). Only IPv4 sources are used — discovery is IPv4-only.
+    ///
+    /// This affects **sending only**. The passive listener stays bound to
+    /// `0.0.0.0`, so devices that broadcast unsolicited are still received on
+    /// every interface regardless of this setting.
+    pub fn set_discovery_sources(&self, sources: Vec<IpAddr>) {
+        *self.inner.discovery_sources.write() = sources;
+    }
+
     /// Sets the local bind address. If the address actually changes and the
     /// passive listener is already running, the existing receiver tasks are
     /// aborted and the sockets re-bound to the new address. The dispatcher
     /// task and the discovery cache survive the rebind (no events lost from
     /// the consumer's POV; in-flight UDP packets on the old sockets may be
     /// dropped).
+    ///
+    /// # Broadcast reception
+    ///
+    /// The listener needs to receive limited-broadcast (`255.255.255.255`)
+    /// discovery packets, but a socket bound to a *specific* unicast IP does
+    /// not receive them. So a concrete (non-loopback) unicast address is
+    /// transparently widened to the family wildcard (`0.0.0.0` / `::`) — with
+    /// a warning — rather than silently disabling passive discovery.
+    /// `0.0.0.0`/`::` and loopback are used exactly as given. To pin the
+    /// *source* of active-scan broadcasts (e.g. per subnet on a multi-homed
+    /// host), use [`set_discovery_sources`](Self::set_discovery_sources)
+    /// instead, which affects sending only.
     pub fn set_bind_address(&self, addr: &str) -> Result<()> {
         let new_addr = addr.to_string();
         // Take the guard for the whole detect-clear-rebind sequence so a
@@ -666,18 +782,28 @@ impl Scanner {
         None
     }
 
-    async fn send_discovery_broadcast(&self, socket: &UdpSocket, port: u16) -> Result<()> {
-        let local_ip = Self::discover_local_ip_blocking().unwrap_or_else(|| {
-            // All three candidate destinations failed a kernel route lookup —
-            // typically only happens on containers/namespaces with an empty
-            // routing table. v3.5 (port 7000) payloads carry this IP and some
-            // firmwares ignore broadcasts with `ip="0.0.0.0"`, so surface it.
-            warn!(
-                "Local IP detection failed for discovery broadcast on port {port}; \
-                 falling back to 0.0.0.0"
-            );
-            "0.0.0.0".to_string()
-        });
+    async fn send_discovery_broadcast(
+        &self,
+        socket: &UdpSocket,
+        port: u16,
+        source_override: Option<IpAddr>,
+    ) -> Result<()> {
+        let local_ip = match source_override {
+            // A source was explicitly configured (`set_discovery_sources`): use
+            // it verbatim as the v3.5 payload `ip` — no route-lookup guessing.
+            Some(ip) => ip.to_string(),
+            None => Self::discover_local_ip_blocking().unwrap_or_else(|| {
+                // All three candidate destinations failed a kernel route lookup —
+                // typically only happens on containers/namespaces with an empty
+                // routing table. v3.5 (port 7000) payloads carry this IP and some
+                // firmwares ignore broadcasts with `ip="0.0.0.0"`, so surface it.
+                warn!(
+                    "Local IP detection failed for discovery broadcast on port {port}; \
+                     falling back to 0.0.0.0"
+                );
+                "0.0.0.0".to_string()
+            }),
+        };
         debug!("Sending discovery broadcast on port {port} (local IP: {local_ip})");
 
         let (payload, prefix) = if port == 7000 {
@@ -980,6 +1106,47 @@ impl Scanner {
         }
     }
 
+    /// Sends one round of discovery broadcasts to every target port.
+    ///
+    /// - **No configured sources (default):** broadcast from each `0.0.0.0`
+    ///   listener socket with an auto-detected payload IP — the original
+    ///   single-subnet behaviour.
+    /// - **Configured sources:** for each source IP, open a dedicated socket
+    ///   bound to it and broadcast to every port with that IP as the payload
+    ///   `ip`, so a multi-homed host reaches each subnet from the right
+    ///   interface with a reply address the device can use.
+    async fn broadcast_once(&self, target_sockets: &[(Arc<UdpSocket>, u16)]) {
+        let sources = self.inner.discovery_sources.read().clone();
+
+        if sources.is_empty() {
+            for (socket, port) in target_sockets {
+                let _ = self.send_discovery_broadcast(socket, *port, None).await;
+            }
+            return;
+        }
+
+        for source in sources {
+            if !source.is_ipv4() {
+                // 255.255.255.255 is an IPv4 broadcast target; an IPv6 source
+                // can't reach it. Discovery is IPv4-only by design.
+                debug!("Skipping non-IPv4 discovery source {source}");
+                continue;
+            }
+            let send_socket = match Self::create_send_socket(source) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to bind discovery source {source}: {e} (skipping)");
+                    continue;
+                }
+            };
+            for (_, port) in target_sockets {
+                let _ = self
+                    .send_discovery_broadcast(&send_socket, *port, Some(source))
+                    .await;
+            }
+        }
+    }
+
     async fn perform_discovery_loop(self) -> Result<()> {
         let state = &self.inner;
         let ports_snapshot: Vec<u16> = state.ports.read().clone();
@@ -1034,9 +1201,7 @@ impl Scanner {
                 _ = broadcast_interval.tick() => {
                     broadcast_count += 1;
                     debug!("Sent broadcast {broadcast_count}/{MAX_BROADCASTS}");
-                    for (socket, port) in &target_sockets {
-                        let _ = self.send_discovery_broadcast(socket, *port).await;
-                    }
+                    self.broadcast_once(&target_sockets).await;
                 }
             }
         }
@@ -1328,6 +1493,35 @@ mod tests {
         assert_eq!(b.ports(), vec![9999]);
     }
 
+    // feat/discovery-source-select: `discovery_sources` defaults to empty
+    // (auto-detect) and round-trips through the shared state via `&self`
+    // setters, like the other scanner config. Send-only knob, so no socket
+    // binding is triggered here.
+    #[test]
+    fn discovery_sources_default_empty_and_round_trip() {
+        let inner = Arc::new(ScannerState::new());
+        let a = Scanner {
+            inner: inner.clone(),
+        };
+        let b = Scanner { inner };
+
+        assert!(
+            a.discovery_sources().is_empty(),
+            "default must be empty (auto-detect source via route lookup)"
+        );
+
+        let srcs = vec![
+            "192.168.1.50".parse::<IpAddr>().unwrap(),
+            "10.0.20.5".parse::<IpAddr>().unwrap(),
+        ];
+        a.set_discovery_sources(srcs.clone());
+        assert_eq!(b.discovery_sources(), srcs);
+
+        // Clearing restores auto-detect.
+        b.set_discovery_sources(Vec::new());
+        assert!(a.discovery_sources().is_empty());
+    }
+
     // 0.3.0-rc.2: lock in that the local-IP lookup is *not* cached. A
     // process-wide `OnceLock` over an `Option<String>` here would freeze the
     // result at first call, breaking long-running processes whose host IP
@@ -1358,6 +1552,45 @@ mod tests {
     // `ensure_passive_listener` uses to decide which ports to bind/abort.
     // Before this fix, the function only added new ports; ports removed
     // from the configured list silently kept their receiver tasks alive.
+    // footgun fix: a socket bound to a specific unicast IP does not receive
+    // limited-broadcast discovery packets, silently disabling passive
+    // discovery. `effective_bind_ip` widens a concrete unicast address to the
+    // family wildcard while keeping unspecified/loopback exact.
+    #[test]
+    fn effective_bind_ip_widens_only_concrete_unicast() {
+        // Unspecified stays exact, not flagged as widened.
+        assert_eq!(
+            effective_bind_ip("0.0.0.0"),
+            Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), false))
+        );
+        assert_eq!(
+            effective_bind_ip("::"),
+            Some((IpAddr::V6(Ipv6Addr::UNSPECIFIED), false))
+        );
+
+        // Loopback is a deliberate unicast/mock choice — kept exact.
+        assert_eq!(
+            effective_bind_ip("127.0.0.1"),
+            Some(("127.0.0.1".parse().unwrap(), false))
+        );
+
+        // Concrete routable unicast is widened to the wildcard (the footgun).
+        assert_eq!(
+            effective_bind_ip("192.168.1.50"),
+            Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), true))
+        );
+        assert_eq!(
+            effective_bind_ip("10.0.0.87"),
+            Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), true))
+        );
+        let (v6, widened) = effective_bind_ip("2001:db8::1").unwrap();
+        assert_eq!(v6, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert!(widened);
+
+        // Garbage is rejected.
+        assert_eq!(effective_bind_ip("not-an-ip"), None);
+    }
+
     #[test]
     fn compute_port_diff_adds_only() {
         let (add, remove) = compute_port_diff(&[6666, 6667, 7000], &[]);
