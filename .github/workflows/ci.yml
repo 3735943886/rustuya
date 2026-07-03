@@ -69,7 +69,14 @@ jobs:
         run: ../.venv/bin/maturin develop --release
       - name: Run tuyamock integration tests
         working-directory: python
-        run: ../.venv/bin/pytest tests -v -m "not fleet"
+        run: ../.venv/bin/pytest tests -v -m "not fleet and not slow"
+      - name: Reconnect/fault tests (slow — exercises the ~16s backoff floor)
+        # drop -> reconnect -> recover against tuyamock's fault injection. Gated
+        # behind the `slow` marker so it stays out of the fast run above; kept in
+        # CI because it's the only end-to-end coverage of the offline/reconnect
+        # path (see test_tuyamock_integration.py).
+        working-directory: python
+        run: ../.venv/bin/pytest tests -v -m slow
       - name: Fleet-scale tests (1000-device connect on v3.4 + 500-device keepalive/set on v3.5)
         # rustuya's fleet path end-to-end, split across both session-key
         # handshakes in one run: (1) hold 1000 device actors connected

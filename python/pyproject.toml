@@ -31,4 +31,5 @@ module-name = "rustuya"
 [tool.pytest.ini_options]
 markers = [
     "fleet: large-scale concurrent-connection test (heavy; mocks split across processes)",
+    "slow: exercises rustuya's ~16s reconnect backoff floor end-to-end (drop -> reconnect -> recover); minutes-scale, run separately",
 ]
