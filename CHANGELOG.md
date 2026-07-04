@@ -441,8 +441,6 @@ unchanged.
 - **M6.4**: `log` → `tracing` migration. ~50 call sites plus a parallel
   change in the bindings crate; scoped as its own PR.
 
-See [MILESTONES.md](MILESTONES.md) for the full list.
-
 ---
 
 ## [0.2.8] — 2025-05-19
