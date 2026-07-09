@@ -57,6 +57,11 @@ oracle-green and reviewed. The goal is "same behavior, new I/O boundary," not
    builds the core for a bare-metal target (`riscv32imc-unknown-none-elf`) with
    `--no-default-features` from day one. If it doesn't build `no_std`, the phase
    is not done.
+7. **Minimal core dependencies.** Every core dep must build `no_std` for the
+   bare-metal target; prefer a `core`/`alloc` built-in or a few inline lines
+   over a crate. The only non-trivial deps are RustCrypto (essential) and the
+   JSON seam — everything incidental is trimmed (see the Core-deps note under
+   Target crate layout).
 
 ## Target crate layout
 
@@ -69,46 +74,58 @@ rustuya-embassy    no_std           thin driver: embassy-net + embassy-time  (Ph
 python             extension        unchanged; sits on rustuya (tokio)
 ```
 
-- **Core deps:** RustCrypto (`aes`, `aes-gcm`, `cipher`, `hmac`, `sha2`,
-  `md-5` — all `no_std`, default-features off) · `serde` / `serde_json`
-  (`no_std` + `alloc`) · `base64` / `byteorder` (`no_std`) · `rand_core`
-  (traits only) · `thiserror` 2 (`no_std`) · `core::net`.
+- **Core deps (minimal — see the dependency policy below):**
+  - _Essential, keep:_ RustCrypto (`aes`, `aes-gcm`, `cipher`, `ecb`, `hmac`,
+    `sha2`, `md-5` — all `no_std`, default-features off; **do not hand-roll
+    crypto**) · `rand_core` (the `RngCore` **trait only** — the RNG is injected,
+    so **not** the full `rand`) · `core::net` for addresses.
+  - _Keep behind the D8 seam:_ `serde` + `serde_json` (`alloc`). Dynamic dps
+    payloads are arbitrary maps, which `serde-json-core` (no-alloc, fixed
+    shapes) does not handle well — so keep `serde_json` for now; swap only if
+    ESP32 RAM forces it. Do **not** pre-emptively hand-roll JSON (parity-oracle
+    risk).
+  - _Borderline:_ `base64` (small, no transitive deps) — keep or inline later.
+  - **Trimmed out of core:** `byteorder` → `u32::from_be_bytes`/`to_be_bytes`
+    (core built-in); `thiserror` → hand-rolled `CoreError` enum + `Display`
+    (drops a proc-macro dep; `TuyaError` with io stays in the tokio driver);
+    `log` → diagnostics surfaced as events, not a logging side effect.
 - **Driver-only deps (must NOT appear in core):** `tokio`, `tokio-util`,
   `tokio-stream`, `socket2`, `rlimit`, `parking_lot`, `async-stream`,
-  `futures-*`.
+  `futures-*`, the full `rand`, `env_logger`.
 
 ## Sans-I/O interface (shape)
 
 ```rust
-// Device connection FSM — pure, single-owner, no I/O.
-pub enum DevEvent<'a> {
+// Device connection FSM — pure, single-owner, no I/O, no per-call allocation.
+// Inputs are pushed IN; outputs are pulled OUT separately (quinn-proto style).
+pub enum DevInput<'a> {
     Connected,
-    ConnectFailed(TuyaError),
-    BytesReceived(&'a [u8]),   // driver read from the socket
-    TimerFired(TimerId),       // Backoff | Heartbeat | IdleTimeout
+    ConnectFailed(TransportError),  // neutral transport error (D5), not std::io
+    BytesReceived(&'a [u8]),        // driver read; core reassembles frames (D4)
     CommandQueued(Command),
-    DiscoveryUpdated(IpAddr),  // replaces the wait_for_backoff sleep+watch coupling
+    DiscoveryUpdated(IpAddr),       // replaces wait_for_backoff sleep+watch coupling
     Closed,
 }
-pub enum DevAction {
-    Send(Vec<u8>),                  // driver writes to the socket
-    StartTimer(TimerId, Duration),  // core computes jitter/backoff; driver sleeps
-    CancelTimer(TimerId),
-    Emit(DeviceEvent),              // to listener()
-    Reconnect,
-}
 impl DeviceCore {
-    pub fn step(&mut self, ev: DevEvent<'_>, now: Instant, rng: &mut impl RngCore) -> Vec<DevAction>;
+    // push inputs (mutate state; may arm/clear internal deadlines)
+    fn handle_input(&mut self, input: DevInput<'_>, now: Instant, rng: &mut impl RngCore);
+    fn handle_timeout(&mut self, now: Instant, rng: &mut impl RngCore);
+
+    // pull outputs (driver drains each to None after any handle_*)
+    fn poll_transmit(&mut self) -> Option<Vec<u8>>;    // bytes to send
+    fn poll_event(&mut self)    -> Option<DeviceEvent>;// app events for listener()
+    fn poll_timeout(&self)      -> Option<Instant>;    // THE single next deadline (D2)
 }
-// Discovery FSM is isomorphic:
-//   ScanEvent  { PacketReceived, TimerFired, ScanRequested }
-//   ScanAction { SendBroadcast(bytes, port), StartTimer, EmitDiscovered }
+// Discovery FSM is isomorphic: handle_input / handle_timeout, and
+// poll_transmit -> Option<(Vec<u8>, u16 /*port*/)>, poll_event -> Discovered.
 ```
 
-> **This shape is not yet locked — see D1.** The single `step() -> Vec<Action>`
-> above is the simplest form; the leading proposal is the quinn-proto-style
-> poll-split (`handle_input` / `poll_transmit` / `poll_timeout` / `poll_event`),
-> which is better proven for a cross-runtime, embedded-capable state machine.
+> **D1 resolved → poll-split (B).** Driver loop: read `poll_timeout()` and arm
+> **one** timer; on socket-read / that-timer / command, call the matching
+> `handle_*`; then drain `poll_transmit()` and `poll_event()` to `None`. One
+> deadline (no timer ids), no per-event `Vec`, and send/event/timeout on
+> separate channels — the identical shape drives the tokio, blocking, and
+> embassy drivers.
 
 ---
 
@@ -118,16 +135,16 @@ Each is a fork that is expensive to reverse once M0 lands. Listed with a
 **proposed** answer and the reasoning; these are for the maintainer to confirm
 or override *before* any code, so the core's spine is settled up front.
 
-- **D1 — Core API shape: quinn-proto-style poll-split _(proposed)_ vs monolithic
-  `step -> Vec<Action>`.** Proposed: separate entry points —
-  `handle_input(event, now)`, `poll_transmit() -> Option<Bytes>`,
-  `poll_timeout() -> Option<Instant>`, `poll_event() -> Option<DeviceEvent>`.
-  The driver loops: feed input → drain transmits → arm one timer at
-  `poll_timeout` → deliver events. *Why:* battle-tested for exactly this (a
-  connection state machine reused across runtimes incl. embedded), no
-  per-step `Vec` allocation, and it separates "bytes to send" / "next deadline"
-  / "app events" cleanly. The `step -> Vec` form is easier to write first but
-  gets awkward around timers and re-entrancy.
+- **D1 — Core API shape. RESOLVED (2026-07-09) → quinn-proto-style poll-split.**
+  Entry points: `handle_input(input, now, rng)` + `handle_timeout(now, rng)`;
+  outputs pulled via `poll_transmit() -> Option<Vec<u8>>`,
+  `poll_event() -> Option<DeviceEvent>`, `poll_timeout() -> Option<Instant>`.
+  The driver loops: feed input → drain transmits + events → arm the **one**
+  timer at `poll_timeout`. *Why over `step -> Vec<Action>`:* battle-tested for
+  exactly this (a connection state machine reused across runtimes incl.
+  embedded), no per-event `Vec` allocation, a **single** next-deadline so the
+  driver never tracks timer ids, and "bytes to send" / "next deadline" / "app
+  events" stay on separate channels. See the interface sketch above.
 
 - **D2 — Timer model: single next-deadline _(proposed)_ vs multiple named
   timers.** Proposed: `poll_timeout()` returns the earliest of {backoff,
@@ -184,7 +201,7 @@ or override *before* any code, so the core's spine is settled up front.
 - [ ] **M0.2** Move `protocol/` (pack/unpack, message types) into core. Swap `std::net` → `core::net`; `HashMap` → `alloc::collections::BTreeMap` (or `heapless`) where it appears in core paths.
 - [ ] **M0.3** Move `crypto.rs` into core with RustCrypto `default-features = false`. Confirm GCM + ECB paths byte-identical.
 - [ ] **M0.4** Thread the RNG through: replace every internal `rand::rng()` (GCM IV @ `protocol/mod.rs`, handshake nonce @ `prepare_session_key_negotiation`, backoff jitter) with an injected `&mut impl RngCore`. Driver supplies `rand::rng()`; tests supply a seeded RNG.
-- [ ] **M0.5** Define a core-local `Instant`/monotonic abstraction (no `std::time`), and a `no_std`-clean error enum (verify `thiserror` 2 `no_std`, else hand-roll).
+- [ ] **M0.5** Define a core-local `Instant`/monotonic abstraction (no `std::time`), and a hand-rolled `CoreError` enum + `Display` (no `thiserror` in core; no `std::io::Error` — D5). Replace `byteorder` with `u32::from_be_bytes`/`to_be_bytes`.
 - [ ] **M0.6** Re-land the tokio `rustuya` crate as a **driver** calling core for pack/unpack/crypto. `sync` facade + Python unchanged.
 - [ ] **M0.7** **CI: bare-metal build gate.** `cargo build -p rustuya-core --no-default-features --target riscv32imc-unknown-none-elf` (add the target + a no-std smoke). Also `--target thumbv7em-none-eabi`.
 - [ ] **M0.8** Green gates: `tinytuya_parity` (210/210), `tuyamock` integration (fast + slow), clippy, MSRV.
