@@ -34,6 +34,9 @@ crc = { version = "3.4", default-features = false }
 hmac = { version = "0.13", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 md-5 = { version = "0.11", default-features = false }
+# RngCore trait only — the RNG itself is injected by the driver (never called
+# from the core). The tokio driver passes rand::rng(); tests pass a seeded RNG.
+rand_core = { version = "0.9", default-features = false }
 # JSON seam (D8): the only non-crypto, non-trivial dep. no_std + alloc; kept
 # behind `src/json.rs` so it can be swapped without touching the byte core.
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }

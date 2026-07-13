@@ -29,6 +29,8 @@ pub enum CoreError {
     HmacMismatch,
     /// 6699 encrypted region is smaller than IV + tag.
     InvalidPayload,
+    /// A command was submitted before the connection was ready.
+    NotConnected,
 }
 
 impl fmt::Display for CoreError {
@@ -42,6 +44,7 @@ impl fmt::Display for CoreError {
             CoreError::CrcMismatch => "CRC-32 mismatch",
             CoreError::HmacMismatch => "HMAC-SHA256 mismatch",
             CoreError::InvalidPayload => "encrypted payload too short",
+            CoreError::NotConnected => "not connected",
         })
     }
 }
