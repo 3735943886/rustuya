@@ -159,12 +159,15 @@ or override *before* any code, so the core's spine is settled up front.
   `embassy-time::Instant`, `std::Instant`). No `std::time` in the core. *Why:*
   simplest; a generic `<C: Clock>` adds type noise for no real gain here.
 
-- **D4 — RX reassembly buffer lives in the core, bounded _(proposed)_.**
-  Proposed: the core owns the receive buffer; `handle_input(bytes)` appends and
-  extracts whole frames; cap at `MAX_PAYLOAD_LEN`; overflow → protocol error →
-  reset. *Why:* this is what makes the core a real sans-I/O machine (the driver
-  just pumps raw bytes); bounded so ESP32 RAM is predictable. The driver still
-  owns its own socket-read scratch buffer — only the partial-frame state is core.
+- **D4 — RX reassembly buffer lives in the core, bounded. RESOLVED (2026-07-13)
+  → `rx::RxBuffer`.** The core owns the receive buffer; `Input::Received(bytes)`
+  appends any fragment and the FSM drains every whole frame via
+  `RxBuffer::next_frame()` (partial → `Ok(None)`; malformed/oversized prefix →
+  `Err` → teardown + `clear()`). Bounded by construction: `peek_header` rejects a
+  declared length past `MAX_PAYLOAD_LEN`, so the buffer never exceeds one
+  max-sized frame — predictable ESP32 RAM. The driver just pumps raw socket
+  bytes; only the partial-frame state is core. `RxBuffer` is cleared on every
+  teardown so a fresh socket starts empty.
 
 - **D5 — Split the error type: core vs transport.** Today `TuyaError` wraps
   `std::io::Error` (not `no_std`). Proposed: the core error carries **no**
@@ -281,9 +284,9 @@ tokio driver.
 - **`serde_json` is the heaviest core dep (RAM).** Keep JSON handling behind one
   seam so it can become `serde-json-core` later. (M0.2 / M3.3)
 - `thiserror` 2 `no_std` — verify; hand-roll the core error enum if needed. (M0.5)
-- **RX buffer growth** — the core reassembly buffer must be bounded at
-  `MAX_PAYLOAD_LEN` and reset on overflow, or a malformed length field balloons
-  RAM on ESP32. (D4 / M1)
+- **RX buffer growth** — handled: `rx::RxBuffer` is bounded by `peek_header`'s
+  `MAX_PAYLOAD_LEN` check (a malformed length field errors before it can balloon
+  RAM) and cleared on teardown. (D4 — resolved)
 - **Error-type split leakage** — if any `std::io::Error` sneaks into the core
   error, `no_std` breaks. Enforce with the M0.7 bare-metal build gate. (D5)
 - **API drift during refactor** — the tokio/Python surface must stay 0.3-identical

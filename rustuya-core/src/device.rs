@@ -30,6 +30,7 @@ use rand_core::RngCore;
 use crate::command::{self, CommandType};
 use crate::json::{self, Value};
 use crate::message::{self, Message};
+use crate::rx::RxBuffer;
 use crate::session::Handshake;
 use crate::time::{Duration, Instant};
 use crate::version::{DeviceType, Version};
@@ -99,7 +100,8 @@ pub enum Input<'a> {
     Connected,
     /// The driver failed to open the TCP connection (arms backoff).
     ConnectFailed,
-    /// The driver read these bytes from the socket (one whole frame).
+    /// The driver read these raw bytes from the socket — any fragment: a partial
+    /// frame, one frame, or several coalesced. The core reassembles (D4).
     Received(&'a [u8]),
     /// The caller wants to send a command; `t` is the wall-clock timestamp
     /// (seconds) the driver stamps.
@@ -157,6 +159,8 @@ pub struct Device {
     idle_deadline: Option<Instant>,
     /// When to give up on an incomplete handshake while `Handshaking`.
     handshake_deadline: Option<Instant>,
+    /// Reassembles whole frames out of the raw socket byte stream (D4).
+    rx: RxBuffer,
     tx: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
 }
@@ -176,6 +180,7 @@ impl Device {
             next_heartbeat: None,
             idle_deadline: None,
             handshake_deadline: None,
+            rx: RxBuffer::new(),
             tx: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -314,15 +319,42 @@ impl Device {
     }
 
     fn on_received(&mut self, data: &[u8], now: Instant, rng: &mut impl RngCore) {
+        // Only buffer bytes while a connection is live; stray bytes in any other
+        // state belong to a dead socket and are dropped.
+        if !matches!(self.state, State::Handshaking | State::Connected) {
+            return;
+        }
+        self.rx.push(data);
+        // Drain every whole frame the read completed. A frame may itself move the
+        // FSM (handshake → connected, or a fault → teardown), so re-check state
+        // each turn and stop the moment we leave a receiving state.
+        loop {
+            match self.rx.next_frame() {
+                Ok(Some(frame)) => self.on_frame(&frame, now, rng),
+                Ok(None) => break,
+                Err(e) => {
+                    self.rx.clear();
+                    self.fail(e, now, rng);
+                    break;
+                }
+            }
+            if !matches!(self.state, State::Handshaking | State::Connected) {
+                break;
+            }
+        }
+    }
+
+    /// Dispatch one fully-reassembled frame by connection state.
+    fn on_frame(&mut self, frame: &[u8], now: Instant, rng: &mut impl RngCore) {
         match self.state {
-            State::Handshaking => self.on_handshake_response(data, now, rng),
+            State::Handshaking => self.on_handshake_response(frame, now, rng),
             State::Connected => {
                 // Any inbound frame proves the peer is alive: push the idle
                 // (silent-drop) deadline forward.
                 self.idle_deadline = self.cfg.idle_timeout.map(|d| now + d);
                 // Data responses carry a 4-byte retcode (S1: explicit, cmd-context
                 // driven — not byte-sniffed).
-                match message::decode_message(self.cfg.version, data, self.active_key(), true) {
+                match message::decode_message(self.cfg.version, frame, self.active_key(), true) {
                     Ok(msg) => self.events.push_back(Event::Response(msg)),
                     Err(e) => self.events.push_back(Event::ProtocolError(e)),
                 }
@@ -411,6 +443,7 @@ impl Device {
         self.next_heartbeat = None; // no keepalive/liveness timing while down
         self.idle_deadline = None;
         self.handshake_deadline = None;
+        self.rx.clear(); // any buffered bytes belong to the dead connection
         if self.cfg.auto_reconnect {
             let delay = self.cfg.backoff.delay(self.attempt, rng);
             self.attempt = self.attempt.saturating_add(1);
@@ -559,9 +592,9 @@ mod tests {
         v
     }
 
-    /// Drives a v3.4/v3.5 handshake to Connected: recover the FSM's nonce from
-    /// the SessKeyNegStart it emitted, craft the device response, feed it back.
-    fn complete_handshake(dev: &mut Device, version: Version, rng: &mut impl RngCore) {
+    /// Recover the FSM's nonce from the SessKeyNegStart it emitted and craft the
+    /// matching device SessKeyNegResp (framed bytes, not yet fed).
+    fn craft_handshake_response(dev: &mut Device, version: Version) -> Vec<u8> {
         let start = dev.poll_transmit().expect("SessKeyNegStart");
         let start_msg = decode_message(version, &start, &KEY, false).unwrap();
         let local_nonce = start_msg.payload;
@@ -570,15 +603,12 @@ mod tests {
         mac.update(&local_nonce);
         let mut resp_payload = remote_nonce.to_vec();
         resp_payload.extend_from_slice(&mac.finalize().into_bytes());
-        let resp = message::encode_message(
-            version,
-            CommandType::SessKeyNegResp as u32,
-            1,
-            &resp_payload,
-            &KEY,
-            &[3u8; 12],
-        )
-        .unwrap();
+        message::encode_message(version, CommandType::SessKeyNegResp as u32, 1, &resp_payload, &KEY, &[3u8; 12]).unwrap()
+    }
+
+    /// Drives a v3.4/v3.5 handshake to Connected in one feed.
+    fn complete_handshake(dev: &mut Device, version: Version, rng: &mut impl RngCore) {
+        let resp = craft_handshake_response(dev, version);
         dev.handle_input(Input::Received(&resp), T0, rng);
     }
 
@@ -909,5 +939,62 @@ mod tests {
         assert!(dev.is_connected());
         // No heartbeat/idle configured → the deadline is gone, not left stale.
         assert_eq!(dev.poll_timeout(), None, "handshake deadline cleared on connect");
+    }
+
+    // -- RX reassembly (D4) --------------------------------------------------
+
+    #[test]
+    fn fragmented_response_reassembles_into_one_event() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg(Version::V3_3), &mut rng);
+        let frame = inbound_data_frame();
+        let mid = frame.len() / 2;
+        dev.handle_input(Input::Received(&frame[..mid]), T0, &mut rng);
+        assert!(dev.poll_event().is_none(), "half a frame yields nothing");
+        dev.handle_input(Input::Received(&frame[mid..]), T0, &mut rng);
+        let events = drain_events(&mut dev);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::Response(_)));
+    }
+
+    #[test]
+    fn coalesced_responses_emit_two_events() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg(Version::V3_3), &mut rng);
+        let mut glued = inbound_data_frame();
+        glued.extend_from_slice(&inbound_data_frame());
+        dev.handle_input(Input::Received(&glued), T0, &mut rng);
+        let n = drain_events(&mut dev)
+            .iter()
+            .filter(|e| matches!(e, Event::Response(_)))
+            .count();
+        assert_eq!(n, 2, "both coalesced frames surface");
+    }
+
+    #[test]
+    fn malformed_stream_tears_down() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg(Version::V3_3), &mut rng);
+        dev.handle_input(Input::Received(&[0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0]), T0, &mut rng);
+        assert!(!dev.is_connected(), "a bad prefix corrupts the stream → teardown");
+        let events = drain_events(&mut dev);
+        assert!(events.iter().any(|e| matches!(e, Event::ProtocolError(_))));
+        assert!(events.contains(&Event::Disconnected));
+    }
+
+    #[test]
+    fn fragmented_handshake_response_reassembles() {
+        let mut rng = SeededRng(42);
+        let version = Version::V3_4;
+        let mut dev = Device::new(cfg(version));
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let resp = craft_handshake_response(&mut dev, version);
+        // Deliver the SessKeyNegResp in three fragments across three reads.
+        dev.handle_input(Input::Received(&resp[..4]), T0, &mut rng);
+        assert!(!dev.is_connected());
+        dev.handle_input(Input::Received(&resp[4..20]), T0, &mut rng);
+        assert!(!dev.is_connected());
+        dev.handle_input(Input::Received(&resp[20..]), T0, &mut rng);
+        assert!(dev.is_connected(), "handshake completes once the last fragment arrives");
     }
 }

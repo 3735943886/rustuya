@@ -18,6 +18,7 @@ pub mod frame;
 pub mod json;
 pub mod message;
 pub mod payload;
+pub mod rx;
 pub mod session;
 pub mod time;
 pub mod version;
