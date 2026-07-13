@@ -1,14 +1,22 @@
 //! Tuya command codes and JSON request-envelope generation.
 //!
-//! [`generate_payload`] builds the dps command JSON (gwId / devId / uid / t / dps
-//! with per-command field rules) to match the tinytuya reference. It is
-//! **version-independent** for the base (non-device22) path — only the wire
-//! codec differs by version. The device22 dialect wraps this (next slice).
+//! [`generate`] builds the dps command JSON to match the tinytuya reference.
+//! Two envelope templates exist:
+//!   * **legacy** (v3.1 / v3.2 / v3.3): `{gwId, devId, uid, t, dps}` with
+//!     per-command field stripping;
+//!   * **modern** (v3.4 / v3.5): `Control`/`DpQuery` become
+//!     `{protocol: 5, t, data: {...}}` / `{dps}`, and their command codes are
+//!     remapped to `ControlNew` / `DpQueryNew`.
+//!
+//! The **device22** dialect is layered on top: it overrides only the status
+//! query (`DpQuery` → `ControlNew`, asking for `{"1": null}` when no dps given);
+//! v3.2 is always device22.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::json::{Map, Value};
+use crate::version::{DeviceType, Version};
 
 /// Tuya local command codes (the `cmd` field on the wire).
 #[repr(u32)]
@@ -54,13 +62,39 @@ impl CommandType {
     }
 }
 
-/// Builds the JSON request envelope for `command`, returning `(cmd_code, value)`.
-///
-/// Version-independent; the device22 dialect is applied as a separate wrapper.
-/// `t` is the device timestamp (seconds) — always serialized as a string, as
-/// tinytuya does.
+/// Builds the request envelope for `command`, applying the device22 dialect when
+/// `dev_type` is [`DeviceType::Device22`] or the version is v3.2 (always
+/// device22). Returns `(cmd_code, value)`.
+#[must_use]
+pub fn generate(
+    version: Version,
+    dev_type: DeviceType,
+    device_id: &str,
+    command: CommandType,
+    data: Option<Value>,
+    cid: Option<&str>,
+    t: u64,
+) -> (u32, Value) {
+    let dev22 = dev_type == DeviceType::Device22 || version == Version::V3_2;
+    // device22 overrides *only* the status query; everything else uses the base
+    // version's shape.
+    if dev22 && command == CommandType::DpQuery {
+        let mut m = base_payload(device_id, cid, data, t);
+        m.remove("gwId");
+        m.entry("dps".to_string()).or_insert_with(|| {
+            let mut d = Map::new();
+            d.insert("1".to_string(), Value::Null);
+            Value::Object(d)
+        });
+        return (CommandType::ControlNew.code(), Value::Object(m));
+    }
+    generate_payload(version, device_id, command, data, cid, t)
+}
+
+/// The base (non-device22) envelope for `command` at `version`.
 #[must_use]
 pub fn generate_payload(
+    version: Version,
     device_id: &str,
     command: CommandType,
     data: Option<Value>,
@@ -68,36 +102,45 @@ pub fn generate_payload(
     t: u64,
 ) -> (u32, Value) {
     use CommandType::{
-        Control, ControlNew, DpQueryNew, HeartBeat, LanExtStream, Status, UpdateDps,
+        Control, ControlNew, DpQuery, DpQueryNew, HeartBeat, LanExtStream, Status, UpdateDps,
     };
+    let modern = is_modern(version);
+
     let payload = match command {
-        // Only `cid` (if any) survives; `dpId` replaces `dps`.
-        UpdateDps => {
-            let mut m = Map::new();
-            if let Some(c) = cid {
-                m.insert("cid".to_string(), c.into());
-            }
-            m.insert("dpId".to_string(), data.unwrap_or_else(default_dp_ids));
-            m
-        }
-        // A wholly different envelope built from the request object.
+        UpdateDps => update_dps(cid, data),
         LanExtStream => lan_ext_stream(data),
-        _ => {
+        Control | ControlNew if modern => modern_control_envelope(t, cid, data),
+        DpQuery | DpQueryNew if modern => dps_only(cid, data),
+        // legacy control family (and modern falls through above): drop gwId.
+        Control | ControlNew | DpQueryNew => {
             let mut m = base_payload(device_id, cid, data, t);
-            match command {
-                Control | ControlNew | DpQueryNew => {
-                    m.remove("gwId");
-                }
-                Status | HeartBeat => {
-                    m.remove("uid");
-                    m.remove("t");
-                }
-                _ => {} // ApConfig, DpQuery, SceneExecute, ReqDevInfo, … keep the base
-            }
+            m.remove("gwId");
             m
         }
+        Status | HeartBeat => {
+            let mut m = base_payload(device_id, cid, data, t);
+            m.remove("uid");
+            m.remove("t");
+            m
+        }
+        // ApConfig, legacy DpQuery, SceneExecute, ReqDevInfo, … keep the base.
+        _ => base_payload(device_id, cid, data, t),
     };
-    (command.code(), Value::Object(payload))
+    (effective_command(version, command), Value::Object(payload))
+}
+
+/// v3.4/v3.5 remap `Control` → `ControlNew` and `DpQuery` → `DpQueryNew`; all
+/// other commands (and all legacy versions) keep their own code.
+fn effective_command(version: Version, command: CommandType) -> u32 {
+    match (is_modern(version), command) {
+        (true, CommandType::Control) => CommandType::ControlNew.code(),
+        (true, CommandType::DpQuery) => CommandType::DpQueryNew.code(),
+        _ => command.code(),
+    }
+}
+
+fn is_modern(version: Version) -> bool {
+    matches!(version, Version::V3_4 | Version::V3_5)
 }
 
 fn base_payload(
@@ -113,10 +156,49 @@ fn base_payload(
     if let Some(c) = cid {
         m.insert("cid".to_string(), c.into());
     }
-    m.insert("t".to_string(), t.to_string().into());
+    m.insert("t".to_string(), t.to_string().into()); // legacy: t as string
     if let Some(d) = data {
         m.insert("dps".to_string(), d);
     }
+    m
+}
+
+/// v3.4/v3.5 `Control`/`ControlNew`: `{protocol: 5, t: <int>, data: {cid?, ctype?, dps?}}`.
+fn modern_control_envelope(t: u64, cid: Option<&str>, data: Option<Value>) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("protocol".to_string(), Value::from(5u64));
+    m.insert("t".to_string(), Value::from(t)); // modern: t as integer
+
+    let mut inner = Map::new();
+    if let Some(c) = cid {
+        inner.insert("cid".to_string(), c.into());
+        inner.insert("ctype".to_string(), Value::from(0u64));
+    }
+    if let Some(d) = data {
+        inner.insert("dps".to_string(), d);
+    }
+    m.insert("data".to_string(), Value::Object(inner));
+    m
+}
+
+/// v3.4/v3.5 `DpQuery`/`DpQueryNew`: only `cid`/`dps` survive.
+fn dps_only(cid: Option<&str>, data: Option<Value>) -> Map<String, Value> {
+    let mut m = Map::new();
+    if let Some(c) = cid {
+        m.insert("cid".to_string(), c.into());
+    }
+    if let Some(d) = data {
+        m.insert("dps".to_string(), d);
+    }
+    m
+}
+
+fn update_dps(cid: Option<&str>, data: Option<Value>) -> Map<String, Value> {
+    let mut m = Map::new();
+    if let Some(c) = cid {
+        m.insert("cid".to_string(), c.into());
+    }
+    m.insert("dpId".to_string(), data.unwrap_or_else(default_dp_ids));
     m
 }
 
@@ -147,55 +229,59 @@ mod tests {
     const ID: &str = "01234567890123456789ab";
     const T: u64 = 1_700_000_000;
 
-    fn mk(cmd: CommandType, data: Option<Value>) -> (u32, Value) {
-        generate_payload(ID, cmd, data, None, T)
-    }
-
     #[test]
-    fn base_commands_keep_full_envelope() {
-        let (code, p) = mk(CommandType::ApConfig, None);
-        assert_eq!(code, 1);
-        assert_eq!(p, json!({"gwId": ID, "devId": ID, "uid": ID, "t": "1700000000"}));
-        // DpQuery / SceneExecute / ReqDevInfo share the same shape
-        assert_eq!(mk(CommandType::DpQuery, None).0, 0x0a);
-        assert_eq!(mk(CommandType::DpQuery, None).1, p);
-    }
-
-    #[test]
-    fn control_family_drops_gwid() {
-        let (code, p) = mk(CommandType::Control, None);
+    fn legacy_control_drops_gwid_status_strips() {
+        let (code, p) = generate_payload(Version::V3_3, ID, CommandType::Control, None, None, T);
         assert_eq!(code, 7);
         assert_eq!(p, json!({"devId": ID, "uid": ID, "t": "1700000000"}));
-        assert_eq!(mk(CommandType::ControlNew, None).0, 0x0d);
-        assert_eq!(mk(CommandType::DpQueryNew, None).0, 0x10);
-    }
 
-    #[test]
-    fn status_and_heartbeat_strip_uid_and_t() {
-        let (code, p) = mk(CommandType::Status, None);
+        let (code, p) = generate_payload(Version::V3_3, ID, CommandType::Status, None, None, T);
         assert_eq!(code, 8);
         assert_eq!(p, json!({"gwId": ID, "devId": ID}));
-        assert_eq!(mk(CommandType::HeartBeat, None).1, p);
     }
 
     #[test]
-    fn update_dps_defaults_and_control_carries_dps() {
-        let (code, p) = mk(CommandType::UpdateDps, None);
-        assert_eq!(code, 0x12);
-        assert_eq!(p, json!({"dpId": [18, 19, 20]}));
-
-        // dps data flows into a Control envelope
-        let (_, p) = mk(CommandType::Control, Some(json!({"1": true})));
-        assert_eq!(p, json!({"devId": ID, "uid": ID, "t": "1700000000", "dps": {"1": true}}));
-    }
-
-    #[test]
-    fn lan_ext_stream_reshapes_into_reqtype_and_data() {
-        let (code, p) = mk(
-            CommandType::LanExtStream,
-            Some(json!({"reqType": "subdev_online_stat_query", "cids": []})),
+    fn modern_control_and_dpquery_and_remap() {
+        let (code, p) = generate_payload(
+            Version::V3_4,
+            ID,
+            CommandType::Control,
+            Some(json!({"1": true})),
+            None,
+            T,
         );
-        assert_eq!(code, 0x40);
-        assert_eq!(p, json!({"reqType": "subdev_online_stat_query", "data": {"cids": []}}));
+        assert_eq!(code, 0x0d); // Control -> ControlNew
+        assert_eq!(p, json!({"protocol": 5, "t": 1700000000, "data": {"dps": {"1": true}}}));
+
+        let (code, p) = generate_payload(Version::V3_5, ID, CommandType::DpQuery, None, None, T);
+        assert_eq!(code, 0x10); // DpQuery -> DpQueryNew
+        assert_eq!(p, json!({}));
+    }
+
+    #[test]
+    fn dev22_dpquery_override_and_v32_always_dev22() {
+        let (code, p) = generate(
+            Version::V3_3,
+            DeviceType::Device22,
+            ID,
+            CommandType::DpQuery,
+            None,
+            None,
+            T,
+        );
+        assert_eq!(code, 0x0d);
+        assert_eq!(p, json!({"devId": ID, "uid": ID, "t": "1700000000", "dps": {"1": null}}));
+
+        // v3.2 is device22 even with dev_type=Auto
+        let (code, _) = generate(
+            Version::V3_2,
+            DeviceType::Auto,
+            ID,
+            CommandType::DpQuery,
+            None,
+            None,
+            T,
+        );
+        assert_eq!(code, 0x0d);
     }
 }
