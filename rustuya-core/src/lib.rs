@@ -12,6 +12,7 @@ extern crate alloc;
 
 mod error;
 pub mod crypto;
+pub mod frame;
 
 pub use error::CoreError;
 
