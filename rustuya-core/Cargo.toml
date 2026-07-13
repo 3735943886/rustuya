@@ -1,0 +1,32 @@
+# rustuya-core — sans-I/O, no_std + alloc core for the Tuya local protocol.
+# Part of the 0.4 clean-slate redesign (see MILESTONES.md). No tokio, no std,
+# no sockets/timers: protocol + crypto + (later) the Device/Discovery state
+# machines, with `now` and the RNG injected by the driver.
+#
+# Standalone [workspace] so it builds independently of the legacy 0.3 crate
+# still living at the repo root during the transition.
+[package]
+name = "rustuya-core"
+version = "0.4.0-dev"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Sans-I/O no_std core for the Tuya local protocol (protocol, crypto, state machines)"
+repository = "https://github.com/3735943886/rustuya"
+
+[workspace]
+
+[lib]
+name = "rustuya_core"
+
+[features]
+default = []
+
+# Minimal, no_std-only dependencies (design invariant 7). Crypto is RustCrypto
+# with default-features off; nothing here pulls std.
+[dependencies]
+aes = { version = "0.9", default-features = false }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+cipher = { version = "0.5", default-features = false }
+ecb = { version = "0.2", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
