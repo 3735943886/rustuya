@@ -19,6 +19,7 @@ not built yet — listed so it isn't forgotten).
 | S4 | **Crypto mega-function** `encrypt(data, bool, Option, Option, bool)` | `crypto.rs` | Five positional bool/option args; unreadable, error-prone. | Explicit `ecb_encrypt/decrypt` and `gcm_encrypt/decrypt` methods. |
 | S5 | **Errors allocate `String`** (`DecodeError("…".into())`, `format!`) | throughout `protocol/mod.rs` | Alloc-heavy on a hot path; drags `alloc`/`format` into `no_std`; stringly-typed. | `CoreError` is a plain field-less enum. |
 | S6 | **`Crc::<u32>::new(...)` rebuilt every call** | `pack_message` / `unpack_message` | Re-parsing the algorithm table per frame. | `const CRC32` built once. |
+| S7 | **15-method `TuyaProtocol` trait, one near-duplicate impl per version** | `v31.rs`…`v35.rs` | Most methods differ only in data (prefix, integrity, session-key flag, header placement); copy-paste drift risk. | The data-driven parts move to a single `version::Profile` table; only genuinely version-specific behaviour (v3.1 md5/base64) stays as code. |
 
 ## Connection / discovery FSM (rustuya-core FSM) — pending (M1 / M2)
 

@@ -13,8 +13,10 @@ extern crate alloc;
 mod error;
 pub mod crypto;
 pub mod frame;
+pub mod version;
 
 pub use error::CoreError;
+pub use version::{DeviceType, Version};
 
 /// Core-wide result type.
 ///
