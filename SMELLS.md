@@ -37,12 +37,11 @@ head-on as the Device FSM lands (`device.rs`), not carried over.
 | P4 | **`is_connected` slow/stale after a passive drop** | observed via mock probe | **Resolved.** `is_connected()` is an explicit state (`== Connected`); it flips the instant the driver feeds `Closed`, **and** an `idle_timeout` deadline (below) flips it on a *silent* drop without waiting for the driver. |
 | P5 | **A passive drop does not surface on `listener()` promptly** | observed via mock probe | **Resolved.** `Config::idle_timeout`: any inbound frame pushes an idle deadline forward; on expiry the FSM emits `Event::Disconnected` and re-arms backoff — a silent drop surfaces at `idle_timeout`, not at the next ~16 s reconnect. `Config::heartbeat` sends periodic `HeartBeat` keepalives (fresh v3.5 IV from the injected RNG) to provoke that traffic. |
 | P6 | **`persist=false` cooldown also floored at 16 s, only bypassable via `connect_now`** | `actor.rs` cooldown loop | **Reconciled to one path.** `Config::auto_reconnect` decides *whether* to retry; the delay curve is single/identical for both. `false` → terminal `Closed`; `true` → `Backoff`. |
+| P7 | **dev22 auto-detection** — no agreed algorithm; a known unknown | `decision.rs` / protocol | **Resolved as a documented decision.** The core performs **no** runtime detection: `DeviceType::Auto` == `Default` plus the one firm rule that **v3.2 is always Device22** (`command::generate`); `Device22` is set explicitly by the caller. The doc on `DeviceType` states this. Matches the known-unknown guidance — no hidden heuristic. |
 
-**Pending** (later FSM increments):
-
-| # | 0.3 smell | Where (0.3) | The question to settle |
-|---|-----------|-------------|------------------------|
-| P7 | **dev22 auto-detection** — no agreed algorithm; a known unknown | `decision.rs` / protocol | Keep as an explicit, documented decision in the protocol layer; don't hide it. |
+All connection- and discovery-FSM smells (P1–P7, Q1–Q5) are now resolved on
+the core side; only Q6's driver-side source-IP auto-detection remains, and it
+belongs to the tokio driver, not the core.
 
 ## Discovery / scanner (rustuya-core `discovery.rs`)
 

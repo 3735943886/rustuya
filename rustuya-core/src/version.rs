@@ -97,11 +97,25 @@ impl Version {
 
 /// Device architecture dialect. `Device22` is a wrapper applied on top of a base
 /// version (v3.2 is always Device22); it is orthogonal to [`Version`].
+///
+/// **No runtime auto-detection (SMELLS P7, a deliberate decision).** There is no
+/// agreed algorithm for sniffing a "22-character device id" dialect from the wire
+/// — the 0.3 heuristic was not tinytuya-authoritative and is a known-unknown. So
+/// the core never guesses: [`Auto`](Self::Auto) behaves as [`Default`](Self::Default)
+/// except that **v3.2 is always treated as `Device22`** (the one firm rule, in
+/// [`crate::command::generate`]). A caller that knows better sets `Device22`
+/// explicitly; any detection policy is an explicit driver decision, never hidden
+/// in the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceType {
+    /// No dialect override: same as `Default`, plus the v3.2-is-Device22 rule.
+    /// **Not** a request to auto-detect — the core performs no detection.
     #[default]
     Auto,
+    /// The standard dialect.
     Default,
+    /// The device22 wrapper: `DpQuery` becomes a `ControlNew` with a
+    /// `{"1":null}` dps default (status reads DP 1 only, by design).
     Device22,
 }
 
