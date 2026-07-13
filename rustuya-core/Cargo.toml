@@ -33,3 +33,6 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 crc = { version = "3.4", default-features = false }
 hmac = { version = "0.13", default-features = false }
 sha2 = { version = "0.11", default-features = false }
+# JSON seam (D8): the only non-crypto, non-trivial dep. no_std + alloc; kept
+# behind `src/json.rs` so it can be swapped without touching the byte core.
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }

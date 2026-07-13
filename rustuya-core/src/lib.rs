@@ -11,10 +11,13 @@
 extern crate alloc;
 
 mod error;
+pub mod command;
 pub mod crypto;
 pub mod frame;
+pub mod json;
 pub mod version;
 
+pub use command::CommandType;
 pub use error::CoreError;
 pub use version::{DeviceType, Version};
 
