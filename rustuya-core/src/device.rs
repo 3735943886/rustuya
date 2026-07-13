@@ -997,4 +997,82 @@ mod tests {
         dev.handle_input(Input::Received(&resp[20..]), T0, &mut rng);
         assert!(dev.is_connected(), "handshake completes once the last fragment arrives");
     }
+
+    // -- randomness uniqueness (injected RNG; tinytuya #722 immunity) ---------
+    //
+    // These pin the security property as *tests*, not convention: given a real
+    // entropy source (modelled by one advancing seeded RNG), every handshake
+    // nonce and every GCM IV the core puts on the wire is distinct. A driver that
+    // wrongly fed a fixed/reset RNG would reuse a v3.5 nonce — exactly the
+    // GCM-nonce-reuse class tinytuya PR #722 fixed, which rustuya is immune to.
+
+    /// The 12-byte GCM IV a 6699 (v3.5) frame carries, at `header(18) .. +12`.
+    fn frame_iv(wire: &[u8]) -> Vec<u8> {
+        wire[18..30].to_vec()
+    }
+
+    fn assert_all_distinct(items: &[Vec<u8>]) {
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                assert_ne!(items[i], items[j], "duplicate at ({i}, {j}) — randomness reuse");
+            }
+        }
+    }
+
+    /// A v3.5 device driven through the handshake to Connected, transmits drained.
+    fn connected_v35(cfg: Config, rng: &mut impl RngCore) -> Device {
+        let mut dev = Device::new(cfg);
+        dev.handle_input(Input::Connected, T0, rng);
+        complete_handshake(&mut dev, Version::V3_5, rng);
+        while dev.poll_transmit().is_some() {}
+        while dev.poll_event().is_some() {}
+        dev
+    }
+
+    #[test]
+    fn handshake_nonces_are_unique_across_connections() {
+        let mut rng = SeededRng(123);
+        let mut nonces = Vec::new();
+        for _ in 0..8 {
+            let mut dev = Device::new(cfg(Version::V3_4));
+            dev.handle_input(Input::Connected, T0, &mut rng);
+            let start = dev.poll_transmit().expect("SessKeyNegStart");
+            // The SessKeyNegStart payload is the raw 16-byte local_nonce.
+            nonces.push(decode_message(Version::V3_4, &start, &KEY, false).unwrap().payload);
+        }
+        assert_all_distinct(&nonces);
+    }
+
+    #[test]
+    fn v35_message_ivs_are_unique() {
+        let mut rng = SeededRng(7);
+        let mut dev = connected_v35(cfg(Version::V3_5), &mut rng);
+        let mut ivs = Vec::new();
+        for i in 0..8 {
+            dev.handle_input(
+                Input::Send {
+                    cmd: CommandType::Control,
+                    data: Some(json::from_bytes(br#"{"1":true}"#).unwrap()),
+                    t: 1_700_000_000 + i,
+                },
+                T0,
+                &mut rng,
+            );
+            ivs.push(frame_iv(&dev.poll_transmit().expect("frame")));
+        }
+        assert_all_distinct(&ivs);
+    }
+
+    #[test]
+    fn timer_driven_heartbeats_use_distinct_ivs() {
+        let mut rng = SeededRng(3);
+        let cfg = Config { heartbeat: Some(Duration::from_secs(10)), ..cfg(Version::V3_5) };
+        let mut dev = connected_v35(cfg, &mut rng);
+        let mut ivs = Vec::new();
+        for k in 1..=5u64 {
+            dev.handle_timeout(Instant::from_millis(k * 10_000), &mut rng);
+            ivs.push(frame_iv(&dev.poll_transmit().expect("heartbeat frame")));
+        }
+        assert_all_distinct(&ivs);
+    }
 }
