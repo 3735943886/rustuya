@@ -33,6 +33,7 @@ head-on as the Device FSM lands (`device.rs`), not carried over.
 |---|-----------|-------------|----------------|
 | P1 | **`SLEEP_RECONNECT_MIN = 16 s` hard floor**, not configurable | `device/mod.rs`, `actor.rs get_backoff_duration` | **Gone.** Backoff is [`Backoff`] policy (`base`/`max`/`jitter`) the driver injects; **no floor**. Tests pass `base = ZERO` and drive the whole reconnect path at zero wall-clock. |
 | P2 | **Backoff jitter via internal `rand::rng()`** | `actor.rs get_backoff_duration` | **Gone.** `Backoff::delay(attempt, rng)` draws jitter from the *injected* `RngCore`; the FSM computes a pure `Duration`. Seeded-RNG test pins bounds + variation. |
+| P3 | **`wait_for_backoff` selects sleep + scanner-rediscovery `watch`** | `actor.rs` | **Resolved.** No hidden `select` in the core: the backoff deadline is `poll_timeout()` and rediscovery enters as `Input::DiscoveryUpdated`, which cancels the remaining wait and redials (attempt counter preserved, so a flapping device can't defeat escalation). The driver's `select!` multiplexes `sleep_until(deadline)` vs the discovery `watch`; the core stays pure. |
 | P4 | **`is_connected` slow/stale after a passive drop** | observed via mock probe | **Resolved.** `is_connected()` is an explicit state (`== Connected`); it flips the instant the driver feeds `Closed`, **and** an `idle_timeout` deadline (below) flips it on a *silent* drop without waiting for the driver. |
 | P5 | **A passive drop does not surface on `listener()` promptly** | observed via mock probe | **Resolved.** `Config::idle_timeout`: any inbound frame pushes an idle deadline forward; on expiry the FSM emits `Event::Disconnected` and re-arms backoff — a silent drop surfaces at `idle_timeout`, not at the next ~16 s reconnect. `Config::heartbeat` sends periodic `HeartBeat` keepalives (fresh v3.5 IV from the injected RNG) to provoke that traffic. |
 | P6 | **`persist=false` cooldown also floored at 16 s, only bypassable via `connect_now`** | `actor.rs` cooldown loop | **Reconciled to one path.** `Config::auto_reconnect` decides *whether* to retry; the delay curve is single/identical for both. `false` → terminal `Closed`; `true` → `Backoff`. |
@@ -41,7 +42,6 @@ head-on as the Device FSM lands (`device.rs`), not carried over.
 
 | # | 0.3 smell | Where (0.3) | The question to settle |
 |---|-----------|-------------|------------------------|
-| P3 | **`wait_for_backoff` selects sleep + scanner-rediscovery `watch`** | `actor.rs` | The sleep↔discovery coupling. In poll-split this is **not core work**: the core exposes the backoff deadline via `poll_timeout()` and accepts a `DiscoveryUpdated` input; the driver's `select!` multiplexes `sleep_until(deadline)` vs `watch.changed()`. Wire the `DiscoveryUpdated` input in the discovery-wake increment. |
 | P7 | **dev22 auto-detection** — no agreed algorithm; a known unknown | `decision.rs` / protocol | Keep as an explicit, documented decision in the protocol layer; don't hide it. |
 
 ## Discovery / scanner (rustuya-core `discovery.rs`)

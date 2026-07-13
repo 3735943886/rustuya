@@ -110,6 +110,12 @@ pub enum Input<'a> {
         data: Option<Value>,
         t: u64,
     },
+    /// The `discovery` FSM saw this device broadcast on the LAN. While backing
+    /// off, this cancels the remaining wait and redials **now** — the sans-io
+    /// replacement for the 0.3 `wait_for_backoff` sleep-vs-rediscovery `select`
+    /// (SMELLS P3). Address-less: the core holds no address, so the driver just
+    /// updates its own dial target and pushes this wake.
+    DiscoveryUpdated,
     /// The connection was closed / dropped.
     Closed,
 }
@@ -194,6 +200,7 @@ impl Device {
             Input::ConnectFailed => self.on_connect_failed(now, rng),
             Input::Received(data) => self.on_received(data, now, rng),
             Input::Send { cmd, data, t } => self.on_send(cmd, data, t, rng),
+            Input::DiscoveryUpdated => self.on_discovery_updated(),
             Input::Closed => self.on_closed(now, rng),
         }
     }
@@ -315,6 +322,16 @@ impl Device {
     fn on_connect_failed(&mut self, now: Instant, rng: &mut impl RngCore) {
         if self.state == State::Connecting {
             self.arm_backoff(now, rng);
+        }
+    }
+
+    fn on_discovery_updated(&mut self) {
+        // Only meaningful while waiting out a backoff: skip the wait and redial.
+        // The backoff *attempt* counter is left intact, so a flapping device
+        // can't reset the escalation by re-announcing each cycle.
+        if self.state == State::Backoff {
+            self.deadline = None;
+            self.state = State::Connecting;
         }
     }
 
@@ -830,6 +847,58 @@ mod tests {
         // Exactly at the deadline it fires.
         dev.handle_timeout(deadline, &mut rng);
         assert!(dev.wants_connect());
+    }
+
+    // -- discovery-wake (P3) -------------------------------------------------
+
+    #[test]
+    fn discovery_wake_cancels_backoff_and_redials() {
+        let backoff = Backoff {
+            base: Duration::from_secs(30),
+            max: Duration::from_secs(30),
+            jitter: Duration::ZERO,
+        };
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg_with(Version::V3_3, true, backoff));
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+        dev.handle_input(Input::Closed, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+        assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(30)));
+        assert!(!dev.wants_connect());
+
+        // Rediscovered on the LAN → skip the 30 s wait, redial immediately.
+        dev.handle_input(Input::DiscoveryUpdated, T0, &mut rng);
+        assert!(dev.wants_connect());
+        assert_eq!(dev.poll_timeout(), None);
+    }
+
+    #[test]
+    fn discovery_wake_preserves_backoff_escalation() {
+        // A flapping device that re-announces each cycle must not reset the curve.
+        let backoff = Backoff {
+            base: Duration::from_secs(2),
+            max: Duration::from_secs(100),
+            jitter: Duration::ZERO,
+        };
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg_with(Version::V3_3, true, backoff));
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+        dev.handle_input(Input::Closed, T0, &mut rng); // attempt 0 → 2 s
+        assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(2)));
+        dev.handle_input(Input::DiscoveryUpdated, T0, &mut rng); // → Connecting, counter intact
+        dev.handle_input(Input::ConnectFailed, T0, &mut rng); // attempt 1 → 4 s, not reset to 2 s
+        assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn discovery_wake_is_noop_when_connected() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg(Version::V3_3), &mut rng);
+        dev.handle_input(Input::DiscoveryUpdated, T0, &mut rng);
+        assert!(dev.is_connected());
+        assert!(dev.poll_event().is_none());
     }
 
     // -- heartbeat / idle liveness (P4/P5) -----------------------------------
