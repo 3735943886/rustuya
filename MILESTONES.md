@@ -249,7 +249,7 @@ runs with tokio absent from the dependency tree; same core, same oracle.
 > The core decides ports/payloads/timing; the driver owns the UDP sockets and
 > broadcast.
 
-- [ ] **M2.1** Model the scanner FSM: `ScanEvent`/`ScanAction`; move the already-pure helpers (`compute_port_diff`, `effective_bind_ip`, packet parse, cache/dedup, cooldown math) into the core.
+- [x] **M2.1** Model the discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`); packet decode (6699/GCM + 55AA plaintext/ECB) + TTL cache/dedup moved into the core. *v1, passive receive only — `discovery.rs`.* (Renamed from `scanner`; singleton dropped — SMELLS Q1–Q3.)
 - [ ] **M2.2** Broadcast scheduling + cooldowns as timer actions; payload/port selection (incl. v3.5 source-IP / `set_discovery_sources`) as pure output.
 - [ ] **M2.3** Tokio driver owns UDP bind / `SO_BROADCAST` / send-recv; passive listener + active scan re-expressed as driver loops feeding the FSM.
 - [ ] **M2.4** Discovery cache / watch-channel semantics preserved (no lost wakeups — cf. concurrency rules).

@@ -14,6 +14,7 @@ mod error;
 pub mod command;
 pub mod crypto;
 pub mod device;
+pub mod discovery;
 pub mod frame;
 pub mod json;
 pub mod message;
