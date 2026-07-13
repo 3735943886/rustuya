@@ -1,0 +1,46 @@
+# rustuya-tokio — the std + tokio *driver* over the sans-I/O `rustuya-core` FSM.
+#
+# This is the M1.5 deliverable of the 0.4 sans-I/O program (see ../MILESTONES.md):
+# a thin driver that owns *only* I/O — TCP sockets, one `sleep` timer, the RNG,
+# and the monotonic clock — and delegates every protocol/lifecycle *decision*
+# (handshake, backoff, heartbeat, idle-liveness, frame reassembly) to the pure
+# `rustuya-core` Device FSM. Written from scratch on the FSM; the legacy 0.3
+# `rustuya` crate at the repo root is reference-only.
+#
+# Standalone [workspace] so it builds independently of the legacy root crate,
+# mirroring how rustuya-core is set up during the transition.
+[package]
+name = "rustuya-tokio"
+version = "0.4.0-dev"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Tokio driver for the sans-I/O rustuya-core Tuya protocol FSM"
+repository = "https://github.com/3735943886/rustuya"
+
+[workspace]
+
+[lib]
+name = "rustuya_tokio"
+
+[dependencies]
+rustuya-core = { path = "../rustuya-core" }
+tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+# BroadcastStream, so `listener()` is a `Stream` (README `.next().await` idiom).
+tokio-stream = { version = "0.1", features = ["sync"] }
+# UDP discovery sockets: SO_REUSEADDR/REUSEPORT + SO_BROADCAST so the scanner can
+# share the well-known ports and send broadcasts.
+socket2 = { version = "0.6", features = ["all"] }
+# The RNG the core never generates itself: a Send CSPRNG (ChaCha), OS-seeded,
+# injected into every handle_input/handle_timeout so IVs/nonces stay unique.
+rand = "0.9"
+serde = "1.0"
+serde_json = "1.0"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+# For crafting a v3.4 SessKeyNegResp in the handshake loopback test (same
+# versions as rustuya-core, so no duplicate in the tree).
+hmac = "0.13"
+sha2 = "0.11"

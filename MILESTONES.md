@@ -68,8 +68,10 @@ oracle-green and reviewed. The goal is "same behavior, new I/O boundary," not
 ```
 rustuya-core       no_std + alloc   protocol · crypto · Device FSM · Discovery FSM
                                     (now/RNG injected; core::net; no I/O)
-rustuya            std + tokio      thin driver: tokio TCP/UDP, timers, sync facade,
-                                    scanner sockets, Python-facing surface
+rustuya-tokio      std + tokio      thin driver: tokio TCP, one timer, RNG/clock
+                                    injection over the FSM (M1.5, from scratch).
+                                    Grows into UDP scanner + sync facade + Python
+                                    surface; supersedes the reference root crate.
 rustuya-embassy    no_std           thin driver: embassy-net + embassy-time  (Phase 3)
 python             extension        unchanged; sits on rustuya (tokio)
 ```
@@ -221,9 +223,41 @@ byte-for-byte behavior-identical under the existing oracles.
 - [x] **M1.2** Port the session-key negotiation (prepare/verify/finalize) into the FSM. *v1, `session.rs` + `device.rs`.*
 - [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout` deadline (SMELLS P1/P2/P6). Discovery-wake half (`DiscoveryUpdated`) deferred to the discovery increment — in poll-split it's a driver `select!` arm, not core `select`. *v2, `device.rs` + `time.rs`.*
 - [x] **M1.4** Heartbeat + idle-timeout + handshake-timeout as timer events, all merged into the single `poll_timeout` via `earliest()` (SMELLS P4/P5 resolved; a stalled handshake no longer stalls forever). *v3, `device.rs`.* dev22 fallback decisions still to port from `decision.rs`.
-- [ ] **M1.5** Rewrite the tokio actor as a thin driver over the FSM. `persist` / `nowait` / `connect_now` semantics preserved.
+- [x] **M1.4b (core)** Thread `cid` through the FSM so **sub-devices** work:
+  `Input::Send` gained a `cid: Option<&'a str>` field, `on_send` forwards it into
+  `command::generate` (which already took `cid` but was called with `None`). Pinned
+  by `send_with_cid_targets_the_sub_device_in_the_envelope` (zero-time: the emitted
+  frame's `devId`/`cid` address the sub-device). 77 lib + parity + no_std(riscv)
+  green. Unblocks the sub-device half of M1.5.
+- [ ] **M1.5** Tokio driver as a thin loop over the FSM — **driver skeleton
+  landed, milestone not complete.** Built **from scratch** as a new
+  `rustuya-tokio` crate (standalone `[workspace]`, path dep on `rustuya-core`),
+  **not** an in-place rewrite of the legacy root `rustuya` crate (now
+  reference-only). One `tokio::spawn`ed actor per device runs the canonical
+  poll-split loop: `wants_connect → dial`, then
+  `select!{cmd_rx, socket-read, one poll_timeout timer}`, then drain
+  `poll_transmit → socket` / `poll_event → {waiters, listener bus}`. The driver
+  injects **only** I/O — a Send `StdRng` (OS-seeded, keeps IV/nonce uniqueness),
+  a `tokio::time::Instant` base for `now`, and TCP. *No protocol decisions in the
+  driver.* `persist`/`nowait` collapse into the core's `auto_reconnect` knob;
+  backoff/heartbeat/idle/handshake-timeout are all FSM-owned. Public surface so
+  far: `DeviceBuilder → Device` with `status`/`set_dps`/`set_value`/`request`,
+  lossless `listener()` (a `Stream`, so the README `while let Some(m) =
+  l.next().await` idiom works verbatim), `is_connected`/`wait_connected`, graceful
+  `close`, and **sub-devices** via `Device::sub(cid) → SubDevice` (rides M1.4b; a
+  loopback test asserts the `cid` reaches the wire envelope). Fire-and-forget FIFO
+  response correlation (no seqno matching — protocol has no token). A runnable
+  `examples/tokio_control.rs` mirrors the README async shape (explicit address).
+  **Still required by this milestone before it can close:** `connect_now` (M1.5
+  explicitly lists it) and the Python surface. *Addressless connect now works:*
+  `DeviceBuilder::discover(&Discovery, timeout)` resolves IP **and** version from
+  the LAN (via M2.3) and connects — see `examples/discover_connect.rs`, pinned by a
+  deterministic E2E (UDP announce → discover → TCP connect → status). This is
+  **resolve-once**; continuous rediscovery cancelling backoff (the core's
+  `DiscoveryUpdated`) and a literal addressless `Device::new` are the remaining
+  bits of the exact README snippet.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
-- [ ] **M1.7** `tuyamock` E2E unchanged and green (the regression gate for this extraction).
+- [ ] **M1.7** `tuyamock` E2E unchanged and green (the regression gate for this extraction). *Interim:* `rustuya-tokio/tests/loopback.rs` drives the full stack (dial → connect → send → framed reply → decode → correlate) against a hand-rolled v3.3 device **and** a real v3.4 session-key handshake over loopback TCP — a from-scratch stand-in until `tuyamock` is wired to the new driver.
 
 **Acceptance:** reconnect/handshake/dev22 covered by pure zero-time tests; tokio
 behavior unchanged under tuyamock.
@@ -251,7 +285,19 @@ runs with tokio absent from the dependency tree; same core, same oracle.
 
 - [x] **M2.1** Model the discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`); packet decode (6699/GCM + 55AA plaintext/ECB) + TTL cache/dedup moved into the core. *v1, passive receive only — `discovery.rs`.* (Renamed from `scanner`; singleton dropped — SMELLS Q1–Q3.)
 - [x] **M2.2** Broadcast scheduling as timer actions (`StartScan`/`StopScan` + `poll_timeout`/`handle_timeout`, injected interval/burst); payload/port selection as pure output via a typed `Probe`/`Dialect` table (SMELLS Q4/Q5). v3.5 source-IP is `Config::local_ip` (driver fills it — Q6). *v2, `discovery.rs`.* Scan-start cooldown/throttle stays a driver policy (when to send `StartScan`).
-- [ ] **M2.3** Tokio driver owns UDP bind / `SO_BROADCAST` / send-recv; passive listener + active scan re-expressed as driver loops feeding the FSM.
+- [x] **M2.3** Tokio UDP driver over the discovery FSM — `rustuya-tokio/src/discovery.rs`.
+  Owns UDP bind (`SO_REUSEADDR`/`REUSEPORT` so the well-known ports 6666/6667/7000
+  are shareable) + `SO_BROADCAST` send; one reader task per socket funnels
+  datagrams into a channel, and one actor runs `select!{datagram, control, one
+  poll_timeout timer}` → drain `poll_transmit → broadcast socket` /
+  `poll_event → announcement bus`. Public surface (no "scanner" name, matching the
+  core rename): `Discovery` / `DiscoveryBuilder` / `Discovered` (a `Stream`),
+  `find(id, timeout)`, `discover_for(window)`, `known()`. **Best-effort local-IP
+  detection** fills `Config::local_ip` (Q6). `find` is race-free by design — it
+  holds a driver-side `known` map (id → info) and subscribes *before* the cache
+  check, so it resolves an already-announced device immediately instead of hanging
+  on the dedup-suppressed re-announcement (this replaced a magic short-TTL test
+  hack). Two loopback E2E tests (crafted UDP announcement → `DeviceInfo`).
 - [ ] **M2.4** Discovery cache / watch-channel semantics preserved (no lost wakeups — cf. concurrency rules).
 - [ ] **M2.5** Parity of discovery behavior against 0.3 (unit + any mock discovery coverage).
 

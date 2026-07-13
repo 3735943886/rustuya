@@ -104,10 +104,12 @@ pub enum Input<'a> {
     /// frame, one frame, or several coalesced. The core reassembles (D4).
     Received(&'a [u8]),
     /// The caller wants to send a command; `t` is the wall-clock timestamp
-    /// (seconds) the driver stamps.
+    /// (seconds) the driver stamps. `cid` addresses a gateway **sub-device** by
+    /// its channel id; `None` addresses the device/gateway itself.
     Send {
         cmd: CommandType,
         data: Option<Value>,
+        cid: Option<&'a str>,
         t: u64,
     },
     /// The `discovery` FSM saw this device broadcast on the LAN. While backing
@@ -199,7 +201,7 @@ impl Device {
             Input::Connected => self.on_connected(now, rng),
             Input::ConnectFailed => self.on_connect_failed(now, rng),
             Input::Received(data) => self.on_received(data, now, rng),
-            Input::Send { cmd, data, t } => self.on_send(cmd, data, t, rng),
+            Input::Send { cmd, data, cid, t } => self.on_send(cmd, data, cid, t, rng),
             Input::DiscoveryUpdated => self.on_discovery_updated(),
             Input::Closed => self.on_closed(now, rng),
         }
@@ -411,7 +413,14 @@ impl Device {
         self.reach_connected(now);
     }
 
-    fn on_send(&mut self, cmd: CommandType, data: Option<Value>, t: u64, rng: &mut impl RngCore) {
+    fn on_send(
+        &mut self,
+        cmd: CommandType,
+        data: Option<Value>,
+        cid: Option<&str>,
+        t: u64,
+        rng: &mut impl RngCore,
+    ) {
         if self.state != State::Connected {
             self.events.push_back(Event::ProtocolError(CoreError::NotConnected));
             return;
@@ -422,7 +431,7 @@ impl Device {
             &self.cfg.device_id,
             cmd,
             data,
-            None,
+            cid,
             t,
         );
         let plaintext = json::to_bytes(&value);
@@ -653,6 +662,7 @@ mod tests {
             Input::Send {
                 cmd: CommandType::Control,
                 data: Some(json::from_bytes(br#"{"1":true}"#).unwrap()),
+                cid: None,
                 t: 1_700_000_000,
             },
             T0,
@@ -666,11 +676,37 @@ mod tests {
     }
 
     #[test]
+    fn send_with_cid_targets_the_sub_device_in_the_envelope() {
+        // A `cid` on Send must reach `command::generate`: the emitted frame's
+        // envelope addresses the sub-device (`devId`/`cid` = the channel id), not
+        // the gateway. Pins the M1.4b threading so a driver can never silently
+        // drop the sub-device target.
+        let mut rng = SeededRng(2);
+        let mut dev = connected(cfg(Version::V3_3), &mut rng);
+        dev.handle_input(
+            Input::Send {
+                cmd: CommandType::Control,
+                data: Some(json::from_bytes(br#"{"1":true}"#).unwrap()),
+                cid: Some("subchannel01"),
+                t: 1_700_000_000,
+            },
+            T0,
+            &mut rng,
+        );
+        let wire = dev.poll_transmit().expect("a frame was queued");
+        let msg = decode_message(Version::V3_3, &wire, &KEY, false).unwrap();
+        let v = json::from_bytes(&msg.payload).unwrap();
+        assert_eq!(v["cid"], "subchannel01", "cid field present");
+        assert_eq!(v["devId"], "subchannel01", "envelope addresses the sub-device");
+        assert_eq!(v["dps"], json::from_bytes(br#"{"1":true}"#).unwrap());
+    }
+
+    #[test]
     fn send_before_ready_errors() {
         let mut rng = SeededRng(3);
         let mut dev = Device::new(cfg(Version::V3_5));
         dev.handle_input(
-            Input::Send { cmd: CommandType::DpQuery, data: None, t: 1 },
+            Input::Send { cmd: CommandType::DpQuery, data: None, cid: None, t: 1 },
             T0,
             &mut rng,
         );
@@ -1122,6 +1158,7 @@ mod tests {
                 Input::Send {
                     cmd: CommandType::Control,
                     data: Some(json::from_bytes(br#"{"1":true}"#).unwrap()),
+                    cid: None,
                     t: 1_700_000_000 + i,
                 },
                 T0,

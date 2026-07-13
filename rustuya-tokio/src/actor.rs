@@ -1,0 +1,272 @@
+//! The per-device driver task: a thin tokio loop over the pure `rustuya-core`
+//! [`Device`] FSM.
+//!
+//! The loop is the canonical sans-I/O driver shape (MILESTONES D1, "poll-split"):
+//!
+//! 1. **Dial** whenever the FSM [`wants_connect`](Device::wants_connect) — the
+//!    core owns *whether* and *when* (backoff); the driver only opens the socket
+//!    and reports [`Input::Connected`] / [`Input::ConnectFailed`].
+//! 2. **Arm one timer** at the FSM's single [`poll_timeout`](Device::poll_timeout)
+//!    deadline (backoff / heartbeat / idle / handshake — the core already merged
+//!    them into one).
+//! 3. **`select!`** over {a queued command, socket-readable, that timer} and feed
+//!    the matching `handle_*`.
+//! 4. **Settle**: drain [`poll_transmit`](Device::poll_transmit) to the socket and
+//!    [`poll_event`](Device::poll_event) to the waiters / listener bus.
+//!
+//! No protocol decisions live here. The clock and the RNG are the only things the
+//! driver injects — a `StdRng` (Send, OS-seeded) so every IV/nonce the core emits
+//! stays unique, and a monotonic `tokio::time::Instant` base for `now`.
+
+use std::collections::VecDeque;
+use std::time::Duration as StdDuration;
+
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::time::{sleep_until, timeout, Instant as TokioInstant};
+
+use rustuya_core::device::{Config as CoreConfig, Device, Event, Input};
+use rustuya_core::json::Value;
+use rustuya_core::message::Message;
+use rustuya_core::time::Instant as CoreInstant;
+use rustuya_core::{CommandType, CoreError};
+
+use crate::error::{Result, TuyaError};
+
+/// A command handed from a [`Device`](crate::Device) handle to its actor task.
+pub(crate) enum Cmd {
+    /// Send a protocol command and complete `resp` with the next matching response.
+    /// `cid` addresses a gateway sub-device; `None` addresses the device itself.
+    Request {
+        cmd: CommandType,
+        data: Option<Value>,
+        cid: Option<String>,
+        resp: oneshot::Sender<Result<Message>>,
+    },
+    /// Graceful shutdown: fail any in-flight waiters and exit the task.
+    Close,
+}
+
+/// Everything the actor needs to run one device, moved in at spawn time.
+pub(crate) struct ActorConfig {
+    pub core: CoreConfig,
+    pub addr: String,
+    pub connect_timeout: StdDuration,
+}
+
+/// Convert the driver's monotonic clock into the core's injected `now`.
+#[inline]
+fn now_since(base: TokioInstant) -> CoreInstant {
+    CoreInstant::from_millis(base.elapsed().as_millis() as u64)
+}
+
+/// Wall-clock seconds the core stamps into request envelopes (the `t` field).
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The actor entry point. Runs until every command sender is dropped or a
+/// [`Cmd::Close`] arrives.
+pub(crate) async fn run(
+    acfg: ActorConfig,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    bcast_tx: broadcast::Sender<Message>,
+    conn_tx: watch::Sender<bool>,
+) {
+    let ActorConfig {
+        core,
+        addr,
+        connect_timeout,
+    } = acfg;
+
+    let mut fsm = Device::new(core);
+    // A Send CSPRNG (ChaCha), seeded from the OS. One instance for the task's
+    // lifetime is fine: its period dwarfs any device's frame count, and pinning
+    // it here keeps the actor future `Send` (a `ThreadRng` would not be).
+    let mut rng = StdRng::from_os_rng();
+    let base = TokioInstant::now();
+
+    let mut stream: Option<TcpStream> = None;
+    let mut waiters: VecDeque<oneshot::Sender<Result<Message>>> = VecDeque::new();
+    let mut rbuf = vec![0u8; 8192];
+
+    loop {
+        // (A) Dial when the core asks. The result — success or failure — is just
+        //     another input; the core decides what happens next (handshake, or a
+        //     backoff timer).
+        if fsm.wants_connect() {
+            match timeout(connect_timeout, TcpStream::connect(&addr)).await {
+                Ok(Ok(s)) => {
+                    let _ = s.set_nodelay(true);
+                    stream = Some(s);
+                    fsm.handle_input(Input::Connected, now_since(base), &mut rng);
+                }
+                Ok(Err(e)) => {
+                    log::debug!("connect {addr} failed: {e}");
+                    stream = None;
+                    fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
+                }
+                Err(_) => {
+                    log::debug!("connect {addr} timed out");
+                    stream = None;
+                    fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
+                }
+            }
+            settle(&mut fsm, &mut stream, &mut waiters, &bcast_tx, &conn_tx, base, &mut rng).await;
+            continue;
+        }
+
+        // (B) One timer at the single next deadline (D2). `None` disables it.
+        let deadline =
+            fsm.poll_timeout().map(|d| base + StdDuration::from_millis(d.as_millis()));
+
+        // (C) Whichever fires first drives the FSM.
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(Cmd::Request { cmd, data, cid, resp }) => {
+                    if fsm.is_connected() {
+                        let t = unix_secs();
+                        waiters.push_back(resp);
+                        // `cid` is owned here for the duration of this call, so the
+                        // core can borrow it — no per-request allocation in the FSM.
+                        let input = Input::Send { cmd, data, cid: cid.as_deref(), t };
+                        fsm.handle_input(input, now_since(base), &mut rng);
+                    } else {
+                        // Fail fast rather than queue into a socket that isn't up:
+                        // the handle already waited for `connected` before sending,
+                        // so this only trips on a connect/drop race.
+                        let _ = resp.send(Err(TuyaError::Core(CoreError::NotConnected)));
+                    }
+                }
+                // All senders dropped, or an explicit Close: shut the task down.
+                Some(Cmd::Close) | None => {
+                    for w in waiters.drain(..) {
+                        let _ = w.send(Err(TuyaError::Closed));
+                    }
+                    let _ = conn_tx.send(false);
+                    return;
+                }
+            },
+            r = read_some(&mut stream, &mut rbuf), if stream.is_some() => match r {
+                Ok(0) => fsm.handle_input(Input::Closed, now_since(base), &mut rng), // peer EOF
+                Ok(n) => fsm.handle_input(Input::Received(&rbuf[..n]), now_since(base), &mut rng),
+                Err(e) => {
+                    log::debug!("read error: {e}");
+                    fsm.handle_input(Input::Closed, now_since(base), &mut rng);
+                }
+            },
+            _ = sleep_until(deadline.unwrap_or_else(TokioInstant::now)), if deadline.is_some() => {
+                fsm.handle_timeout(now_since(base), &mut rng);
+            }
+        }
+
+        settle(&mut fsm, &mut stream, &mut waiters, &bcast_tx, &conn_tx, base, &mut rng).await;
+    }
+}
+
+/// One socket read into `buf`. Split out so the `select!` precondition
+/// (`if stream.is_some()`) gates the `unwrap`.
+async fn read_some(stream: &mut Option<TcpStream>, buf: &mut [u8]) -> std::io::Result<usize> {
+    stream.as_mut().expect("guarded by `if stream.is_some()`").read(buf).await
+}
+
+/// Push everything the FSM produced out to the world: bytes to the socket, events
+/// to the waiters and the listener bus. Re-runs once if a write fails (feeding the
+/// core `Closed`, which enqueues `Disconnected` for us to dispatch), so the loop
+/// runs at most twice and always leaves the FSM's queues empty.
+async fn settle(
+    fsm: &mut Device,
+    stream: &mut Option<TcpStream>,
+    waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>,
+    bcast_tx: &broadcast::Sender<Message>,
+    conn_tx: &watch::Sender<bool>,
+    base: TokioInstant,
+    rng: &mut StdRng,
+) {
+    loop {
+        // Bytes out. A write failure is just another `Closed` input to the core.
+        if let Err(e) = flush_tx(fsm, stream).await {
+            log::debug!("write error: {e}");
+            *stream = None;
+            fsm.handle_input(Input::Closed, now_since(base), rng);
+            // The Closed produced a Disconnected event; dispatch it next turn.
+            continue;
+        }
+        // Events out. If the core tore the connection down, drop the socket so the
+        // next dial gets a fresh one.
+        if dispatch_events(fsm, waiters, bcast_tx, conn_tx) {
+            *stream = None;
+        }
+        return;
+    }
+}
+
+/// Drain `poll_transmit` to the socket. Errors surface for the `Closed` re-feed.
+async fn flush_tx(fsm: &mut Device, stream: &mut Option<TcpStream>) -> std::io::Result<()> {
+    while let Some(bytes) = fsm.poll_transmit() {
+        // No socket to write to (torn down mid-drain) → drop the bytes; the core
+        // re-establishes state on the next connect.
+        if let Some(s) = stream.as_mut() {
+            s.write_all(&bytes).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Drain `poll_event`, routing each to the response waiters and the listener bus.
+/// Returns `true` if a `Disconnected` was seen (the connection was torn down).
+fn dispatch_events(
+    fsm: &mut Device,
+    waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>,
+    bcast_tx: &broadcast::Sender<Message>,
+    conn_tx: &watch::Sender<bool>,
+) -> bool {
+    let mut tore_down = false;
+    while let Some(ev) = fsm.poll_event() {
+        match ev {
+            Event::Ready => {
+                let _ = conn_tx.send(true);
+            }
+            Event::Response(msg) => {
+                // Every response also feeds the listener bus (lossless attach is
+                // the listener's concern; here we only fan out).
+                let _ = bcast_tx.send(msg.clone());
+                deliver_to_waiter(waiters, msg);
+            }
+            Event::Disconnected => {
+                tore_down = true;
+                let _ = conn_tx.send(false);
+                for w in waiters.drain(..) {
+                    let _ = w.send(Err(TuyaError::Disconnected));
+                }
+            }
+            Event::ProtocolError(e) => {
+                log::debug!("protocol error: {e}");
+            }
+        }
+    }
+    tore_down
+}
+
+/// Complete the oldest still-live waiter with `msg`. Waiters whose receiver has
+/// gone (a timed-out `request`) are popped and skipped, so a stale slot can't
+/// swallow a live response. With no waiter the message was an unsolicited push —
+/// it already went to the listener bus.
+///
+/// This is the documented fire-and-forget correlation (see [`crate::Device`]):
+/// the Tuya LAN protocol carries no request/response token, so responses match
+/// pending requests in FIFO order, not by identity.
+fn deliver_to_waiter(waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>, msg: Message) {
+    while let Some(w) = waiters.pop_front() {
+        match w.send(Ok(msg.clone())) {
+            Ok(()) => return,   // delivered to a live caller
+            Err(_) => continue, // receiver gone — try the next
+        }
+    }
+}
