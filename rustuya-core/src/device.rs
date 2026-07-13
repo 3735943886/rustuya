@@ -86,6 +86,11 @@ pub struct Config {
     /// promptly instead of at the next reconnect (SMELLS.md P4/P5). `None`
     /// disables liveness timing (the driver's `Closed` is then the only signal).
     pub idle_timeout: Option<Duration>,
+    /// If set, a v3.4/v3.5 handshake that does not complete within this window is
+    /// torn down and retried. Without it a device that opens the socket but never
+    /// sends `SessKeyNegResp` would stall `Handshaking` forever (idle_timeout only
+    /// runs once `Connected`). `None` disables the handshake deadline.
+    pub handshake_timeout: Option<Duration>,
 }
 
 /// An input pushed into the state machine by the driver.
@@ -150,6 +155,8 @@ pub struct Device {
     next_heartbeat: Option<Instant>,
     /// When silence declares the connection dead while `Connected`.
     idle_deadline: Option<Instant>,
+    /// When to give up on an incomplete handshake while `Handshaking`.
+    handshake_deadline: Option<Instant>,
     tx: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
 }
@@ -168,6 +175,7 @@ impl Device {
             deadline: None,
             next_heartbeat: None,
             idle_deadline: None,
+            handshake_deadline: None,
             tx: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -218,9 +226,17 @@ impl Device {
                     self.next_heartbeat = self.cfg.heartbeat.map(|iv| now + iv);
                 }
             }
-            // Handshaking has no timer of its own yet (a handshake-timeout is a
-            // later increment); Connecting/Closed are driver-driven.
-            State::Handshaking | State::Connecting | State::Closed => {}
+            State::Handshaking => {
+                // A handshake that never completes: tear the socket down (emit
+                // Disconnected so the driver closes it) and re-arm backoff.
+                if let Some(deadline) = self.handshake_deadline
+                    && now >= deadline
+                {
+                    self.disconnect(now, rng);
+                }
+            }
+            // Connecting/Closed are driver-driven; no core timer.
+            State::Connecting | State::Closed => {}
         }
     }
 
@@ -242,7 +258,8 @@ impl Device {
         match self.state {
             State::Backoff => self.deadline,
             State::Connected => earliest(self.next_heartbeat, self.idle_deadline),
-            State::Handshaking | State::Connecting | State::Closed => None,
+            State::Handshaking => self.handshake_deadline,
+            State::Connecting | State::Closed => None,
         }
     }
 
@@ -275,6 +292,7 @@ impl Device {
                 Ok(bytes) => {
                     self.tx.push_back(bytes);
                     self.handshake = Some(hs);
+                    self.handshake_deadline = self.cfg.handshake_timeout.map(|d| now + d);
                     self.state = State::Handshaking;
                 }
                 // A failure here never emitted Disconnected (we were mid-connect),
@@ -392,6 +410,7 @@ impl Device {
         self.handshake = None;
         self.next_heartbeat = None; // no keepalive/liveness timing while down
         self.idle_deadline = None;
+        self.handshake_deadline = None;
         if self.cfg.auto_reconnect {
             let delay = self.cfg.backoff.delay(self.attempt, rng);
             self.attempt = self.attempt.saturating_add(1);
@@ -407,6 +426,7 @@ impl Device {
         self.state = State::Connected;
         self.attempt = 0; // a good connection resets the backoff curve
         self.deadline = None;
+        self.handshake_deadline = None;
         self.next_heartbeat = self.cfg.heartbeat.map(|iv| now + iv);
         self.idle_deadline = self.cfg.idle_timeout.map(|d| now + d);
         self.events.push_back(Event::Ready);
@@ -510,6 +530,7 @@ mod tests {
             backoff,
             heartbeat: None,
             idle_timeout: None,
+            handshake_timeout: None,
         }
     }
 
@@ -851,5 +872,42 @@ mod tests {
         dev.handle_timeout(Instant::from_millis(10_000), &mut rng);
         let _ = dev.poll_transmit();
         assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(20_000)));
+    }
+
+    // -- handshake timeout ---------------------------------------------------
+
+    #[test]
+    fn stalled_handshake_times_out_and_reconnects() {
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(Config {
+            handshake_timeout: Some(Duration::from_secs(5)),
+            ..cfg(Version::V3_4)
+        });
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let _ = dev.poll_transmit(); // SessKeyNegStart went out
+        assert!(!dev.is_connected());
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(5_000)), "handshake deadline armed");
+
+        // Device never answers: at the deadline the FSM tears the socket down
+        // (Disconnected → driver closes it) and re-arms backoff.
+        dev.handle_timeout(Instant::from_millis(5_000), &mut rng);
+        assert!(!dev.is_connected());
+        assert_eq!(drain_events(&mut dev), vec![Event::Disconnected]);
+        assert!(dev.poll_timeout().is_some(), "backoff armed for the retry");
+    }
+
+    #[test]
+    fn completed_handshake_clears_its_deadline() {
+        let mut rng = SeededRng(42);
+        let mut dev = Device::new(Config {
+            handshake_timeout: Some(Duration::from_secs(5)),
+            ..cfg(Version::V3_4)
+        });
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(5_000)));
+        complete_handshake(&mut dev, Version::V3_4, &mut rng);
+        assert!(dev.is_connected());
+        // No heartbeat/idle configured → the deadline is gone, not left stale.
+        assert_eq!(dev.poll_timeout(), None, "handshake deadline cleared on connect");
     }
 }
