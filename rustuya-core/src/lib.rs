@@ -17,6 +17,7 @@ pub mod frame;
 pub mod json;
 pub mod message;
 pub mod payload;
+pub mod session;
 pub mod version;
 
 pub use command::CommandType;

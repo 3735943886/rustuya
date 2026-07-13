@@ -71,6 +71,18 @@ impl TuyaCipher {
         strip_pkcs7(buf)
     }
 
+    /// AES-128-ECB encrypt of a single 16-byte block, **no padding** — used only
+    /// for session-key derivation (v3.4). Payloads use [`Self::ecb_encrypt`].
+    #[must_use]
+    pub fn ecb_encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        let mut enc = Encryptor::<Aes128>::new((&self.key).into());
+        let mut buf = *block;
+        if let Ok(b) = <&mut Block<Aes128>>::try_from(&mut buf[..]) {
+            enc.encrypt_block(b);
+        }
+        buf
+    }
+
     // -- AES-128-GCM (v3.4 / v3.5) -------------------------------------------
 
     /// Encrypts with AES-128-GCM. Returns `ciphertext || tag`; the caller
