@@ -15,6 +15,7 @@ pub mod command;
 pub mod crypto;
 pub mod frame;
 pub mod json;
+pub mod message;
 pub mod payload;
 pub mod version;
 
