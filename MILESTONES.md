@@ -252,10 +252,15 @@ byte-for-byte behavior-identical under the existing oracles.
   explicitly lists it) and the Python surface. *Addressless connect now works:*
   `DeviceBuilder::discover(&Discovery, timeout)` resolves IP **and** version from
   the LAN (via M2.3) and connects — see `examples/discover_connect.rs`, pinned by a
-  deterministic E2E (UDP announce → discover → TCP connect → status). This is
-  **resolve-once**; continuous rediscovery cancelling backoff (the core's
-  `DiscoveryUpdated`) and a literal addressless `Device::new` are the remaining
-  bits of the exact README snippet.
+  deterministic E2E (UDP announce → discover → TCP connect → status). *Live
+  rediscovery-wake now works too (P3):* `DeviceBuilder::rediscover(&Discovery)`
+  (also auto-linked by `discover`) spawns a forwarder that feeds the core's
+  `Input::DiscoveryUpdated` on each re-announcement, so a device backing off
+  redials the instant it reappears on the LAN — pinned by a deterministic E2E
+  (1-hour backoff, reconnect happens *only* via the wake; `tests/rediscovery.rs`).
+  **Still required before this milestone can close:** `connect_now` and the Python
+  surface; a literal addressless `Device::new` is the last bit of the exact README
+  snippet.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
 - [ ] **M1.7** `tuyamock` E2E unchanged and green (the regression gate for this extraction). *Interim:* `rustuya-tokio/tests/loopback.rs` drives the full stack (dial → connect → send → framed reply → decode → correlate) against a hand-rolled v3.3 device **and** a real v3.4 session-key handshake over loopback TCP — a from-scratch stand-in until `tuyamock` is wired to the new driver.
 

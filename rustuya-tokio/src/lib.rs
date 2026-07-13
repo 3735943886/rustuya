@@ -89,6 +89,7 @@ pub struct DeviceBuilder {
     request_timeout: StdDuration,
     command_capacity: usize,
     listener_capacity: usize,
+    rediscover: Option<Discovery>,
 }
 
 impl DeviceBuilder {
@@ -115,6 +116,7 @@ impl DeviceBuilder {
             request_timeout: StdDuration::from_secs(5),
             command_capacity: 64,
             listener_capacity: 128,
+            rediscover: None,
         }
     }
 
@@ -199,6 +201,18 @@ impl DeviceBuilder {
         self
     }
 
+    /// Link a [`Discovery`] so a live re-announcement of this device **cancels a
+    /// pending reconnect backoff and redials immediately** (the core's
+    /// `DiscoveryUpdated`, SMELLS P3). Independent of [`address`](Self::address):
+    /// use it with a fixed address to cut reconnect latency when the device
+    /// reappears, instead of waiting out the backoff. [`discover`](Self::discover)
+    /// links this automatically.
+    #[must_use]
+    pub fn rediscover(mut self, disco: &Discovery) -> Self {
+        self.rediscover = Some(disco.clone());
+        self
+    }
+
     /// Spawn the device actor and return a handle. Fails if `address` is unset or
     /// the local key is not 16 bytes.
     pub fn connect(self) -> Result<Device> {
@@ -235,8 +249,16 @@ impl DeviceBuilder {
         let (bcast_tx, _) = broadcast::channel(self.listener_capacity);
         let (conn_tx, conn_rx) = watch::channel(false);
 
+        // If a discovery is linked, spawn a forwarder that nudges the actor on
+        // each re-announcement of this device id (backoff cancellation, P3).
+        let wake_rx = self.rediscover.as_ref().map(|disco| {
+            let (wake_tx, wake_rx) = mpsc::channel(4);
+            spawn_rediscovery_forwarder(disco.clone(), self.id.clone(), wake_tx);
+            wake_rx
+        });
+
         let bcast_for_actor = bcast_tx.clone();
-        tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx));
+        tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx, wake_rx));
 
         Ok(Device {
             id: self.id,
@@ -254,17 +276,38 @@ impl DeviceBuilder {
     /// overridden by what discovery reports; a `port` you set is kept (the device
     /// still connects on its TCP port, not the discovery port).
     ///
-    /// *Resolve-once:* this fixes the address at connect time. Continuous
-    /// rediscovery cancelling backoff (the core's `DiscoveryUpdated`) is a later
-    /// increment.
+    /// *Resolve-once for the address:* this fixes the IP at connect time. It also
+    /// **links the discovery for live rewake** (unless you already linked one via
+    /// [`rediscover`](Self::rediscover)), so a later re-announcement cancels
+    /// backoff and redials — see [`rediscover`](Self::rediscover).
     pub async fn discover(mut self, disco: &Discovery, timeout: StdDuration) -> Result<Device> {
         let info = disco.find(&self.id, timeout).await?;
         self.address = Some(info.ip.to_string());
         if let Some(v) = info.version {
             self.version = v;
         }
+        self.rediscover.get_or_insert_with(|| disco.clone());
         self.connect()
     }
+}
+
+/// Subscribe to `disco`'s announcement bus and nudge the actor (`wake_tx`) on each
+/// re-announcement of `device_id`. Runs until the discovery bus closes or the
+/// actor drops its receiver.
+fn spawn_rediscovery_forwarder(disco: Discovery, device_id: String, wake_tx: mpsc::Sender<()>) {
+    tokio::spawn(async move {
+        let mut stream = disco.discovered();
+        loop {
+            match stream.recv().await {
+                Ok(info) => {
+                    if info.id == device_id && wake_tx.send(()).await.is_err() {
+                        break; // actor gone
+                    }
+                }
+                Err(_) => break, // discovery closed
+            }
+        }
+    });
 }
 
 /// A handle to one device's driver task. Cheap to clone; all clones share the one

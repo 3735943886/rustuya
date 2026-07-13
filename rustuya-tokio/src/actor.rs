@@ -78,6 +78,9 @@ pub(crate) async fn run(
     mut cmd_rx: mpsc::Receiver<Cmd>,
     bcast_tx: broadcast::Sender<Message>,
     conn_tx: watch::Sender<bool>,
+    // A linked `Discovery` (if any) forwards this device's re-announcements here;
+    // each wake feeds `Input::DiscoveryUpdated` so a rediscovery cancels backoff.
+    mut wake_rx: Option<mpsc::Receiver<()>>,
 ) {
     let ActorConfig {
         core,
@@ -164,6 +167,12 @@ pub(crate) async fn run(
             _ = sleep_until(deadline.unwrap_or_else(TokioInstant::now)), if deadline.is_some() => {
                 fsm.handle_timeout(now_since(base), &mut rng);
             }
+            // (D) A linked discovery saw this device again: cancel any backoff and
+            //     redial now (a no-op unless the FSM is currently backing off).
+            w = recv_wake(&mut wake_rx) => match w {
+                Some(()) => fsm.handle_input(Input::DiscoveryUpdated, now_since(base), &mut rng),
+                None => wake_rx = None, // forwarder gone — stop selecting on it
+            },
         }
 
         settle(&mut fsm, &mut stream, &mut waiters, &bcast_tx, &conn_tx, base, &mut rng).await;
@@ -174,6 +183,15 @@ pub(crate) async fn run(
 /// (`if stream.is_some()`) gates the `unwrap`.
 async fn read_some(stream: &mut Option<TcpStream>, buf: &mut [u8]) -> std::io::Result<usize> {
     stream.as_mut().expect("guarded by `if stream.is_some()`").read(buf).await
+}
+
+/// Await the next discovery-wake, or pend forever when no discovery is linked so
+/// this `select!` arm simply never fires.
+async fn recv_wake(rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Push everything the FSM produced out to the world: bytes to the socket, events
