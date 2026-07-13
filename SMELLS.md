@@ -27,12 +27,14 @@ not built yet — listed so it isn't forgotten).
 The big "ambiguous sleep / weird smell" cluster lived in the 0.3 actor. Confronted
 head-on as the Device FSM lands (`device.rs`), not carried over.
 
-**Resolved** (Device FSM v2, backoff/reconnect):
+**Resolved** (Device FSM v2 backoff/reconnect + v3 heartbeat/idle):
 
 | # | 0.3 smell | Where (0.3) | 0.4 resolution |
 |---|-----------|-------------|----------------|
 | P1 | **`SLEEP_RECONNECT_MIN = 16 s` hard floor**, not configurable | `device/mod.rs`, `actor.rs get_backoff_duration` | **Gone.** Backoff is [`Backoff`] policy (`base`/`max`/`jitter`) the driver injects; **no floor**. Tests pass `base = ZERO` and drive the whole reconnect path at zero wall-clock. |
 | P2 | **Backoff jitter via internal `rand::rng()`** | `actor.rs get_backoff_duration` | **Gone.** `Backoff::delay(attempt, rng)` draws jitter from the *injected* `RngCore`; the FSM computes a pure `Duration`. Seeded-RNG test pins bounds + variation. |
+| P4 | **`is_connected` slow/stale after a passive drop** | observed via mock probe | **Resolved.** `is_connected()` is an explicit state (`== Connected`); it flips the instant the driver feeds `Closed`, **and** an `idle_timeout` deadline (below) flips it on a *silent* drop without waiting for the driver. |
+| P5 | **A passive drop does not surface on `listener()` promptly** | observed via mock probe | **Resolved.** `Config::idle_timeout`: any inbound frame pushes an idle deadline forward; on expiry the FSM emits `Event::Disconnected` and re-arms backoff — a silent drop surfaces at `idle_timeout`, not at the next ~16 s reconnect. `Config::heartbeat` sends periodic `HeartBeat` keepalives (fresh v3.5 IV from the injected RNG) to provoke that traffic. |
 | P6 | **`persist=false` cooldown also floored at 16 s, only bypassable via `connect_now`** | `actor.rs` cooldown loop | **Reconciled to one path.** `Config::auto_reconnect` decides *whether* to retry; the delay curve is single/identical for both. `false` → terminal `Closed`; `true` → `Backoff`. |
 
 **Pending** (later FSM increments):
@@ -40,8 +42,6 @@ head-on as the Device FSM lands (`device.rs`), not carried over.
 | # | 0.3 smell | Where (0.3) | The question to settle |
 |---|-----------|-------------|------------------------|
 | P3 | **`wait_for_backoff` selects sleep + scanner-rediscovery `watch`** | `actor.rs` | The sleep↔discovery coupling. In poll-split this is **not core work**: the core exposes the backoff deadline via `poll_timeout()` and accepts a `DiscoveryUpdated` input; the driver's `select!` multiplexes `sleep_until(deadline)` vs `watch.changed()`. Wire the `DiscoveryUpdated` input in the discovery-wake increment. |
-| P4 | **`is_connected` slow/stale after a passive drop** | observed via mock probe | Partly addressed: `is_connected()` is now an explicit state (`== Connected`) that flips the instant the driver feeds `Closed`. Remaining: prompt *detection* of a silent peer drop is a driver/heartbeat concern (P5). |
-| P5 | **A passive drop does not surface on `listener()` promptly** | observed via mock probe | The FSM already emits `Event::Disconnected` synchronously on `Closed`. Remaining: a **heartbeat/idle timer** so a *silent* drop becomes a `Closed` promptly instead of at the next reconnect — the next FSM increment (adds a second `poll_timeout` source). |
 | P7 | **dev22 auto-detection** — no agreed algorithm; a known unknown | `decision.rs` / protocol | Keep as an explicit, documented decision in the protocol layer; don't hide it. |
 
 ## Notes

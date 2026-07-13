@@ -78,6 +78,14 @@ pub struct Config {
     pub auto_reconnect: bool,
     /// Backoff curve used when `auto_reconnect` is set.
     pub backoff: Backoff,
+    /// If set, emit a `HeartBeat` frame every interval while connected
+    /// (keepalive). `None` disables keepalive.
+    pub heartbeat: Option<Duration>,
+    /// If set, a connection with no inbound frame for this long is declared dead
+    /// and disconnected — this is what makes a *silent* peer drop surface
+    /// promptly instead of at the next reconnect (SMELLS.md P4/P5). `None`
+    /// disables liveness timing (the driver's `Closed` is then the only signal).
+    pub idle_timeout: Option<Duration>,
 }
 
 /// An input pushed into the state machine by the driver.
@@ -136,8 +144,12 @@ pub struct Device {
     seqno: u32,
     /// Consecutive failed/lost connections; reset to 0 on reaching `Connected`.
     attempt: u32,
-    /// When to redial while in `Backoff` (the sole `poll_timeout` source in v2).
+    /// When to redial while in `Backoff`.
     deadline: Option<Instant>,
+    /// When to send the next keepalive `HeartBeat` while `Connected`.
+    next_heartbeat: Option<Instant>,
+    /// When silence declares the connection dead while `Connected`.
+    idle_deadline: Option<Instant>,
     tx: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
 }
@@ -154,6 +166,8 @@ impl Device {
             seqno: 1,
             attempt: 0,
             deadline: None,
+            next_heartbeat: None,
+            idle_deadline: None,
             tx: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -171,17 +185,42 @@ impl Device {
         }
     }
 
-    /// Fires the single armed timer. In v2 that is only the backoff deadline: if
-    /// it has elapsed, the machine returns to `Connecting` so the driver redials.
-    /// `_rng` is part of the D1 interface for timer-driven sends (heartbeat, a
-    /// later increment) and is unused while only backoff is timed.
-    pub fn handle_timeout(&mut self, now: Instant, _rng: &mut impl RngCore) {
-        if self.state == State::Backoff
-            && let Some(deadline) = self.deadline
-            && now >= deadline
-        {
-            self.deadline = None;
-            self.state = State::Connecting;
+    /// Fires the single armed timer and recomputes internal deadlines (D2). The
+    /// driver arms **one** timer at [`poll_timeout`](Self::poll_timeout); on fire
+    /// this evaluates whichever deadline(s) elapsed:
+    ///  * `Backoff` elapsed → return to `Connecting` so the driver redials;
+    ///  * `Connected` idle elapsed → declare the peer dead and disconnect (the
+    ///    silent-drop fix, SMELLS P4/P5) — checked first so a dead link doesn't
+    ///    also emit a doomed heartbeat;
+    ///  * `Connected` heartbeat elapsed → emit a keepalive frame (needs the
+    ///    injected RNG for the v3.5 GCM IV) and re-arm.
+    pub fn handle_timeout(&mut self, now: Instant, rng: &mut impl RngCore) {
+        match self.state {
+            State::Backoff => {
+                if let Some(deadline) = self.deadline
+                    && now >= deadline
+                {
+                    self.deadline = None;
+                    self.state = State::Connecting;
+                }
+            }
+            State::Connected => {
+                if let Some(idle) = self.idle_deadline
+                    && now >= idle
+                {
+                    self.disconnect(now, rng);
+                    return;
+                }
+                if let Some(hb) = self.next_heartbeat
+                    && now >= hb
+                {
+                    self.send_heartbeat(rng);
+                    self.next_heartbeat = self.cfg.heartbeat.map(|iv| now + iv);
+                }
+            }
+            // Handshaking has no timer of its own yet (a handshake-timeout is a
+            // later increment); Connecting/Closed are driver-driven.
+            State::Handshaking | State::Connecting | State::Closed => {}
         }
     }
 
@@ -195,13 +234,15 @@ impl Device {
         self.events.pop_front()
     }
 
-    /// The single next deadline the driver should arm a timer for (D2). `None`
-    /// means "no timer" — currently non-`None` only while backing off.
+    /// The single next deadline the driver should arm a timer for (D2): the
+    /// earliest of the currently-active internal deadlines. `Backoff` exposes the
+    /// redial time; `Connected` exposes `min(next_heartbeat, idle_deadline)`.
     #[must_use]
     pub fn poll_timeout(&self) -> Option<Instant> {
         match self.state {
             State::Backoff => self.deadline,
-            _ => None,
+            State::Connected => earliest(self.next_heartbeat, self.idle_deadline),
+            State::Handshaking | State::Connecting | State::Closed => None,
         }
     }
 
@@ -244,7 +285,7 @@ impl Device {
                 }
             }
         } else {
-            self.reach_connected();
+            self.reach_connected(now);
         }
     }
 
@@ -258,6 +299,9 @@ impl Device {
         match self.state {
             State::Handshaking => self.on_handshake_response(data, now, rng),
             State::Connected => {
+                // Any inbound frame proves the peer is alive: push the idle
+                // (silent-drop) deadline forward.
+                self.idle_deadline = self.cfg.idle_timeout.map(|d| now + d);
                 // Data responses carry a 4-byte retcode (S1: explicit, cmd-context
                 // driven — not byte-sniffed).
                 match message::decode_message(self.cfg.version, data, self.active_key(), true) {
@@ -297,7 +341,7 @@ impl Device {
             Err(e) => return self.fail(e, now, rng),
         }
         self.session_key = Some(finished.session_key);
-        self.reach_connected();
+        self.reach_connected(now);
     }
 
     fn on_send(&mut self, cmd: CommandType, data: Option<Value>, t: u64, rng: &mut impl RngCore) {
@@ -346,6 +390,8 @@ impl Device {
     fn arm_backoff(&mut self, now: Instant, rng: &mut impl RngCore) {
         self.session_key = None;
         self.handshake = None;
+        self.next_heartbeat = None; // no keepalive/liveness timing while down
+        self.idle_deadline = None;
         if self.cfg.auto_reconnect {
             let delay = self.cfg.backoff.delay(self.attempt, rng);
             self.attempt = self.attempt.saturating_add(1);
@@ -357,11 +403,33 @@ impl Device {
         }
     }
 
-    fn reach_connected(&mut self) {
+    fn reach_connected(&mut self, now: Instant) {
         self.state = State::Connected;
         self.attempt = 0; // a good connection resets the backoff curve
         self.deadline = None;
+        self.next_heartbeat = self.cfg.heartbeat.map(|iv| now + iv);
+        self.idle_deadline = self.cfg.idle_timeout.map(|d| now + d);
         self.events.push_back(Event::Ready);
+    }
+
+    /// Emit a keepalive `HeartBeat` frame. Its payload carries no timestamp
+    /// (`{gwId, devId}`), so a wall-clock `t` is irrelevant here.
+    fn send_heartbeat(&mut self, rng: &mut impl RngCore) {
+        let (code, value) = command::generate(
+            self.cfg.version,
+            self.cfg.dev_type,
+            &self.cfg.device_id,
+            CommandType::HeartBeat,
+            None,
+            None,
+            0,
+        );
+        let plaintext = json::to_bytes(&value);
+        let key = self.active_key().to_vec();
+        match self.encode(code, &plaintext, &key, rng) {
+            Ok(bytes) => self.tx.push_back(bytes),
+            Err(e) => self.events.push_back(Event::ProtocolError(e)),
+        }
     }
 
     fn active_key(&self) -> &[u8] {
@@ -387,6 +455,14 @@ impl Device {
     fn fail(&mut self, e: CoreError, now: Instant, rng: &mut impl RngCore) {
         self.events.push_back(Event::ProtocolError(e));
         self.disconnect(now, rng);
+    }
+}
+
+/// The earlier of two optional deadlines (`None` acts as "no deadline").
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+        (a, b) => a.or(b),
     }
 }
 
@@ -432,7 +508,18 @@ mod tests {
             local_key: KEY,
             auto_reconnect,
             backoff,
+            heartbeat: None,
+            idle_timeout: None,
         }
+    }
+
+    /// Connect a legacy device and drain the `Ready` event, returning it ready.
+    fn connected(cfg: Config, rng: &mut impl RngCore) -> Device {
+        let mut dev = Device::new(cfg);
+        dev.handle_input(Input::Connected, T0, rng);
+        while dev.poll_event().is_some() {}
+        while dev.poll_transmit().is_some() {}
+        dev
     }
 
     fn zero_backoff() -> Backoff {
@@ -692,5 +779,77 @@ mod tests {
         // Exactly at the deadline it fires.
         dev.handle_timeout(deadline, &mut rng);
         assert!(dev.wants_connect());
+    }
+
+    // -- heartbeat / idle liveness (P4/P5) -----------------------------------
+
+    fn cfg_live(heartbeat: Option<Duration>, idle_timeout: Option<Duration>) -> Config {
+        Config { heartbeat, idle_timeout, ..cfg(Version::V3_3) }
+    }
+
+    /// A valid inbound data frame (retcode(4) || json), as a device would send.
+    fn inbound_data_frame() -> Vec<u8> {
+        let mut body = vec![0u8; 4]; // retcode 0
+        body.extend_from_slice(br#"{"dps":{"1":true}}"#);
+        message::encode_message(Version::V3_3, CommandType::DpQuery as u32, 9, &body, &KEY, &[0u8; 12]).unwrap()
+    }
+
+    #[test]
+    fn heartbeat_fires_and_rearms() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg_live(Some(Duration::from_secs(10)), None), &mut rng);
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(10_000)));
+
+        // At the deadline: a HeartBeat frame goes out and the timer re-arms +10s.
+        dev.handle_timeout(Instant::from_millis(10_000), &mut rng);
+        let wire = dev.poll_transmit().expect("heartbeat frame");
+        let msg = decode_message(Version::V3_3, &wire, &KEY, false).unwrap();
+        assert_eq!(msg.cmd, CommandType::HeartBeat as u32);
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(20_000)));
+        assert!(dev.is_connected(), "heartbeat keeps the connection");
+    }
+
+    #[test]
+    fn idle_timeout_declares_dead_and_reconnects() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg_live(None, Some(Duration::from_secs(30))), &mut rng);
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(30_000)));
+
+        // Silence past the idle deadline: the FSM declares the peer dead — the
+        // silent-drop fix (P5). Disconnected surfaces immediately, backoff arms.
+        dev.handle_timeout(Instant::from_millis(30_000), &mut rng);
+        assert!(!dev.is_connected());
+        assert_eq!(drain_events(&mut dev), vec![Event::Disconnected]);
+        assert!(dev.poll_timeout().is_some(), "dropped into backoff (auto_reconnect)");
+    }
+
+    #[test]
+    fn inbound_frame_pushes_idle_deadline_forward() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg_live(None, Some(Duration::from_secs(30))), &mut rng);
+        // A frame arrives at t=20s → idle resets to 20+30 = 50s (peer is alive).
+        let frame = inbound_data_frame();
+        dev.handle_input(Input::Received(&frame), Instant::from_millis(20_000), &mut rng);
+        let _ = drain_events(&mut dev);
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(50_000)));
+        // Firing at the *old* 30s deadline is now a no-op — still connected.
+        dev.handle_timeout(Instant::from_millis(30_000), &mut rng);
+        assert!(dev.is_connected());
+    }
+
+    #[test]
+    fn poll_timeout_is_the_earliest_of_heartbeat_and_idle() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(
+            cfg_live(Some(Duration::from_secs(10)), Some(Duration::from_secs(30))),
+            &mut rng,
+        );
+        // min(heartbeat 10s, idle 30s) = 10s.
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(10_000)));
+        // After the heartbeat fires (and re-arms to 20s), idle (30s) is still the
+        // farther one, so the next deadline is the re-armed heartbeat.
+        dev.handle_timeout(Instant::from_millis(10_000), &mut rng);
+        let _ = dev.poll_transmit();
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(20_000)));
     }
 }
