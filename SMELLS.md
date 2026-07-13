@@ -56,14 +56,14 @@ The 0.3 `scanner.rs` is tinytuya-derived and singleton-heavy. Rewritten as a pur
 | Q1 | **Process-wide `OnceLock<Scanner>` singleton** + replace-on-stop `CancellationToken`/`startup_guard` machinery | `scanner.rs` `GLOBAL_SCANNER` | **Gone.** `Discovery` is an owned, single-instance FSM; no global mutable state, no cancel-token lifecycle. |
 | Q2 | **UDP keys as undocumented literal bytes** (md5 provenance lost) | `scanner.rs:53-60` | `UDP_KEY_V35` documented as `md5("yGAdlopoPVldABfn")` and **pinned by a test**; `UDP_KEY_V33` noted as a plain-ASCII (non-md5) key. |
 | Q3 | **Open-ended brute-force decode** (every key × retcode × ECB-fallback × find-first-`{`) | `scanner.rs:1225-1308` | Replaced with a **structured, bounded** decode (6699/GCM → 55AA plaintext / ECB with optional version-header strip). Like dev22 it is an explicit, documented decision — validated against self-crafted packets, **not** claimed authoritative. |
+| Q4 | **Blocking sleeps / tokio `interval`** for broadcast cadence | `scanner.rs` `perform_discovery_loop` | **Resolved.** Broadcast cadence is `poll_timeout`/`handle_timeout`; `broadcast_interval` + `broadcast_burst` are injected policy (no hardcoded 6 s / 3-count). `StartScan`/`StopScan` inputs drive it; recv-error backoff is a driver concern. |
+| Q5 | **Port→behavior coupling by scattered `== 7000`** literals | `scanner.rs:809/829/841` | **Resolved.** A typed `Probe { port, Dialect::{Legacy, V35} }` descriptor table (`DEFAULT_PROBES`) drives frame kind / cmd / key — data-driven like `version::Profile`. |
 
-**Pending** (Discovery FSM v2 — active probing):
+**Pending**:
 
 | # | 0.3 smell | Where (0.3) | The question to settle |
 |---|-----------|-------------|------------------------|
-| Q4 | **Blocking sleeps / tokio `interval`** for broadcast cadence + recv-error backoff | `scanner.rs` `perform_discovery_loop` | Move to `poll_timeout`/`handle_timeout`; broadcast interval + max-count become injected policy (no hardcoded 6 s), like the Device backoff. |
-| Q5 | **Port→behavior coupling by scattered `== 7000`** literals | `scanner.rs:809/829/841` | Replace with a typed per-port descriptor (frame kind, cmd, key) — data-driven like `version::Profile`. |
-| Q6 | **`discover_local_ip_blocking` + `0.0.0.0` fallback** stamped into v3.5 probe | `scanner.rs:762-805` | Source-IP selection is a **driver** concern; the core emits the probe, the driver fills/binds the egress IP. |
+| Q6 | **`discover_local_ip_blocking` + `0.0.0.0` fallback** stamped into v3.5 probe | `scanner.rs:762-805` | Source-IP selection is a **driver** concern; the core takes `Config::local_ip` (`None` → documented `0.0.0.0` degrade) and the driver fills/binds the egress IP. Core half done; driver-side auto-detection pending the tokio driver. |
 
 ## Notes
 

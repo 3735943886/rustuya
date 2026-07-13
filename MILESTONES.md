@@ -250,7 +250,7 @@ runs with tokio absent from the dependency tree; same core, same oracle.
 > broadcast.
 
 - [x] **M2.1** Model the discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`); packet decode (6699/GCM + 55AA plaintext/ECB) + TTL cache/dedup moved into the core. *v1, passive receive only — `discovery.rs`.* (Renamed from `scanner`; singleton dropped — SMELLS Q1–Q3.)
-- [ ] **M2.2** Broadcast scheduling + cooldowns as timer actions; payload/port selection (incl. v3.5 source-IP / `set_discovery_sources`) as pure output.
+- [x] **M2.2** Broadcast scheduling as timer actions (`StartScan`/`StopScan` + `poll_timeout`/`handle_timeout`, injected interval/burst); payload/port selection as pure output via a typed `Probe`/`Dialect` table (SMELLS Q4/Q5). v3.5 source-IP is `Config::local_ip` (driver fills it — Q6). *v2, `discovery.rs`.* Scan-start cooldown/throttle stays a driver policy (when to send `StartScan`).
 - [ ] **M2.3** Tokio driver owns UDP bind / `SO_BROADCAST` / send-recv; passive listener + active scan re-expressed as driver loops feeding the FSM.
 - [ ] **M2.4** Discovery cache / watch-channel semantics preserved (no lost wakeups — cf. concurrency rules).
 - [ ] **M2.5** Parity of discovery behavior against 0.3 (unit + any mock discovery coverage).

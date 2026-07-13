@@ -20,10 +20,12 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::net::IpAddr;
+use core::net::{IpAddr, Ipv4Addr};
+use rand_core::RngCore;
 
+use crate::command::CommandType;
 use crate::crypto::TuyaCipher;
-use crate::frame::{peek_header, unpack_55aa, unpack_6699, Integrity, PREFIX_55AA, PREFIX_6699};
+use crate::frame::{pack_55aa, pack_6699, peek_header, unpack_55aa, unpack_6699, Integrity, PREFIX_55AA, PREFIX_6699};
 use crate::json;
 use crate::time::{Duration, Instant};
 use crate::version::Version;
@@ -37,6 +39,30 @@ const UDP_KEY_V35: [u8; 16] = [
 
 /// The v3.3 UDP discovery key — a plain ASCII key, **not** md5-derived.
 const UDP_KEY_V33: &[u8; 16] = b"yG9shRKIBrIBUjc3";
+
+/// Which wire dialect an active probe uses on a given port (SMELLS Q5: a typed
+/// descriptor replacing the 0.3 scattered `== 7000` literals).
+#[derive(Debug, Clone, Copy)]
+enum Dialect {
+    /// 55AA / CRC, cmd `UdpNew`, plaintext payload — v3.1/3.3 ports (6666/6667).
+    Legacy,
+    /// 6699 / GCM under the v3.5 UDP key, cmd `ReqDevInfo` — v3.5 port (7000).
+    V35,
+}
+
+/// One probe target: a broadcast port and the dialect to speak on it.
+#[derive(Debug, Clone, Copy)]
+struct Probe {
+    port: u16,
+    dialect: Dialect,
+}
+
+/// The standard Tuya discovery ports and their dialects.
+const DEFAULT_PROBES: &[Probe] = &[
+    Probe { port: 6666, dialect: Dialect::Legacy },
+    Probe { port: 6667, dialect: Dialect::Legacy },
+    Probe { port: 7000, dialect: Dialect::V35 },
+];
 
 /// A device that announced itself on the LAN.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +81,12 @@ pub struct DeviceInfo {
 pub enum Input<'a> {
     /// One UDP datagram the driver read, with its source address.
     Datagram { data: &'a [u8], from: IpAddr },
+    /// Begin (or restart) active broadcast probing: the FSM arms an immediate
+    /// broadcast, then re-broadcasts every `broadcast_interval` until the burst
+    /// (`broadcast_burst`) is exhausted — or forever if it is `None`.
+    StartScan,
+    /// Stop active probing; passive receive continues.
+    StopScan,
 }
 
 /// An event drained by the driver.
@@ -69,6 +101,16 @@ pub struct Config {
     /// How long a cached device is remembered before a re-announcement counts as
     /// "new" again.
     pub cache_ttl: Duration,
+    /// Delay between active broadcast rounds (SMELLS Q4: injected, not a
+    /// hardcoded 6 s).
+    pub broadcast_interval: Duration,
+    /// How many broadcast rounds one `StartScan` fires. `None` = broadcast
+    /// perpetually (a long-lived controller); `Some(n)` = a bounded scan.
+    pub broadcast_burst: Option<u32>,
+    /// Local IPv4 stamped into the v3.5 probe so the device knows where to reply.
+    /// Selecting it is the driver's job (SMELLS Q6); `None` degrades to
+    /// `0.0.0.0`, which some firmware ignores.
+    pub local_ip: Option<Ipv4Addr>,
 }
 
 struct CacheEntry {
@@ -89,24 +131,74 @@ pub struct Discovery {
     cfg: Config,
     cache: BTreeMap<String, CacheEntry>,
     events: VecDeque<Event>,
+    /// Outbound probe packets: (bytes, destination port). The driver sends each
+    /// to the local broadcast address on that port.
+    tx: VecDeque<(Vec<u8>, u16)>,
+    /// When the next active broadcast round is due (`None` = not scanning).
+    next_broadcast: Option<Instant>,
+    /// Broadcast rounds still to fire in the current burst (`None` = perpetual).
+    bursts_left: Option<u32>,
 }
 
 impl Discovery {
     #[must_use]
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, cache: BTreeMap::new(), events: VecDeque::new() }
+        Self {
+            cfg,
+            cache: BTreeMap::new(),
+            events: VecDeque::new(),
+            tx: VecDeque::new(),
+            next_broadcast: None,
+            bursts_left: None,
+        }
     }
 
-    /// Feeds one input; queues a [`Event::Found`] for a new/changed device.
-    pub fn handle_input(&mut self, input: Input<'_>, now: Instant) {
+    /// Feeds one input. `rng` supplies the fresh GCM IV for v3.5 probes; passive
+    /// receive uses none but the signature is uniform.
+    pub fn handle_input(&mut self, input: Input<'_>, now: Instant, rng: &mut impl RngCore) {
         match input {
             Input::Datagram { data, from: _ } => self.on_datagram(data, now),
+            Input::StartScan => self.on_start_scan(now, rng),
+            Input::StopScan => {
+                self.next_broadcast = None;
+                self.bursts_left = None;
+            }
+        }
+    }
+
+    /// Fires the broadcast timer: if a round is due, queue a probe per port and
+    /// schedule (or end) the next round.
+    pub fn handle_timeout(&mut self, now: Instant, rng: &mut impl RngCore) {
+        if let Some(next) = self.next_broadcast
+            && now >= next
+        {
+            self.emit_probes(rng);
+            let more = match self.bursts_left.as_mut() {
+                None => true, // perpetual
+                Some(n) => {
+                    *n = n.saturating_sub(1);
+                    *n > 0
+                }
+            };
+            self.next_broadcast = more.then(|| now.saturating_add(self.cfg.broadcast_interval));
         }
     }
 
     /// Events for the driver/caller (drain to `None`).
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+
+    /// Outbound probe packets as `(bytes, port)` (drain to `None`). The driver
+    /// sends each to the broadcast address on that port.
+    pub fn poll_transmit(&mut self) -> Option<(Vec<u8>, u16)> {
+        self.tx.pop_front()
+    }
+
+    /// The next broadcast deadline the driver should arm a timer for (D2).
+    #[must_use]
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        self.next_broadcast
     }
 
     /// Number of devices currently remembered (for diagnostics/tests).
@@ -116,6 +208,40 @@ impl Discovery {
     }
 
     // -- internals -----------------------------------------------------------
+
+    fn on_start_scan(&mut self, now: Instant, _rng: &mut impl RngCore) {
+        // A zero-count burst would scan nothing; treat it as "don't start".
+        if self.cfg.broadcast_burst == Some(0) {
+            return;
+        }
+        self.bursts_left = self.cfg.broadcast_burst;
+        self.next_broadcast = Some(now); // first round is immediate
+    }
+
+    fn emit_probes(&mut self, rng: &mut impl RngCore) {
+        for probe in DEFAULT_PROBES {
+            if let Some(pkt) = self.build_probe(probe, rng) {
+                self.tx.push_back(pkt);
+            }
+        }
+    }
+
+    fn build_probe(&self, probe: &Probe, rng: &mut impl RngCore) -> Option<(Vec<u8>, u16)> {
+        let bytes = match probe.dialect {
+            Dialect::Legacy => {
+                // seqno 0, plaintext + CRC (no key).
+                pack_55aa(0, CommandType::UdpNew as u32, br#"{"gwId":"","devId":""}"#, Integrity::Crc32)
+            }
+            Dialect::V35 => {
+                let ip = self.cfg.local_ip.map_or_else(|| "0.0.0.0".to_string(), |i| i.to_string());
+                let payload = alloc::format!(r#"{{"from":"app","ip":"{ip}"}}"#).into_bytes();
+                let mut iv = [0u8; 12];
+                rng.fill_bytes(&mut iv);
+                pack_6699(0, CommandType::ReqDevInfo as u32, &payload, &UDP_KEY_V35, &iv).ok()?
+            }
+        };
+        Some((bytes, probe.port))
+    }
 
     fn on_datagram(&mut self, data: &[u8], now: Instant) {
         // Undecodable packets (noise, unknown dialects) are silently ignored —
@@ -229,11 +355,32 @@ mod tests {
     use crate::frame::{pack_55aa, pack_6699};
     use alloc::vec;
 
-    const IP: IpAddr = IpAddr::V4(core::net::Ipv4Addr::new(192, 168, 0, 42));
+    const IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 42));
     const TTL: Duration = Duration::from_secs(60);
 
+    struct SeededRng(u64);
+    impl RngCore for SeededRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32())
+        }
+        fn fill_bytes(&mut self, dst: &mut [u8]) {
+            for b in dst.iter_mut() {
+                *b = self.next_u32() as u8;
+            }
+        }
+    }
+
     fn disco() -> Discovery {
-        Discovery::new(Config { cache_ttl: TTL })
+        Discovery::new(Config {
+            cache_ttl: TTL,
+            broadcast_interval: Duration::from_secs(6),
+            broadcast_burst: Some(3),
+            local_ip: Some(Ipv4Addr::new(192, 168, 0, 100)),
+        })
     }
 
     fn json_bytes(id: &str, ip: &str, version: &str) -> Vec<u8> {
@@ -280,28 +427,31 @@ mod tests {
     #[test]
     fn found_emitted_once_then_deduped() {
         let mut d = disco();
+        let mut rng = SeededRng(1);
         let pkt = packet_6699("dev1", "192.168.0.42");
         let now = Instant::from_millis(0);
 
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, now);
+        d.handle_input(Input::Datagram { data: &pkt, from: IP }, now, &mut rng);
         assert!(matches!(d.poll_event(), Some(Event::Found(i)) if i.id == "dev1"));
         assert_eq!(d.cached(), 1);
 
         // Same device, unchanged: no second Found.
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, now + Duration::from_secs(1));
+        d.handle_input(Input::Datagram { data: &pkt, from: IP }, now + Duration::from_secs(1), &mut rng);
         assert!(d.poll_event().is_none());
     }
 
     #[test]
     fn change_in_ip_re_emits() {
         let mut d = disco();
+        let mut rng = SeededRng(1);
         let now = Instant::from_millis(0);
-        d.handle_input(Input::Datagram { data: &packet_6699("dev1", "192.168.0.10"), from: IP }, now);
+        d.handle_input(Input::Datagram { data: &packet_6699("dev1", "192.168.0.10"), from: IP }, now, &mut rng);
         let _ = d.poll_event();
         // Same id, different ip → a fresh Found.
         d.handle_input(
             Input::Datagram { data: &packet_6699("dev1", "192.168.0.11"), from: IP },
             now + Duration::from_secs(1),
+            &mut rng,
         );
         assert!(matches!(d.poll_event(), Some(Event::Found(i)) if i.ip == "192.168.0.11".parse::<IpAddr>().unwrap()));
     }
@@ -309,22 +459,142 @@ mod tests {
     #[test]
     fn re_announcement_after_ttl_is_fresh_again() {
         let mut d = disco();
+        let mut rng = SeededRng(1);
         let pkt = packet_6699("dev1", "192.168.0.42");
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, Instant::from_millis(0));
+        d.handle_input(Input::Datagram { data: &pkt, from: IP }, Instant::from_millis(0), &mut rng);
         let _ = d.poll_event();
         // Past the TTL: the entry is evicted, so the same packet is "new" again.
         let later = Instant::from_millis(0) + TTL + Duration::from_secs(1);
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, later);
+        d.handle_input(Input::Datagram { data: &pkt, from: IP }, later, &mut rng);
         assert!(matches!(d.poll_event(), Some(Event::Found(_))));
     }
 
     #[test]
     fn garbage_and_malformed_are_ignored() {
         let mut d = disco();
+        let mut rng = SeededRng(1);
         let now = Instant::from_millis(0);
-        d.handle_input(Input::Datagram { data: &[0, 1, 2, 3], from: IP }, now);
-        d.handle_input(Input::Datagram { data: &vec![0xff; 40], from: IP }, now);
+        d.handle_input(Input::Datagram { data: &[0, 1, 2, 3], from: IP }, now, &mut rng);
+        d.handle_input(Input::Datagram { data: &vec![0xff; 40], from: IP }, now, &mut rng);
         assert!(d.poll_event().is_none());
         assert_eq!(d.cached(), 0);
+    }
+
+    // -- active broadcast (v2) ----------------------------------------------
+
+    /// Drain all queued probe packets, returning (port, decoded DeviceInfo-ok?).
+    fn drain_probes(d: &mut Discovery) -> Vec<u16> {
+        let mut ports = Vec::new();
+        while let Some((_, port)) = d.poll_transmit() {
+            ports.push(port);
+        }
+        ports
+    }
+
+    #[test]
+    fn start_scan_broadcasts_all_ports_immediately() {
+        let mut d = disco();
+        let mut rng = SeededRng(7);
+        let t0 = Instant::from_millis(0);
+        d.handle_input(Input::StartScan, t0, &mut rng);
+        // First round is due now.
+        assert_eq!(d.poll_timeout(), Some(t0));
+        d.handle_timeout(t0, &mut rng);
+        assert_eq!(drain_probes(&mut d), vec![6666, 6667, 7000]);
+    }
+
+    #[test]
+    fn probes_are_valid_frames_the_decoder_accepts_shape() {
+        // The v3.5 (7000) probe must be a well-formed 6699 frame under the UDP
+        // key — i.e. it round-trips through unpack_6699.
+        let mut d = disco();
+        let mut rng = SeededRng(7);
+        d.handle_input(Input::StartScan, Instant::from_millis(0), &mut rng);
+        d.handle_timeout(Instant::from_millis(0), &mut rng);
+        while let Some((bytes, port)) = d.poll_transmit() {
+            if port == 7000 {
+                let f = unpack_6699(&bytes, &UDP_KEY_V35).unwrap();
+                assert!(looks_like_json(&f.body), "v3.5 probe carries JSON: {:?}", f.body);
+            } else {
+                assert!(unpack_55aa(&bytes, Integrity::Crc32).is_ok(), "legacy probe is 55AA/CRC");
+            }
+        }
+    }
+
+    #[test]
+    fn burst_stops_after_configured_rounds() {
+        let mut d = disco(); // broadcast_burst = Some(3), interval 6 s
+        let mut rng = SeededRng(7);
+        let mut t = Instant::from_millis(0);
+        d.handle_input(Input::StartScan, t, &mut rng);
+        for round in 0..3 {
+            assert_eq!(d.poll_timeout(), Some(t), "round {round} due");
+            d.handle_timeout(t, &mut rng);
+            assert_eq!(drain_probes(&mut d).len(), 3, "round {round} hits 3 ports");
+            t = t + Duration::from_secs(6);
+        }
+        // After 3 rounds the burst is spent: no further deadline, firing is inert.
+        assert_eq!(d.poll_timeout(), None);
+        d.handle_timeout(t, &mut rng);
+        assert!(d.poll_transmit().is_none());
+    }
+
+    #[test]
+    fn perpetual_burst_never_stops() {
+        let mut d = Discovery::new(Config {
+            cache_ttl: TTL,
+            broadcast_interval: Duration::from_secs(6),
+            broadcast_burst: None, // perpetual
+            local_ip: None,
+        });
+        let mut rng = SeededRng(7);
+        let mut t = Instant::from_millis(0);
+        d.handle_input(Input::StartScan, t, &mut rng);
+        for _ in 0..10 {
+            d.handle_timeout(t, &mut rng);
+            let _ = drain_probes(&mut d);
+            let next = d.poll_timeout().expect("still scanning");
+            assert_eq!(next, t + Duration::from_secs(6));
+            t = next;
+        }
+    }
+
+    #[test]
+    fn stop_scan_clears_the_schedule() {
+        let mut d = disco();
+        let mut rng = SeededRng(7);
+        d.handle_input(Input::StartScan, Instant::from_millis(0), &mut rng);
+        d.handle_input(Input::StopScan, Instant::from_millis(0), &mut rng);
+        assert_eq!(d.poll_timeout(), None);
+        d.handle_timeout(Instant::from_millis(0), &mut rng);
+        assert!(d.poll_transmit().is_none());
+    }
+
+    #[test]
+    fn v35_probe_ivs_are_unique_across_rounds() {
+        let mut d = Discovery::new(Config {
+            cache_ttl: TTL,
+            broadcast_interval: Duration::from_secs(6),
+            broadcast_burst: None,
+            local_ip: Some(Ipv4Addr::new(10, 0, 0, 5)),
+        });
+        let mut rng = SeededRng(7);
+        let mut ivs = Vec::new();
+        let mut t = Instant::from_millis(0);
+        d.handle_input(Input::StartScan, t, &mut rng);
+        for _ in 0..5 {
+            d.handle_timeout(t, &mut rng);
+            while let Some((bytes, port)) = d.poll_transmit() {
+                if port == 7000 {
+                    ivs.push(bytes[18..30].to_vec()); // 6699 IV
+                }
+            }
+            t = d.poll_timeout().unwrap();
+        }
+        for i in 0..ivs.len() {
+            for j in (i + 1)..ivs.len() {
+                assert_ne!(ivs[i], ivs[j], "probe IV reuse ({i},{j})");
+            }
+        }
     }
 }
