@@ -214,10 +214,10 @@ byte-for-byte behavior-identical under the existing oracles.
 > Extract the connection/handshake/reconnect lifecycle as `step()`. The tokio
 > actor becomes a translator (`DevAction` ↔ tokio TCP/timer).
 
-- [ ] **M1.1** Model the FSM: states (Connecting → Handshaking → Connected → Backoff → …) + `DevEvent`/`DevAction` as above.
-- [ ] **M1.2** Port the session-key negotiation (already near-pure: prepare/verify/finalize) into the FSM.
-- [ ] **M1.3** Port backoff + jitter as `StartTimer(Backoff, dur)` actions; decouple the `wait_for_backoff` sleep-vs-scanner-rediscovery `select` into `TimerFired` vs `DiscoveryUpdated` events.
-- [ ] **M1.4** Port heartbeat + idle-timeout as timer events; port dev22 fallback decisions (largely already in `decision.rs`).
+- [x] **M1.1** Model the FSM: states (Connecting → Handshaking → Connected → Backoff → …) + `Input`/`Event` (poll-split). *v2, `device.rs`.*
+- [x] **M1.2** Port the session-key negotiation (prepare/verify/finalize) into the FSM. *v1, `session.rs` + `device.rs`.*
+- [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout` deadline (SMELLS P1/P2/P6). Discovery-wake half (`DiscoveryUpdated`) deferred to the discovery increment — in poll-split it's a driver `select!` arm, not core `select`. *v2, `device.rs` + `time.rs`.*
+- [ ] **M1.4** Port heartbeat + idle-timeout as timer events (a 2nd `poll_timeout` source; SMELLS P4/P5); port dev22 fallback decisions (largely already in `decision.rs`).
 - [ ] **M1.5** Rewrite the tokio actor as a thin driver over the FSM. `persist` / `nowait` / `connect_now` semantics preserved.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
 - [ ] **M1.7** `tuyamock` E2E unchanged and green (the regression gate for this extraction).

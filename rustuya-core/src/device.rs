@@ -1,14 +1,26 @@
-//! Connection-lifecycle state machine — **v1: happy path only**.
+//! Connection-lifecycle state machine — **v2: reconnect / backoff timers**.
 //!
 //! Sans-I/O (poll-split, design D1): the driver pumps bytes/commands in via
-//! [`Device::handle`] and drains work out via [`Device::poll_transmit`] /
-//! [`Device::poll_event`]. No I/O, no timers, no randomness of its own — the
-//! RNG is injected (handshake nonce, per-message GCM IV).
+//! [`Device::handle_input`], fires the single armed timer via
+//! [`Device::handle_timeout`], and drains work out via [`Device::poll_transmit`]
+//! / [`Device::poll_event`]. The next deadline is exposed as **one** value via
+//! [`Device::poll_timeout`] (D2). No I/O, no clock, no randomness of its own —
+//! the driver injects `now` (D3) and the RNG (handshake nonce, per-message IV).
 //!
-//! v1 covers: connect → (v3.4/v3.5 session handshake) → connected → request /
-//! response. Backoff/reconnect/heartbeat/idle timers and the discovery-wake
-//! input come in later increments (SMELLS.md P1–P6) — deliberately excluded so
-//! this stays a small, fully-tested skeleton.
+//! The reconnect loop is a pure state cycle:
+//! `Connecting → (handshake) → Connected → Backoff → Connecting → …`. The driver
+//! dials whenever [`Device::wants_connect`] is true and reports the outcome as
+//! [`Input::Connected`] or [`Input::ConnectFailed`]; the *whether* and the *when*
+//! (backoff delay) are the core's policy, testable at zero wall-clock.
+//!
+//! Smells confronted here (SMELLS.md): **P1** — no 16 s hard floor; the backoff
+//! curve is [`Backoff`] policy the driver injects, and tests set it to zero.
+//! **P2** — jitter is drawn from the injected RNG, not an internal `rand::rng()`.
+//! **P6** — persist / non-persist collapse into one path: [`Config::auto_reconnect`]
+//! decides *whether* to retry; the delay policy is single and identical.
+//!
+//! Still deferred to later increments: heartbeat / idle timers (P4/P5) and the
+//! `DiscoveryUpdated` wake input (P3).
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -19,8 +31,40 @@ use crate::command::{self, CommandType};
 use crate::json::{self, Value};
 use crate::message::{self, Message};
 use crate::session::Handshake;
+use crate::time::{Duration, Instant};
 use crate::version::{DeviceType, Version};
 use crate::CoreError;
+
+/// Exponential-backoff policy for reconnect attempts (SMELLS.md P1/P2).
+///
+/// Delay for attempt `n` (0-based) is `min(base * 2^n, max)` plus a random
+/// `[0, jitter)` drawn from the injected RNG. There is **no** hard floor — a
+/// driver may pass `base = ZERO` for immediate retry, and tests do exactly that
+/// to run the whole reconnect path at zero wall-clock.
+#[derive(Debug, Clone, Copy)]
+pub struct Backoff {
+    /// Delay before the first retry (attempt 0).
+    pub base: Duration,
+    /// Upper bound on the exponential term (before jitter).
+    pub max: Duration,
+    /// Extra uniform random delay in `[0, jitter)`, from the injected RNG.
+    pub jitter: Duration,
+}
+
+impl Backoff {
+    /// The delay for a given 0-based attempt number.
+    fn delay(&self, attempt: u32, rng: &mut impl RngCore) -> Duration {
+        // 2^attempt, saturating: attempt >= 64 (never realistic) pins to u64::MAX,
+        // then `base * factor` saturates and is capped by `max` anyway.
+        let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+        let capped = self.base.saturating_mul(factor).min(self.max);
+        let jitter = match self.jitter.as_millis() {
+            0 => 0,
+            j => rng.next_u64() % j,
+        };
+        Duration::from_millis(capped.as_millis().saturating_add(jitter))
+    }
+}
 
 /// Static configuration for one device.
 pub struct Config {
@@ -28,12 +72,20 @@ pub struct Config {
     pub dev_type: DeviceType,
     pub device_id: String,
     pub local_key: [u8; 16],
+    /// Whether a dropped / failed connection re-arms a backoff timer (`true`) or
+    /// drops to a terminal closed state (`false`). Unifies the 0.3
+    /// persist-vs-nowait split into one policy knob (SMELLS.md P6).
+    pub auto_reconnect: bool,
+    /// Backoff curve used when `auto_reconnect` is set.
+    pub backoff: Backoff,
 }
 
 /// An input pushed into the state machine by the driver.
 pub enum Input<'a> {
     /// The driver established the TCP connection.
     Connected,
+    /// The driver failed to open the TCP connection (arms backoff).
+    ConnectFailed,
     /// The driver read these bytes from the socket (one whole frame).
     Received(&'a [u8]),
     /// The caller wants to send a command; `t` is the wall-clock timestamp
@@ -54,7 +106,8 @@ pub enum Event {
     Ready,
     /// A decoded inbound message (a response or an unsolicited push).
     Response(Message),
-    /// The connection is gone.
+    /// A live connection was lost (only emitted when leaving a connected state,
+    /// not on each failed retry).
     Disconnected,
     /// A protocol-level error occurred while processing input.
     ProtocolError(CoreError),
@@ -62,9 +115,15 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    Idle,
+    /// The driver should dial; awaiting `Connected` / `ConnectFailed`.
+    Connecting,
+    /// v3.4/v3.5 session-key negotiation in flight.
     Handshaking,
+    /// Ready for commands.
     Connected,
+    /// Waiting out a reconnect delay; `deadline` holds when to redial.
+    Backoff,
+    /// Terminal: disconnected with `auto_reconnect = false`.
     Closed,
 }
 
@@ -75,31 +134,54 @@ pub struct Device {
     session_key: Option<Vec<u8>>,
     handshake: Option<Handshake>,
     seqno: u32,
+    /// Consecutive failed/lost connections; reset to 0 on reaching `Connected`.
+    attempt: u32,
+    /// When to redial while in `Backoff` (the sole `poll_timeout` source in v2).
+    deadline: Option<Instant>,
     tx: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
 }
 
 impl Device {
+    /// A new device that begins wanting to connect (`wants_connect() == true`).
     #[must_use]
     pub fn new(cfg: Config) -> Self {
         Self {
             cfg,
-            state: State::Idle,
+            state: State::Connecting,
             session_key: None,
             handshake: None,
             seqno: 1,
+            attempt: 0,
+            deadline: None,
             tx: VecDeque::new(),
             events: VecDeque::new(),
         }
     }
 
     /// Feeds one input into the machine, queuing any resulting transmits/events.
-    pub fn handle(&mut self, input: Input<'_>, rng: &mut impl RngCore) {
+    /// `now` is the driver's monotonic clock; the core never reads a clock itself.
+    pub fn handle_input(&mut self, input: Input<'_>, now: Instant, rng: &mut impl RngCore) {
         match input {
-            Input::Connected => self.on_connected(rng),
-            Input::Received(data) => self.on_received(data, rng),
+            Input::Connected => self.on_connected(now, rng),
+            Input::ConnectFailed => self.on_connect_failed(now, rng),
+            Input::Received(data) => self.on_received(data, now, rng),
             Input::Send { cmd, data, t } => self.on_send(cmd, data, t, rng),
-            Input::Closed => self.on_closed(),
+            Input::Closed => self.on_closed(now, rng),
+        }
+    }
+
+    /// Fires the single armed timer. In v2 that is only the backoff deadline: if
+    /// it has elapsed, the machine returns to `Connecting` so the driver redials.
+    /// `_rng` is part of the D1 interface for timer-driven sends (heartbeat, a
+    /// later increment) and is unused while only backoff is timed.
+    pub fn handle_timeout(&mut self, now: Instant, _rng: &mut impl RngCore) {
+        if self.state == State::Backoff
+            && let Some(deadline) = self.deadline
+            && now >= deadline
+        {
+            self.deadline = None;
+            self.state = State::Connecting;
         }
     }
 
@@ -113,6 +195,24 @@ impl Device {
         self.events.pop_front()
     }
 
+    /// The single next deadline the driver should arm a timer for (D2). `None`
+    /// means "no timer" — currently non-`None` only while backing off.
+    #[must_use]
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        match self.state {
+            State::Backoff => self.deadline,
+            _ => None,
+        }
+    }
+
+    /// Whether the driver should (re)dial a socket. Level-triggered: true exactly
+    /// while in `Connecting`, so the driver dials once and the result
+    /// (`Connected` / `ConnectFailed`) moves the machine on.
+    #[must_use]
+    pub fn wants_connect(&self) -> bool {
+        self.state == State::Connecting
+    }
+
     /// Whether the device is connected and past any handshake.
     #[must_use]
     pub fn is_connected(&self) -> bool {
@@ -121,7 +221,10 @@ impl Device {
 
     // -- transitions ---------------------------------------------------------
 
-    fn on_connected(&mut self, rng: &mut impl RngCore) {
+    fn on_connected(&mut self, now: Instant, rng: &mut impl RngCore) {
+        if self.state != State::Connecting {
+            return; // stray Connected (e.g. during backoff) — ignore
+        }
         if self.cfg.version.profile().session_key {
             let mut nonce = [0u8; 16];
             rng.fill_bytes(&mut nonce);
@@ -133,17 +236,27 @@ impl Device {
                     self.handshake = Some(hs);
                     self.state = State::Handshaking;
                 }
-                Err(e) => self.fail(e),
+                // A failure here never emitted Disconnected (we were mid-connect),
+                // so route through the connect-failure path, not disconnect().
+                Err(e) => {
+                    self.events.push_back(Event::ProtocolError(e));
+                    self.arm_backoff(now, rng);
+                }
             }
         } else {
-            self.state = State::Connected;
-            self.events.push_back(Event::Ready);
+            self.reach_connected();
         }
     }
 
-    fn on_received(&mut self, data: &[u8], rng: &mut impl RngCore) {
+    fn on_connect_failed(&mut self, now: Instant, rng: &mut impl RngCore) {
+        if self.state == State::Connecting {
+            self.arm_backoff(now, rng);
+        }
+    }
+
+    fn on_received(&mut self, data: &[u8], now: Instant, rng: &mut impl RngCore) {
         match self.state {
-            State::Handshaking => self.on_handshake_response(data, rng),
+            State::Handshaking => self.on_handshake_response(data, now, rng),
             State::Connected => {
                 // Data responses carry a 4-byte retcode (S1: explicit, cmd-context
                 // driven — not byte-sniffed).
@@ -152,41 +265,39 @@ impl Device {
                     Err(e) => self.events.push_back(Event::ProtocolError(e)),
                 }
             }
-            State::Idle | State::Closed => {}
+            State::Connecting | State::Backoff | State::Closed => {}
         }
     }
 
-    fn on_handshake_response(&mut self, data: &[u8], rng: &mut impl RngCore) {
+    fn on_handshake_response(&mut self, data: &[u8], now: Instant, rng: &mut impl RngCore) {
         // The SessKeyNegResp payload is `remote_nonce(16) || HMAC(32)`, framed
-        // with the local key and (unlike data responses) no retcode prefix.
+        // with the local key and (unlike data responses) no retcode prefix. A
+        // failure at any step lost the negotiation, so disconnect (+ backoff).
         let key = self.cfg.local_key;
         let payload = match message::decode_message(self.cfg.version, data, &key, false) {
             Ok(m) => m.payload,
-            Err(e) => return self.fail(e),
+            Err(e) => return self.fail(e, now, rng),
         };
         let Some(hs) = self.handshake.take() else {
-            return self.fail(CoreError::NotConnected);
+            return self.fail(CoreError::NotConnected, now, rng);
         };
         let remote_nonce = match hs.verify_response(&payload, &key) {
             Ok(n) => n,
-            Err(e) => return self.fail(e),
+            Err(e) => return self.fail(e, now, rng),
         };
         let finished = match hs.finish(self.cfg.version, &remote_nonce, &key) {
             Ok(f) => f,
-            Err(e) => return self.fail(e),
+            Err(e) => return self.fail(e, now, rng),
         };
-        match self.encode(
-            CommandType::SessKeyNegFinish as u32,
-            &finished.finish_hmac,
-            &key,
-            rng,
-        ) {
+        // SessKeyNegFinish is framed with the local key (before the session key
+        // takes effect). For v3.5 this is a 6699/GCM frame, so it needs a fresh
+        // random IV from the injected RNG — never a fixed one (S3/P2).
+        match self.encode(CommandType::SessKeyNegFinish as u32, &finished.finish_hmac, &key, rng) {
             Ok(bytes) => self.tx.push_back(bytes),
-            Err(e) => return self.fail(e),
+            Err(e) => return self.fail(e, now, rng),
         }
         self.session_key = Some(finished.session_key);
-        self.state = State::Connected;
-        self.events.push_back(Event::Ready);
+        self.reach_connected();
     }
 
     fn on_send(&mut self, cmd: CommandType, data: Option<Value>, t: u64, rng: &mut impl RngCore) {
@@ -211,16 +322,47 @@ impl Device {
         }
     }
 
-    fn on_closed(&mut self) {
-        if self.state != State::Closed {
-            self.state = State::Closed;
-            self.session_key = None;
-            self.handshake = None;
-            self.events.push_back(Event::Disconnected);
+    fn on_closed(&mut self, now: Instant, rng: &mut impl RngCore) {
+        match self.state {
+            State::Handshaking | State::Connected => self.disconnect(now, rng),
+            // Aborted mid-dial: never was up, so no Disconnected event — just retry.
+            State::Connecting => self.arm_backoff(now, rng),
+            State::Backoff | State::Closed => {} // idempotent
         }
     }
 
     // -- helpers -------------------------------------------------------------
+
+    /// Leaving a live (Handshaking/Connected) state: surface Disconnected, clear
+    /// session state, and re-arm backoff (or go terminal).
+    fn disconnect(&mut self, now: Instant, rng: &mut impl RngCore) {
+        self.session_key = None;
+        self.handshake = None;
+        self.events.push_back(Event::Disconnected);
+        self.arm_backoff(now, rng);
+    }
+
+    /// Compute the next redial deadline (or go terminal if `!auto_reconnect`).
+    fn arm_backoff(&mut self, now: Instant, rng: &mut impl RngCore) {
+        self.session_key = None;
+        self.handshake = None;
+        if self.cfg.auto_reconnect {
+            let delay = self.cfg.backoff.delay(self.attempt, rng);
+            self.attempt = self.attempt.saturating_add(1);
+            self.deadline = Some(now.saturating_add(delay));
+            self.state = State::Backoff;
+        } else {
+            self.deadline = None;
+            self.state = State::Closed;
+        }
+    }
+
+    fn reach_connected(&mut self) {
+        self.state = State::Connected;
+        self.attempt = 0; // a good connection resets the backoff curve
+        self.deadline = None;
+        self.events.push_back(Event::Ready);
+    }
 
     fn active_key(&self) -> &[u8] {
         self.session_key.as_deref().unwrap_or(&self.cfg.local_key)
@@ -240,12 +382,11 @@ impl Device {
         message::encode_message(self.cfg.version, cmd, seqno, plaintext, key, &iv)
     }
 
-    fn fail(&mut self, e: CoreError) {
+    /// Protocol error on a live (handshaking/connected) path: surface it, then
+    /// disconnect and re-arm backoff with the injected `now`/`rng`.
+    fn fail(&mut self, e: CoreError, now: Instant, rng: &mut impl RngCore) {
         self.events.push_back(Event::ProtocolError(e));
-        self.state = State::Closed;
-        self.session_key = None;
-        self.handshake = None;
-        self.events.push_back(Event::Disconnected);
+        self.disconnect(now, rng);
     }
 }
 
@@ -260,6 +401,7 @@ mod tests {
 
     const KEY: [u8; 16] = *b"0123456789abcdef";
     const ID: &str = "01234567890123456789ab";
+    const T0: Instant = Instant::from_millis(0);
 
     // A tiny deterministic RngCore so tests don't need `rand`.
     struct SeededRng(u64);
@@ -279,11 +421,25 @@ mod tests {
     }
 
     fn cfg(version: Version) -> Config {
+        cfg_with(version, true, zero_backoff())
+    }
+
+    fn cfg_with(version: Version, auto_reconnect: bool, backoff: Backoff) -> Config {
         Config {
             version,
             dev_type: DeviceType::Default,
             device_id: ID.into(),
             local_key: KEY,
+            auto_reconnect,
+            backoff,
+        }
+    }
+
+    fn zero_backoff() -> Backoff {
+        Backoff {
+            base: Duration::ZERO,
+            max: Duration::ZERO,
+            jitter: Duration::ZERO,
         }
     }
 
@@ -295,70 +451,12 @@ mod tests {
         v
     }
 
-    #[test]
-    fn legacy_connect_is_ready_immediately() {
-        let mut rng = SeededRng(1);
-        let mut dev = Device::new(cfg(Version::V3_3));
-        dev.handle(Input::Connected, &mut rng);
-        assert!(dev.is_connected());
-        assert_eq!(drain_events(&mut dev), vec![Event::Ready]);
-        assert!(dev.poll_transmit().is_none()); // no handshake on the wire
-    }
-
-    #[test]
-    fn send_encodes_a_frame_that_decodes_back() {
-        let mut rng = SeededRng(2);
-        let mut dev = Device::new(cfg(Version::V3_3));
-        dev.handle(Input::Connected, &mut rng);
-        let _ = drain_events(&mut dev);
-
-        dev.handle(
-            Input::Send {
-                cmd: CommandType::Control,
-                data: Some(json::from_bytes(br#"{"1":true}"#).unwrap()),
-                t: 1_700_000_000,
-            },
-            &mut rng,
-        );
-        let wire = dev.poll_transmit().expect("a frame was queued");
-        let msg = decode_message(Version::V3_3, &wire, &KEY, false).unwrap();
-        assert_eq!(msg.cmd, CommandType::Control as u32);
-        // payload is the generated Control envelope (gwId dropped)
-        let v = json::from_bytes(&msg.payload).unwrap();
-        assert_eq!(v["dps"], json::from_bytes(br#"{"1":true}"#).unwrap());
-    }
-
-    #[test]
-    fn send_before_ready_errors() {
-        let mut rng = SeededRng(3);
-        let mut dev = Device::new(cfg(Version::V3_5));
-        dev.handle(
-            Input::Send {
-                cmd: CommandType::DpQuery,
-                data: None,
-                t: 1,
-            },
-            &mut rng,
-        );
-        assert_eq!(drain_events(&mut dev), vec![Event::ProtocolError(CoreError::NotConnected)]);
-    }
-
-    /// Drives a full v3.4/v3.5 handshake: read the SessKeyNegStart the FSM
-    /// emits to recover its nonce, craft the device's response, and confirm the
-    /// FSM reaches Connected with a working session key.
-    fn handshake_reaches_connected(version: Version) {
-        let mut rng = SeededRng(42);
-        let mut dev = Device::new(cfg(version));
-        dev.handle(Input::Connected, &mut rng);
-        assert!(!dev.is_connected(), "{version:?} handshaking, not yet ready");
-
-        // Recover local_nonce from the SessKeyNegStart the FSM sent.
+    /// Drives a v3.4/v3.5 handshake to Connected: recover the FSM's nonce from
+    /// the SessKeyNegStart it emitted, craft the device response, feed it back.
+    fn complete_handshake(dev: &mut Device, version: Version, rng: &mut impl RngCore) {
         let start = dev.poll_transmit().expect("SessKeyNegStart");
         let start_msg = decode_message(version, &start, &KEY, false).unwrap();
-        assert_eq!(start_msg.cmd, CommandType::SessKeyNegStart as u32);
         let local_nonce = start_msg.payload;
-
-        // Craft SessKeyNegResp: remote_nonce(16) || HMAC(local_key, local_nonce).
         let remote_nonce = [7u8; 16];
         let mut mac = Hmac::<Sha256>::new_from_slice(&KEY).unwrap();
         mac.update(&local_nonce);
@@ -373,24 +471,76 @@ mod tests {
             &[3u8; 12],
         )
         .unwrap();
+        dev.handle_input(Input::Received(&resp), T0, rng);
+    }
 
-        dev.handle(Input::Received(&resp), &mut rng);
-        assert!(dev.is_connected(), "{version:?} connected after handshake");
-        assert!(drain_events(&mut dev).contains(&Event::Ready), "{version:?}");
-        assert!(dev.poll_transmit().is_some(), "{version:?} sent SessKeyNegFinish");
+    #[test]
+    fn legacy_connect_is_ready_immediately() {
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg(Version::V3_3));
+        assert!(dev.wants_connect(), "starts wanting to connect");
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        assert!(dev.is_connected());
+        assert!(!dev.wants_connect());
+        assert_eq!(drain_events(&mut dev), vec![Event::Ready]);
+        assert!(dev.poll_transmit().is_none()); // no handshake on the wire
+        assert_eq!(dev.poll_timeout(), None);
+    }
+
+    #[test]
+    fn send_encodes_a_frame_that_decodes_back() {
+        let mut rng = SeededRng(2);
+        let mut dev = Device::new(cfg(Version::V3_3));
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+
+        dev.handle_input(
+            Input::Send {
+                cmd: CommandType::Control,
+                data: Some(json::from_bytes(br#"{"1":true}"#).unwrap()),
+                t: 1_700_000_000,
+            },
+            T0,
+            &mut rng,
+        );
+        let wire = dev.poll_transmit().expect("a frame was queued");
+        let msg = decode_message(Version::V3_3, &wire, &KEY, false).unwrap();
+        assert_eq!(msg.cmd, CommandType::Control as u32);
+        let v = json::from_bytes(&msg.payload).unwrap();
+        assert_eq!(v["dps"], json::from_bytes(br#"{"1":true}"#).unwrap());
+    }
+
+    #[test]
+    fn send_before_ready_errors() {
+        let mut rng = SeededRng(3);
+        let mut dev = Device::new(cfg(Version::V3_5));
+        dev.handle_input(
+            Input::Send { cmd: CommandType::DpQuery, data: None, t: 1 },
+            T0,
+            &mut rng,
+        );
+        assert_eq!(drain_events(&mut dev), vec![Event::ProtocolError(CoreError::NotConnected)]);
     }
 
     #[test]
     fn v34_and_v35_handshake_reaches_connected() {
-        handshake_reaches_connected(Version::V3_4);
-        handshake_reaches_connected(Version::V3_5);
+        for version in [Version::V3_4, Version::V3_5] {
+            let mut rng = SeededRng(42);
+            let mut dev = Device::new(cfg(version));
+            dev.handle_input(Input::Connected, T0, &mut rng);
+            assert!(!dev.is_connected(), "{version:?} handshaking, not yet ready");
+            complete_handshake(&mut dev, version, &mut rng);
+            assert!(dev.is_connected(), "{version:?} connected after handshake");
+            assert!(drain_events(&mut dev).contains(&Event::Ready), "{version:?}");
+            assert!(dev.poll_transmit().is_some(), "{version:?} sent SessKeyNegFinish");
+        }
     }
 
     #[test]
-    fn bad_handshake_hmac_fails_and_disconnects() {
+    fn bad_handshake_hmac_fails_and_reconnects() {
         let mut rng = SeededRng(9);
         let mut dev = Device::new(cfg(Version::V3_4));
-        dev.handle(Input::Connected, &mut rng);
+        dev.handle_input(Input::Connected, T0, &mut rng);
         let _ = dev.poll_transmit();
 
         // Garbage response of the right length (48 bytes) -> HMAC mismatch.
@@ -403,21 +553,144 @@ mod tests {
             &[0u8; 12],
         )
         .unwrap();
-        dev.handle(Input::Received(&resp), &mut rng);
+        dev.handle_input(Input::Received(&resp), T0, &mut rng);
         assert!(!dev.is_connected());
         let events = drain_events(&mut dev);
         assert!(events.contains(&Event::Disconnected));
+        // auto_reconnect: dropped into backoff (here zero-delay), wants to redial.
+        assert_eq!(dev.poll_timeout(), Some(T0));
+        dev.handle_timeout(T0, &mut rng);
+        assert!(dev.wants_connect(), "backoff elapsed -> redial");
+    }
+
+    // -- reconnect / backoff (P1/P2/P6) --------------------------------------
+
+    #[test]
+    fn closed_reconnects_via_zero_backoff() {
+        let mut rng = SeededRng(5);
+        let mut dev = Device::new(cfg(Version::V3_3));
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+
+        dev.handle_input(Input::Closed, T0, &mut rng);
+        assert_eq!(drain_events(&mut dev), vec![Event::Disconnected]);
+        assert!(!dev.is_connected());
+        // Zero backoff: deadline is now; firing the timer returns to Connecting.
+        assert_eq!(dev.poll_timeout(), Some(T0));
+        assert!(!dev.wants_connect());
+        dev.handle_timeout(T0, &mut rng);
+        assert!(dev.wants_connect());
+        assert_eq!(dev.poll_timeout(), None);
+
+        // A second Closed while backing off is idempotent (no extra events).
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+        dev.handle_input(Input::Closed, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+        dev.handle_input(Input::Closed, T0, &mut rng);
+        assert!(drain_events(&mut dev).is_empty());
     }
 
     #[test]
-    fn closed_emits_disconnected_once() {
+    fn no_auto_reconnect_goes_terminal() {
         let mut rng = SeededRng(5);
-        let mut dev = Device::new(cfg(Version::V3_3));
-        dev.handle(Input::Connected, &mut rng);
+        let mut dev = Device::new(cfg_with(Version::V3_3, false, zero_backoff()));
+        dev.handle_input(Input::Connected, T0, &mut rng);
         let _ = drain_events(&mut dev);
-        dev.handle(Input::Closed, &mut rng);
+        dev.handle_input(Input::Closed, T0, &mut rng);
         assert_eq!(drain_events(&mut dev), vec![Event::Disconnected]);
-        dev.handle(Input::Closed, &mut rng); // idempotent
+        assert_eq!(dev.poll_timeout(), None);
+        assert!(!dev.wants_connect(), "terminal — no redial");
+        // Firing a stray timeout does nothing.
+        dev.handle_timeout(Instant::from_millis(999), &mut rng);
+        assert!(!dev.wants_connect());
+    }
+
+    #[test]
+    fn connect_failed_arms_backoff_without_disconnected_event() {
+        let mut rng = SeededRng(7);
+        let backoff = Backoff {
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(60),
+            jitter: Duration::ZERO,
+        };
+        let mut dev = Device::new(cfg_with(Version::V3_3, true, backoff));
+        let start = Instant::from_millis(10_000);
+        dev.handle_input(Input::ConnectFailed, start, &mut rng);
+        // Never was up: no Disconnected, but a backoff deadline is armed.
         assert!(drain_events(&mut dev).is_empty());
+        assert_eq!(dev.poll_timeout(), Some(start + Duration::from_secs(1)));
+        assert!(!dev.wants_connect());
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_caps_then_resets() {
+        // jitter = 0 makes the curve deterministic: base, 2·base, 4·base, … ≤ max.
+        let backoff = Backoff {
+            base: Duration::from_secs(2),
+            max: Duration::from_secs(10),
+            jitter: Duration::ZERO,
+        };
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg_with(Version::V3_3, true, backoff));
+
+        let mut now = Instant::from_millis(0);
+        let expected = [2, 4, 8, 10, 10]; // seconds: exponential then capped at max
+        for secs in expected {
+            dev.handle_input(Input::ConnectFailed, now, &mut rng);
+            let deadline = dev.poll_timeout().expect("armed");
+            assert_eq!(deadline, now + Duration::from_secs(secs), "attempt at {now:?}");
+            now = deadline;
+            dev.handle_timeout(now, &mut rng); // elapse -> Connecting
+            assert!(dev.wants_connect());
+        }
+
+        // A successful connection resets the attempt counter: next failure is base.
+        dev.handle_input(Input::Connected, now, &mut rng);
+        let _ = drain_events(&mut dev);
+        dev.handle_input(Input::Closed, now, &mut rng);
+        assert_eq!(dev.poll_timeout(), Some(now + Duration::from_secs(2)), "curve reset to base");
+    }
+
+    #[test]
+    fn jitter_stays_within_bounds_and_uses_injected_rng() {
+        let backoff = Backoff {
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(1),
+            jitter: Duration::from_secs(1),
+        };
+        // Two different seeds should (generally) yield different jittered delays,
+        // and every delay lies in [base, base+jitter) = [1000, 2000) ms.
+        let mut seen = Vec::new();
+        for seed in [1u64, 2, 3, 4] {
+            let mut rng = SeededRng(seed);
+            let mut dev = Device::new(cfg_with(Version::V3_3, true, backoff));
+            dev.handle_input(Input::ConnectFailed, T0, &mut rng);
+            let ms = dev.poll_timeout().unwrap().as_millis();
+            assert!((1000..2000).contains(&ms), "seed {seed}: {ms} out of range");
+            seen.push(ms);
+        }
+        assert!(seen.iter().any(|&ms| ms != seen[0]), "jitter should vary with the RNG");
+    }
+
+    #[test]
+    fn premature_timeout_is_ignored() {
+        let backoff = Backoff {
+            base: Duration::from_secs(5),
+            max: Duration::from_secs(5),
+            jitter: Duration::ZERO,
+        };
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg_with(Version::V3_3, true, backoff));
+        dev.handle_input(Input::ConnectFailed, T0, &mut rng);
+        let deadline = dev.poll_timeout().unwrap();
+        // Fire a full second early: still backing off, still not wanting connect.
+        let early = Instant::from_millis(deadline.as_millis() - 1000);
+        dev.handle_timeout(early, &mut rng);
+        assert!(!dev.wants_connect());
+        assert_eq!(dev.poll_timeout(), Some(deadline));
+        // Exactly at the deadline it fires.
+        dev.handle_timeout(deadline, &mut rng);
+        assert!(dev.wants_connect());
     }
 }

@@ -22,19 +22,26 @@ not built yet — listed so it isn't forgotten).
 | S7 | **15-method `TuyaProtocol` trait, one near-duplicate impl per version** | `v31.rs`…`v35.rs` | Most methods differ only in data (prefix, integrity, session-key flag, header placement); copy-paste drift risk. | The data-driven parts move to a single `version::Profile` table; only genuinely version-specific behaviour (v3.1 md5/base64) stays as code. |
 | S8 | **Error type carries tinytuya's numeric code table + lossy round-trip** | `error.rs` (`define_error_codes!` 900–914, `code()` / `from_code()`) | The core `TuyaError` bakes in tinytuya's internal error numbers and English wording purely for output parity; `code()` is **lossy** (6 variants → 914, so `from_code` can't recover them); it even inherits irrelevant **cloud** codes (909–913) into a LAN library. | Core `CoreError` is a clean semantic enum — no numeric codes, no tinytuya wording, no cloud codes. The tinytuya-compatible `{errorCode, errorMsg}` output (if a consumer wants parity) becomes an **explicit presentation mapping in the driver / compat layer**, not part of the core error type (pending, driver slice). |
 
-## Connection / discovery FSM (rustuya-core FSM) — pending (M1 / M2)
+## Connection / discovery FSM (rustuya-core FSM)
 
-The big "ambiguous sleep / weird smell" cluster lives in the 0.3 actor. To be
-confronted head-on when the Device FSM lands, not carried over:
+The big "ambiguous sleep / weird smell" cluster lived in the 0.3 actor. Confronted
+head-on as the Device FSM lands (`device.rs`), not carried over.
+
+**Resolved** (Device FSM v2, backoff/reconnect):
+
+| # | 0.3 smell | Where (0.3) | 0.4 resolution |
+|---|-----------|-------------|----------------|
+| P1 | **`SLEEP_RECONNECT_MIN = 16 s` hard floor**, not configurable | `device/mod.rs`, `actor.rs get_backoff_duration` | **Gone.** Backoff is [`Backoff`] policy (`base`/`max`/`jitter`) the driver injects; **no floor**. Tests pass `base = ZERO` and drive the whole reconnect path at zero wall-clock. |
+| P2 | **Backoff jitter via internal `rand::rng()`** | `actor.rs get_backoff_duration` | **Gone.** `Backoff::delay(attempt, rng)` draws jitter from the *injected* `RngCore`; the FSM computes a pure `Duration`. Seeded-RNG test pins bounds + variation. |
+| P6 | **`persist=false` cooldown also floored at 16 s, only bypassable via `connect_now`** | `actor.rs` cooldown loop | **Reconciled to one path.** `Config::auto_reconnect` decides *whether* to retry; the delay curve is single/identical for both. `false` → terminal `Closed`; `true` → `Backoff`. |
+
+**Pending** (later FSM increments):
 
 | # | 0.3 smell | Where (0.3) | The question to settle |
 |---|-----------|-------------|------------------------|
-| P1 | **`SLEEP_RECONNECT_MIN = 16 s` hard floor**, not configurable | `device/mod.rs`, `actor.rs get_backoff_duration` | Is 16 s a real requirement or cargo-culted? Make it policy the driver injects; tests set it to 0. |
-| P2 | **Backoff jitter via internal `rand::rng()`** | `actor.rs get_backoff_duration` | Same injection rule as S3 — the FSM computes a *duration*, randomness is injected/testable. |
-| P3 | **`wait_for_backoff` selects sleep + scanner-rediscovery `watch`** | `actor.rs` | The sleep↔discovery coupling. In the poll-split FSM this splits into `TimerFired` vs `DiscoveryUpdated` — no hidden `select`. |
-| P4 | **`is_connected` slow/stale after a passive drop** | observed via mock probe | `is_connected` didn't flip promptly on a peer-closed socket. Define connection state transitions explicitly in the FSM. |
-| P5 | **A passive drop does not surface on `listener()` promptly** | observed via mock probe | Offline events only appeared at the next reconnect attempt (~16 s). Decide when the FSM emits an offline/`DeviceEvent`. |
-| P6 | **`persist=false` cooldown also floored at 16 s, only bypassable via `connect_now`** | `actor.rs` cooldown loop | Reconcile the two backoff paths (persist vs not) into one clear FSM policy. |
+| P3 | **`wait_for_backoff` selects sleep + scanner-rediscovery `watch`** | `actor.rs` | The sleep↔discovery coupling. In poll-split this is **not core work**: the core exposes the backoff deadline via `poll_timeout()` and accepts a `DiscoveryUpdated` input; the driver's `select!` multiplexes `sleep_until(deadline)` vs `watch.changed()`. Wire the `DiscoveryUpdated` input in the discovery-wake increment. |
+| P4 | **`is_connected` slow/stale after a passive drop** | observed via mock probe | Partly addressed: `is_connected()` is now an explicit state (`== Connected`) that flips the instant the driver feeds `Closed`. Remaining: prompt *detection* of a silent peer drop is a driver/heartbeat concern (P5). |
+| P5 | **A passive drop does not surface on `listener()` promptly** | observed via mock probe | The FSM already emits `Event::Disconnected` synchronously on `Closed`. Remaining: a **heartbeat/idle timer** so a *silent* drop becomes a `Closed` promptly instead of at the next reconnect — the next FSM increment (adds a second `poll_timeout` source). |
 | P7 | **dev22 auto-detection** — no agreed algorithm; a known unknown | `decision.rs` / protocol | Keep as an explicit, documented decision in the protocol layer; don't hide it. |
 
 ## Notes

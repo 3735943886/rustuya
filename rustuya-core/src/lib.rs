@@ -19,10 +19,12 @@ pub mod json;
 pub mod message;
 pub mod payload;
 pub mod session;
+pub mod time;
 pub mod version;
 
 pub use command::CommandType;
 pub use error::CoreError;
+pub use time::{Duration, Instant};
 pub use version::{DeviceType, Version};
 
 /// Core-wide result type.
