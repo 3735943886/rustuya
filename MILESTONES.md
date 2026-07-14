@@ -10,6 +10,13 @@ stable, shipping release; nothing here lands on `master` until a phase is
 oracle-green and reviewed. The goal is "same behavior, new I/O boundary," not
 "rewrite for its own sake."
 
+> **Scope (2026-07-14): 0.4 ships as a PURE RUST LIBRARY.** The PyO3 / Python
+> surface is **out of scope for 0.4** — the shipped 0.3 Python is sufficient, and
+> bindings would only be **added later if a need arises** (not a planned
+> deliverable). The deliverable is the `rustuya-tokio` (and later
+> `rustuya-embassy`) Rust API; the 0.3 Python stays on the 0.3.x line. Mentions of
+> a "Python surface" below are historical.
+
 ---
 
 ## Why
@@ -302,7 +309,9 @@ byte-for-byte behavior-identical under the existing oracles.
   (② 300 devices reconnect from one announcement burst; both verified to fail with
   routing neutered). Broadcast is now used only for the `find`/`discovered`
   enumerate API, not the reconnect fast path.
-  **Still required before this milestone can close:** the Python surface.
+  **Scope update (2026-07-14): 0.4 is a pure-Rust library — the Python surface is
+  out of scope** (shipped 0.3 Python suffices; add later only if needed). With
+  that, M1.5's device-driver surface is **complete**; no further blocker.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
 - [x] **M1.7** `tuyamock` E2E wired to the tokio driver (`rustuya-tokio/tests/tuyamock.rs`): spawns the real `tuyamock` subprocess (opt-in via `RUSTUYA_TUYAMOCK`/PATH; skips otherwise) and drives status/set across **every** version (3.1/3.3/3.4/3.5) plus device22. **This immediately paid for itself:** it caught a real bug the self-crafted `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` carries a 4-byte retcode (like every device→client message), but the core decoded it with `has_retcode=false`. The loopback mock, built on the library's own `encode_message`, was self-consistent and blind to it. Fixed in `device.rs` (decode the handshake response with `has_retcode=true`) + both mocks made faithful. `loopback.rs` remains as a zero-dependency stand-in.
 
