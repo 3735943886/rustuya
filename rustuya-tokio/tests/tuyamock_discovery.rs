@@ -91,14 +91,18 @@ async fn discovery_connect_setvalue_matrix() {
         }
     };
 
-    // device22 is a v3.3/v3.4 quirk, so it is only exercised there.
+    // Full matrix: every version without device22, plus device22 where it is a
+    // valid quirk (tuyamock enforces dev22 ∈ {3.2, 3.3, 3.4}, matching tinytuya's
+    // recoverable set — it rejects dev22 on 3.1/3.5).
     let scenarios = [
         Scenario { wire: "3.1", version: Version::V3_1, dev_type: DeviceType::Auto, dev22: false, port: 56740, id: "discov31000000000000aa" },
-        Scenario { wire: "3.3", version: Version::V3_3, dev_type: DeviceType::Auto, dev22: false, port: 56741, id: "discov33000000000000aa" },
-        Scenario { wire: "3.3", version: Version::V3_3, dev_type: DeviceType::Device22, dev22: true, port: 56742, id: "discov33d22000000000aa" },
-        Scenario { wire: "3.4", version: Version::V3_4, dev_type: DeviceType::Auto, dev22: false, port: 56743, id: "discov34000000000000aa" },
-        Scenario { wire: "3.4", version: Version::V3_4, dev_type: DeviceType::Device22, dev22: true, port: 56744, id: "discov34d22000000000aa" },
-        Scenario { wire: "3.5", version: Version::V3_5, dev_type: DeviceType::Auto, dev22: false, port: 56745, id: "discov35000000000000aa" },
+        Scenario { wire: "3.2", version: Version::V3_2, dev_type: DeviceType::Auto, dev22: false, port: 56741, id: "discov32000000000000aa" },
+        Scenario { wire: "3.2", version: Version::V3_2, dev_type: DeviceType::Device22, dev22: true, port: 56742, id: "discov32d22000000000aa" },
+        Scenario { wire: "3.3", version: Version::V3_3, dev_type: DeviceType::Auto, dev22: false, port: 56743, id: "discov33000000000000aa" },
+        Scenario { wire: "3.3", version: Version::V3_3, dev_type: DeviceType::Device22, dev22: true, port: 56744, id: "discov33d22000000000aa" },
+        Scenario { wire: "3.4", version: Version::V3_4, dev_type: DeviceType::Auto, dev22: false, port: 56745, id: "discov34000000000000aa" },
+        Scenario { wire: "3.4", version: Version::V3_4, dev_type: DeviceType::Device22, dev22: true, port: 56746, id: "discov34d22000000000aa" },
+        Scenario { wire: "3.5", version: Version::V3_5, dev_type: DeviceType::Auto, dev22: false, port: 56747, id: "discov35000000000000aa" },
     ];
 
     for s in &scenarios {
