@@ -218,6 +218,8 @@ async fn monitor(mut args: Vec<String>) -> Result<()> {
 
     println!("monitoring {version:?}; Ctrl-C to stop.");
     println!("=> power-cycle the device to watch it reconnect.");
+    println!("=> heartbeat-ack (~every 10s) proves liveness; status-push arrives");
+    println!("   only when the device's state changes (button / another app / sensor).");
 
     let mut listener = dev.listener();
     // Poll the connection flag to render transitions to the console. This is a
@@ -237,11 +239,22 @@ async fn monitor(mut args: Vec<String>) -> Result<()> {
                 }
             }
             msg = listener.next() => match msg {
-                Some(m) => println!(
-                    "[push] cmd={:#x} payload={}",
-                    m.cmd,
-                    String::from_utf8_lossy(&m.payload)
-                ),
+                Some(m) => {
+                    // Label by command so a heartbeat reply isn't mistaken for a
+                    // device push. Unsolicited STATUS (0x08) only arrives when the
+                    // device's state actually changes (button, another app, a
+                    // sensor) — an idle device pushes nothing but heartbeat acks.
+                    let kind = match m.cmd {
+                        0x09 => "heartbeat-ack",
+                        0x08 => "status-push",
+                        _ => "message",
+                    };
+                    println!(
+                        "[{kind}] cmd={:#x} payload={}",
+                        m.cmd,
+                        String::from_utf8_lossy(&m.payload)
+                    );
+                }
                 None => {
                     println!("device stopped.");
                     break;
