@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - 0.4-sansio
   pull_request:
   workflow_dispatch:
 
@@ -18,17 +19,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: riscv32imc-unknown-none-elf, thumbv7em-none-eabi
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint with Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Run tests
-        run: cargo test --all-features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: no_std acceptance gate (rustuya-core)
+        # The core must build with no std on both an RV32 and a Cortex-M target —
+        # the design invariant that keeps the ESP32/Embassy driver reachable.
+        run: |
+          cargo build -p rustuya-core --no-default-features --target riscv32imc-unknown-none-elf
+          cargo build -p rustuya-core --no-default-features --target thumbv7em-none-eabi
+      - name: Install the tuyamock device emulator
+        # Independent, tinytuya-validated emulator; drives the real wire path
+        # (framing, crypto, the v3.4/v3.5 handshake, discovery, fault injection).
+        # Installed unpinned (latest); pin here if an upstream release breaks CI.
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip tuyamock
+      - name: Run tests (unit + loopback + tuyamock E2E)
+        env:
+          RUSTUYA_TUYAMOCK: ${{ github.workspace }}/.venv/bin/tuyamock
+        run: cargo test --workspace --all-features
 
   supply-chain:
     # Advisories + license/source policy. Non-blocking advisory failures by
-    # default — they're useful as a signal but shouldn't break unrelated PRs
-    # the moment a new RUSTSEC advisory is published. Tighten over time.
+    # default — useful as a signal but shouldn't break unrelated PRs the moment a
+    # new RUSTSEC advisory is published. Tighten over time.
     needs: [rust-checks]
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -43,150 +60,3 @@ jobs:
         run: cargo install --locked cargo-deny || true
       - name: cargo deny check
         run: cargo deny check advisories bans sources || true
-
-  python-integration:
-    # End-to-end tests of the Python extension against the tuyamock device
-    # emulator (PyPI), exercising the real wire path — connection, framing,
-    # encryption, the v3.4/v3.5 session-key handshake, and the device22 dialect
-    # — with no physical hardware. tuyamock is installed unpinned (latest); if
-    # an upstream release ever breaks this, pin it here.
-    needs: [rust-checks]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - name: Create venv and install deps
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install --upgrade pip maturin pytest tuyamock
-      - name: Build & install rustuya extension into the venv
-        working-directory: python
-        env:
-          VIRTUAL_ENV: ${{ github.workspace }}/.venv
-        run: ../.venv/bin/maturin develop --release
-      - name: Run tuyamock integration tests
-        working-directory: python
-        run: ../.venv/bin/pytest tests -v -m "not fleet and not slow"
-      - name: Reconnect/fault tests (slow — exercises the ~16s backoff floor)
-        # drop -> reconnect -> recover against tuyamock's fault injection. Gated
-        # behind the `slow` marker so it stays out of the fast run above; kept in
-        # CI because it's the only end-to-end coverage of the offline/reconnect
-        # path (see test_tuyamock_integration.py).
-        working-directory: python
-        run: ../.venv/bin/pytest tests -v -m slow
-      - name: Fleet-scale tests (1000-device connect on v3.4 + 500-device keepalive/set on v3.5)
-        # rustuya's fleet path end-to-end, split across both session-key
-        # handshakes in one run: (1) hold 1000 device actors connected
-        # concurrently over the v3.4 HMAC handshake; (2) over the v3.5 GCM
-        # handshake, keep 500 alive through a 30s idle on automatic heartbeat
-        # alone, bundled in one unified listener, then set_value all of them
-        # (both nowait modes) and confirm a response from each. The
-        # single-connection mocks are split across processes so the mock host's
-        # GIL isn't the bottleneck. 100% required — every device must succeed.
-        working-directory: python
-        env:
-          RUSTUYA_FLEET_VERSION: "3.4"
-          RUSTUYA_KEEPALIVE_VERSION: "3.5"
-        run: ../.venv/bin/pytest tests -v -m fleet
-
-  linux:
-    needs: [rust-checks]
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-22.04
-            target: aarch64-unknown-linux-gnu
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
-          sccache: 'true'
-          manylinux: auto
-          working-directory: python
-      - name: Upload wheels
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-linux-${{ matrix.platform.target }}
-          path: python/dist
-
-  windows:
-    needs: [rust-checks]
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: windows-latest
-            target: x64
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          architecture: ${{ matrix.platform.target }}
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
-          sccache: 'true'
-          working-directory: python
-      - name: Upload wheels
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-windows-${{ matrix.platform.target }}
-          path: python/dist
-
-  macos:
-    needs: [rust-checks]
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: macos-14
-            target: aarch64-apple-darwin
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
-          sccache: 'true'
-          working-directory: python
-      - name: Upload wheels
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-macos-${{ matrix.platform.target }}
-          path: python/dist
-
-  sdist:
-    needs: [rust-checks]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
-          working-directory: python
-      - name: Upload sdist
-        uses: actions/upload-artifact@v7
-        with:
-          name: wheels-sdist
-          path: python/dist

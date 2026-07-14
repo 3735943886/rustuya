@@ -4,11 +4,8 @@
 # a thin driver that owns *only* I/O — TCP sockets, one `sleep` timer, the RNG,
 # and the monotonic clock — and delegates every protocol/lifecycle *decision*
 # (handshake, backoff, heartbeat, idle-liveness, frame reassembly) to the pure
-# `rustuya-core` Device FSM. Written from scratch on the FSM; the legacy 0.3
-# `rustuya` crate at the repo root is reference-only.
-#
-# Standalone [workspace] so it builds independently of the legacy root crate,
-# mirroring how rustuya-core is set up during the transition.
+# `rustuya-core` Device FSM. Written from scratch on the FSM. A member of the
+# root workspace (alongside rustuya-core).
 [package]
 name = "rustuya-tokio"
 version = "0.4.0-dev"
@@ -17,8 +14,6 @@ rust-version = "1.88"
 license = "MIT"
 description = "Tokio driver for the sans-I/O rustuya-core Tuya protocol FSM"
 repository = "https://github.com/3735943886/rustuya"
-
-[workspace]
 
 [lib]
 name = "rustuya_tokio"

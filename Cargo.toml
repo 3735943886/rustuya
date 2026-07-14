@@ -1,61 +1,12 @@
-[package]
-name = "rustuya"
-version = "0.3.0"
-authors = ["3735943886"]
-edition = "2024"
-rust-version = "1.88"
-license = "MIT"
-repository = "https://github.com/3735943886/rustuya"
-homepage = "https://github.com/3735943886/rustuya"
-description = "A fast and concurrent Tuya Local API implementation in Rust"
-keywords = ["tuya", "iot", "smart-home", "automation"]
-categories = ["hardware-support", "network-programming", "api-bindings"]
-include = [
-    "src/**/*",
-    "examples/*.rs",
-    "Cargo.toml",
-    "README.md",
-    "LICENSE"
-]
-
-[lib]
-name = "rustuya"
-crate-type = ["rlib"]
-
-[dependencies]
-aes = "0.9"
-aes-gcm = "0.11"
-async-stream = "0.3"
-base64 = "0.22"
-byteorder = "1.5"
-cipher = "0.5"
-crc = "3.4"
-ecb = "0.2"
-futures-core = "0.3"
-futures-util = "0.3"
-hmac = "0.13"
-log = "0.4"
-md-5 = "0.11"
-parking_lot = "0.12"
-rand = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.11"
-socket2 = { version = "0.6", features = ["all"] }
-thiserror = "2.0"
-tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-
-[target.'cfg(unix)'.dependencies]
-rlimit = "0.11"
-
-[dev-dependencies]
-env_logger = "0.11"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+# rustuya — a sans-I/O Tuya local-protocol library in pure Rust.
+#
+# Virtual workspace over the two 0.4 crates:
+#   * rustuya-core  — no_std + alloc core (protocol, crypto, Device/Discovery
+#                     state machines); driver injects `now` + RNG + sockets.
+#   * rustuya-tokio — the std + tokio driver over that core.
+#
+# The 0.3 line (the monolithic `rustuya` crate + its Python bindings) lives on
+# `master` and the v0.3.x tags; 0.4 is a pure-Rust redesign — see MILESTONES.md.
+[workspace]
+resolver = "2"
+members = ["rustuya-core", "rustuya-tokio"]

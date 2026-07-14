@@ -1,118 +1,121 @@
-# Rustuya
+# rustuya
 
-[![Crates.io](https://img.shields.io/crates/v/rustuya.svg)](https://crates.io/crates/rustuya)
-[![Pypi.org](https://badge.fury.io/py/rustuya.svg)](https://badge.fury.io/py/rustuya)
-[![Documentation](https://docs.rs/rustuya/badge.svg)](https://docs.rs/rustuya)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Local-network control of Tuya-compatible devices, built in Rust with
-first-class Python bindings. Designed for fleets of hundreds to
-thousands of devices — a native Rust core handles the I/O while the
-Python facade releases the GIL on every blocking call, so threaded
-Python workers stay live.
+Local-network control and discovery of Tuya devices, in **pure Rust**.
 
-## Install
+`rustuya` is a **sans-I/O** implementation of the Tuya LAN protocol: a `no_std`
+core state machine that owns every protocol decision, driven by a thin I/O layer.
+The tokio driver runs it on a desktop/server; the same core is built to run on an
+MCU (Embassy/ESP32) behind a different driver — one protocol implementation, many
+runtimes.
 
-**Rust**
+> **Status.** 0.4 is a from-scratch redesign on the `0.4-sansio` branch. The
+> shipping 0.3 line — a monolithic `rustuya` crate with Python bindings — lives on
+> `master` and the `v0.3.x` tags. This README covers 0.4.
 
-```bash
-cargo add rustuya
-```
+## Layout
 
-**Python**
+| crate | what it is |
+|-------|------------|
+| [`rustuya-core`](rustuya-core) | `no_std + alloc` protocol core — framing, crypto (v3.1–v3.5), and the connection + discovery state machines. No sockets, no timers, no clock: the driver injects `now` and an RNG. |
+| [`rustuya-tokio`](rustuya-tokio) | the `std` + tokio driver — TCP, UDP discovery, one timer per device, the OS RNG. |
 
-```bash
-pip install rustuya
-```
-
-## Quick start
-
-**Rust (sync)**
+## Quick start (tokio)
 
 ```rust
-use rustuya::sync::Device;
-
-let dev = Device::new("DEVICE_ID", "LOCAL_KEY");
-dev.set_value(1, true)?;                        // turn on DP 1
-println!("{:?}", dev.status()?);                // read current DPS
-
-for msg in dev.listener() {                     // real-time events
-    println!("{:?}", msg);
-}
-```
-
-**Rust (async)** — inside a `tokio` runtime
-
-```rust
-use rustuya::Device;
-use futures_util::StreamExt;
+use rustuya_tokio::{Device, Version};
 
 #[tokio::main]
-async fn main() -> Result<(), rustuya::TuyaError> {
-    let dev = Device::new("DEVICE_ID", "LOCAL_KEY");
-    dev.set_value(1, true).await?;              // turn on DP 1
-    println!("{:?}", dev.status().await?);      // read current DPS
+async fn main() -> rustuya_tokio::Result<()> {
+    let dev = Device::builder("device_id_22chars0000", "0123456789abcdef")
+        .address("192.168.1.50")
+        .version(Version::V3_4)
+        .connect()?;
 
-    let mut listener = dev.listener();
-    while let Some(msg) = listener.next().await {   // real-time events
-        println!("{:?}", msg);
-    }
+    let state = dev.status().await?;   // query data points
+    println!("{state}");
+    dev.set_value(1, true).await?;     // flip DP 1
+
+    // A lossless stream of device pushes (state changes) and responses.
+    let mut events = dev.listener();
+    let push = events.recv().await?;
+    println!("push: {push:?}");
     Ok(())
 }
 ```
 
-**Python**
+The connection is managed for you: a dropped link reconnects with jittered backoff,
+a keepalive heartbeat holds it open, and idle-liveness surfaces a silently-dead
+peer promptly. Requests are correlated FIFO — the Tuya LAN protocol carries no
+request/response token — so for asynchronous device pushes prefer `listener()`.
 
-```python
-from rustuya import Device
+## Discovery
 
-dev = Device("DEVICE_ID", "LOCAL_KEY")
-dev.set_value(1, True)                          # turn on DP 1
-print(dev.status())                             # read current DPS
+Devices announce themselves over UDP; some only answer active probes. A shared
+`Discovery` handles both, and doubles as the reconnect fast-path.
 
-for msg in dev.listener():                      # real-time events
-    print(msg)
+```rust
+use rustuya_tokio::Discovery;
+
+let disco = Discovery::new()?;
+
+// Enumerate the LAN (passive receive + one active probe round).
+for info in disco.scan(std::time::Duration::from_secs(5)).await {
+    println!("{} at {} ({:?})", info.id, info.ip, info.version);
+}
+
+// Or resolve + connect without hand-typing an address (fills in ip and version):
+let dev = rustuya_tokio::Device::builder("device_id_22chars0000", "0123456789abcdef")
+    .discover(&disco, std::time::Duration::from_secs(10))
+    .await?;
 ```
 
-## Features
+Linking a `Discovery` to a device (via `.discover()` or `.rediscover()`) lets a
+re-announcement cancel the reconnect backoff and redial immediately — and a
+changed IP self-corrects.
 
-- Local-only — talks directly to devices over LAN, no Tuya Cloud
-- Rust core + Python bindings (PyO3) — same engine for both
-- Built for fleet scale — per-device background tasks with
-  automatic reconnection and exponential backoff
-- Full protocol coverage — Tuya 3.1 / 3.2 / 3.3 / 3.4 / 3.5 + device22
+## Design
 
-### Tested at fleet scale
+- **Sans-I/O.** The core decides *which bytes, which port, which timer, whether to
+  reconnect*; the driver only moves bytes and arms one timer. This is what lets the
+  same protocol code target both tokio and a `no_std` MCU.
+- **Injected clock + RNG.** The core reads no clock and generates no randomness —
+  the driver passes `now` and an RNG in. That gives `no_std` portability,
+  deterministic zero-wall-clock tests, and a guaranteed-fresh IV/nonce per frame.
+- **Poll-split FSM** (quinn-proto style): `handle_input` / `handle_timeout` push in;
+  `poll_transmit` / `poll_event` / `poll_timeout` pull out, with a single next
+  deadline the driver arms one timer for.
 
-Large-scale behavior is exercised against real mock devices — a 1000-device
-[tuyamock](https://github.com/3735943886/tuyamock) fleet with actual TCP
-connections and handshakes, not just unit mocks:
+## Examples
 
-- **This repo** stands up the 1000-device fleet and asserts every connection
-  establishes without deadlock under a bounded connect-concurrency cap, in CI
-  ([`python/tests/test_fleet_scale.py`](python/tests/test_fleet_scale.py)).
-- The downstream [rustuya-bridge](https://github.com/3735943886/rustuya-bridge)
-  goes further end-to-end: a 1000-device fleet onboards cleanly with zero
-  retained orphans after a mass clear, and a separate test holds the fleet idle
-  for 30s to prove the heartbeat keeps every connection alive (witnessed
-  mock-side) before fanning a single name-addressed command out to the whole
-  fleet.
+Runnable against a real device (or the `tuyamock` emulator), in `rustuya-tokio`:
 
-It proves the fleet machinery (bounded connect with no deadlock, heartbeat
-survival, fan-out) holds with 1000 concurrent devices over real sockets, end to
-end.
+```bash
+cargo run --example control -- <id> <key>          # read status / set a DP
+cargo run --example monitor -- <id> <key>          # watch state + reconnect
+cargo run --example scan                            # list devices on the LAN
+cargo run --example find    -- <id>                 # resolve one device by probe
+cargo run --example sniff                           # raw discovery hex dump
+```
 
-See the [Guide](https://3735943886.github.io/rustuya/) for the full API
-reference, design philosophy, and architecture notes.
+`[ip]` and `[version]` are optional trailing args — omit them and they are resolved
+from the discovery beacon.
 
-## Credits
+## Testing
 
-The Tuya protocol layer in rustuya is derived from the specifications
-and error codes documented in
-[tinytuya](https://github.com/jasonacox/tinytuya):
+```bash
+cargo test --workspace                              # unit + loopback + discovery
+cargo build -p rustuya-core --no-default-features \
+  --target riscv32imc-unknown-none-elf              # the no_std acceptance gate
+```
 
-- [Protocol Reference](https://github.com/jasonacox/tinytuya/blob/master/PROTOCOL.md)
+Protocol correctness is gated end-to-end against the independent
+[`tuyamock`](https://pypi.org/project/tuyamock/) device emulator (validated against
+tinytuya) — connection, framing, crypto, the v3.4/v3.5 handshake, discovery, and
+fault-injection resilience. Opt in by pointing `RUSTUYA_TUYAMOCK` at the binary;
+tests skip cleanly without it.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
