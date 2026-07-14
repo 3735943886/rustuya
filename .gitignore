@@ -1,6 +1,8 @@
 # Rust build output
 target/
 Cargo.lock
+*/target/
+*/Cargo.lock
 
 # Local Python venv for the oracle tooling (tuyamock / tinytuya)
 .venv/
