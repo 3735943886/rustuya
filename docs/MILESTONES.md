@@ -228,8 +228,8 @@ byte-for-byte behavior-identical under the existing oracles.
 
 - [x] **M1.1** Model the FSM: states (Connecting → Handshaking → Connected → Backoff → …) + `Input`/`Event` (poll-split). *v2, `device.rs`.*
 - [x] **M1.2** Port the session-key negotiation (prepare/verify/finalize) into the FSM. *v1, `session.rs` + `device.rs`.*
-- [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout` deadline (SMELLS P1/P2/P6). The wake half is `Input::ConnectNow` (one signal for both discovery-rewake and explicit `connect_now`) — in poll-split it's a driver channel, not core `select`. *v2, `device.rs` + `time.rs`.*
-- [x] **M1.4** Heartbeat + idle-timeout + handshake-timeout as timer events, all merged into the single `poll_timeout` via `earliest()` (SMELLS P4/P5 resolved; a stalled handshake no longer stalls forever). *v3, `device.rs`.* dev22 fallback decisions still to port from `decision.rs`.
+- [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout` deadline (DESIGN P1/P2/P6). The wake half is `Input::ConnectNow` (one signal for both discovery-rewake and explicit `connect_now`) — in poll-split it's a driver channel, not core `select`. *v2, `device.rs` + `time.rs`.*
+- [x] **M1.4** Heartbeat + idle-timeout + handshake-timeout as timer events, all merged into the single `poll_timeout` via `earliest()` (DESIGN P4/P5 resolved; a stalled handshake no longer stalls forever). *v3, `device.rs`.* dev22 fallback decisions still to port from `decision.rs`.
 - [x] **M1.4b (core)** Thread `cid` through the FSM so **sub-devices** work:
   `Input::Send` gained a `cid: Option<&'a str>` field, `on_send` forwards it into
   `command::generate` (which already took `cid` but was called with `None`). Pinned
@@ -271,7 +271,7 @@ byte-for-byte behavior-identical under the existing oracles.
   (auto-connect with no address, returning a `Device`) is *intentionally dropped*,
   not reproduced: REUSEPORT load-balances, so a per-device Discovery would drop
   announcements — the magic needs a *process-shared* Discovery, i.e. exactly the
-  global scanner singleton SMELLS Q1 removed. Rather than reverse Q1, resolving an
+  global scanner singleton DESIGN Q1 removed. Rather than reverse Q1, resolving an
   address without a fixed IP stays **explicit** (pass a shared `Discovery` to
   `discover`), which keeps error locality (`Result` at the fallible call),
   deterministic lifetime, and fleet-correctness (one shared listener). *`new` was
@@ -293,7 +293,7 @@ byte-for-byte behavior-identical under the existing oracles.
   surfaced by `Discovery::last_seen(id) -> Option<Duration>` so callers judge
   staleness themselves. Pinned by `tests/rediscovery_ip_change.rs` (127.0.0.1 →
   127.0.0.2 redial; verified to fail without the address-carrying rewake).
-  *Fleet-scale discovery hardening (SMELLS R1–R4):* the first per-device
+  *Fleet-scale discovery hardening (DESIGN R1–R4):* the first per-device
   broadcast-subscribe-and-filter forwarder regressed vs the 0.3 singleton at fleet
   scale (the singleton's smell was its *global lifecycle*, not its *keyed
   routing*). Replaced with an **`id → Route` registry** on the owned `Discovery`
@@ -339,8 +339,8 @@ runs with tokio absent from the dependency tree; same core, same oracle.
 > The core decides ports/payloads/timing; the driver owns the UDP sockets and
 > broadcast.
 
-- [x] **M2.1** Model the discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`); packet decode (6699/GCM + 55AA plaintext/ECB) + TTL cache/dedup moved into the core. *v1, passive receive only — `discovery.rs`.* (Renamed from `scanner`; singleton dropped — SMELLS Q1–Q3.)
-- [x] **M2.2** Broadcast scheduling as timer actions (`StartScan`/`StopScan` + `poll_timeout`/`handle_timeout`, injected interval/burst); payload/port selection as pure output via a typed `Probe`/`Dialect` table (SMELLS Q4/Q5). v3.5 source-IP is `Config::local_ip` (driver fills it — Q6). *v2, `discovery.rs`.* Scan-start cooldown/throttle stays a driver policy (when to send `StartScan`).
+- [x] **M2.1** Model the discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`); packet decode (6699/GCM + 55AA plaintext/ECB) + TTL cache/dedup moved into the core. *v1, passive receive only — `discovery.rs`.* (Renamed from `scanner`; singleton dropped — DESIGN Q1–Q3.)
+- [x] **M2.2** Broadcast scheduling as timer actions (`StartScan`/`StopScan` + `poll_timeout`/`handle_timeout`, injected interval/burst); payload/port selection as pure output via a typed `Probe`/`Dialect` table (DESIGN Q4/Q5). v3.5 source-IP is `Config::local_ip` (driver fills it — Q6). *v2, `discovery.rs`.* Scan-start cooldown/throttle stays a driver policy (when to send `StartScan`).
 - [x] **M2.3** Tokio UDP driver over the discovery FSM — `rustuya-tokio/src/discovery.rs`.
   Owns UDP bind (`SO_REUSEADDR`/`REUSEPORT` so the well-known ports 6666/6667/7000
   are shareable) + `SO_BROADCAST` send; one reader task per socket funnels
