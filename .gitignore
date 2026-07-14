@@ -1,23 +1,10 @@
-# Rust
-/target/
-*/target/
+# Rust build output
+target/
 Cargo.lock
-*/Cargo.lock
 
-# Python
-/dist/
-*/dist/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-*.egg-info/
+# Local Python venv for the oracle tooling (tuyamock / tinytuya)
 .venv/
-/venv/
-build/
 
-# OS
-Thumbs.db
-.DS_Store
-
-# Editor / tooling (local, machine-specific — not for the repo)
+# Editor / tooling & OS — local, machine-specific
 .claude/
+.DS_Store
