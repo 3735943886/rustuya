@@ -1,431 +1,258 @@
-# Rustuya 0.4 — Sans-I/O Redesign Milestones
+# rustuya 0.4 — Sans-I/O Redesign Milestones
 
-Tracks the multi-release program that splits rustuya into a **pure, `no_std`
-protocol/state-machine core** plus **thin I/O drivers**, so the same protocol
-logic runs on a beefy Linux/tokio host (fleet scale) *and* on an ESP32-class
-microcontroller (single-device controller).
+Splits rustuya into a **pure, `no_std` protocol/state-machine core** plus **thin
+I/O drivers**, so the same protocol logic runs on a Linux/tokio host (fleet
+scale) *and* on an ESP32-class microcontroller (single-device controller).
 
-This is a **long-lived branch** (`0.4-sansio`). The `0.3.x` line stays the
-stable, shipping release; nothing here lands on `master` until a phase is
-oracle-green and reviewed. The goal is "same behavior, new I/O boundary," not
-"rewrite for its own sake."
-
-> **Scope (2026-07-14): 0.4 ships as a PURE RUST LIBRARY.** The PyO3 / Python
-> surface is **out of scope for 0.4** — the shipped 0.3 Python is sufficient, and
-> bindings would only be **added later if a need arises** (not a planned
-> deliverable). The deliverable is the `rustuya-tokio` (and later
-> `rustuya-embassy`) Rust API; the 0.3 Python stays on the 0.3.x line. Mentions of
-> a "Python surface" below are historical.
+Long-lived branch `0.4-sansio`. The `0.3.x` line stays the prior stable release;
+nothing here lands on `master` until a phase is oracle-green. 0.4 is a **pure-Rust
+library** — the deliverable is the `rustuya-tokio` (and later `rustuya-embassy`)
+Rust API. Design-decision detail lives in [`DESIGN.md`](DESIGN.md) (IDs S/P/Q/R).
 
 ---
 
 ## Why
 
 - **Motivation:** tokio is a non-starter on ESP32 (needs mio/epoll; a
-  multi-thread runtime on a 2-core, ~200 KB-RAM MCU is nonsensical). The wall
-  is not sans-I/O itself — it is that **tokio + `std` must leave the core**.
-  Sans-I/O is the mechanism (cf. `quinn-proto`, `rustls`).
-- **Free wins that fall out of the same move:**
-  - The reconnect/backoff/handshake/dev22 logic becomes a pure
-    `step(event, now, rng) -> [action]` state machine → deterministic tests at
-    **zero wall-clock** (today the reconnect path costs ~16 s of real time to
-    test because `SLEEP_RECONNECT_MIN = 16 s` is real).
-  - Injecting the RNG pins the random-IV / random-nonce property (immunity to
-    the tinytuya #722 GCM-nonce-reuse class) **as a test**, not a convention.
+  multi-thread runtime on a 2-core, ~200 KB-RAM MCU is nonsensical). The wall is
+  that **tokio + `std` must leave the core**. Sans-I/O is the mechanism (cf.
+  `quinn-proto`, `rustls`).
+- **Free wins:** the reconnect/backoff/handshake logic becomes a pure
+  `step(event, now, rng)` machine → deterministic tests at **zero wall-clock**;
+  injecting the RNG pins the random-IV/nonce property (tinytuya #722 immunity) as
+  a test, not a convention.
 
 ## Non-goals / scope guards
 
-- **Not** a behavior change. Wire behavior, defaults, and the public `std`/tokio
-  API stay as in 0.3.x until a deliberate, separate decision.
-- **Not** committing to Embassy-vs-esp-idf now. The core targets `no_std +
-  alloc`, which is the **superset** — it compiles under both. The ESP32 driver
-  flavor is a Phase-3 decision.
-- **Not** zero-alloc. `alloc` is assumed (ESP32 has a heap via esp-alloc /
-  esp-idf). Zero-alloc / `heapless` / `serde-json-core` is a later option if RAM
-  demands it, not a v0.4 requirement.
-- `master` / `0.3.x` is **not** destabilized. Fixes to 0.3 land on `master`; this
-  branch rebases on them.
+- **Not** a wire-behaviour change. Wire behaviour and defaults stay as in 0.3.x;
+  the 0.4 Rust API is a fresh surface (the 0.3 crate is not carried forward).
+- **Not** committing to Embassy-vs-esp-idf now. The core targets `no_std + alloc`
+  (the superset — compiles under both); the ESP32 flavour is a Phase-3 decision.
+- **Not** zero-alloc. `alloc` is assumed; `heapless`/`serde-json-core` is a later
+  option if RAM demands it, not a v0.4 requirement.
+- `master` / `0.3.x` is **not** destabilised.
 
 ## Design invariants (hold across every phase)
 
-1. **Core is `#![no_std]` + `alloc`.** No tokio, no sockets, no timers, no
-   threads, no locks (the core is single-owner, driven by the driver).
-2. **`now: Instant` and `rng: &mut impl RngCore` are injected** into the core.
-   The core never reads the clock or the OS RNG itself.
-3. **Addresses use `core::net::{IpAddr, SocketAddr}`** (stable since 1.77; MSRV
-   is 1.88), so no `std::net` leaks into the core.
-4. **The core owns policy, the driver owns I/O.** "Which bytes, which port,
-   which timer duration, whether to reconnect" is the core. "Open the socket,
-   write the bytes, sleep the timer" is the driver.
-5. **Same oracle.** The core must pass the *existing* `tinytuya_parity`
-   fixtures and the `tuyamock` end-to-end suite. These are the regression net
-   against reopening the 0.3 lifecycle/race fixes.
-6. **`no_std` buildability is the acceptance gate, not the refactor.** A CI job
-   builds the core for a bare-metal target (`riscv32imc-unknown-none-elf`) with
-   `--no-default-features` from day one. If it doesn't build `no_std`, the phase
-   is not done.
-7. **Minimal core dependencies.** Every core dep must build `no_std` for the
-   bare-metal target; prefer a `core`/`alloc` built-in or a few inline lines
-   over a crate. The only non-trivial deps are RustCrypto (essential) and the
-   JSON seam — everything incidental is trimmed (see the Core-deps note under
-   Target crate layout).
+1. **Core is `#![no_std]` + `alloc`.** No tokio, sockets, timers, threads, or
+   locks (single-owner, driven by the driver).
+2. **`now: Instant` and `rng: &mut impl RngCore` are injected.** The core never
+   reads the clock or the OS RNG itself.
+3. **Addresses use `core::net`** (stable 1.77; MSRV 1.88) — no `std::net` leak.
+4. **Core owns policy, driver owns I/O.** "Which bytes/port/timer-duration,
+   whether to reconnect" is the core; "open the socket, write, sleep" is the
+   driver.
+5. **Same oracle.** The core passes the existing `tinytuya_parity` fixtures and
+   the `tuyamock` E2E suite — the regression net against reopening 0.3 fixes.
+6. **`no_std` buildability is the acceptance gate.** CI builds the core for
+   `riscv32imc-unknown-none-elf` / `thumbv7em-none-eabi` with
+   `--no-default-features`. If it doesn't build `no_std`, the phase isn't done.
+7. **Minimal core dependencies.** Prefer a `core`/`alloc` built-in over a crate;
+   the only non-trivial deps are RustCrypto and the JSON seam.
 
 ## Target crate layout
 
 ```
-rustuya-core       no_std + alloc   protocol · crypto · Device FSM · Discovery FSM
-                                    (now/RNG injected; core::net; no I/O)
-rustuya-tokio      std + tokio      thin driver: tokio TCP, one timer, RNG/clock
-                                    injection over the FSM (M1.5, from scratch).
-                                    Grows into UDP scanner + sync facade + Python
-                                    surface; supersedes the reference root crate.
-rustuya-embassy    no_std           thin driver: embassy-net + embassy-time  (Phase 3)
-python             extension        unchanged; sits on rustuya (tokio)
+rustuya-core     no_std + alloc   protocol · crypto · Device FSM · Discovery FSM
+                                  (now/RNG injected; core::net; no I/O)
+rustuya-tokio    std + tokio      thin driver: tokio TCP/UDP, one timer, RNG/clock
+                                  injection over the FSMs
+rustuya-embassy  no_std           thin driver: embassy-net + embassy-time  (Phase 3)
 ```
 
-- **Core deps (minimal — see the dependency policy below):**
-  - _Essential, keep:_ RustCrypto (`aes`, `aes-gcm`, `cipher`, `ecb`, `hmac`,
-    `sha2`, `md-5` — all `no_std`, default-features off; **do not hand-roll
-    crypto**) · `rand_core` (the `RngCore` **trait only** — the RNG is injected,
-    so **not** the full `rand`) · `core::net` for addresses.
-  - _Keep behind the D8 seam:_ `serde` + `serde_json` (`alloc`). Dynamic dps
-    payloads are arbitrary maps, which `serde-json-core` (no-alloc, fixed
-    shapes) does not handle well — so keep `serde_json` for now; swap only if
-    ESP32 RAM forces it. Do **not** pre-emptively hand-roll JSON (parity-oracle
-    risk).
-  - _Borderline:_ `base64` (small, no transitive deps) — keep or inline later.
-  - **Trimmed out of core:** `byteorder` → `u32::from_be_bytes`/`to_be_bytes`
-    (core built-in); `thiserror` → hand-rolled `CoreError` enum + `Display`
-    (drops a proc-macro dep; `TuyaError` with io stays in the tokio driver);
-    `log` → diagnostics surfaced as events, not a logging side effect.
-- **Driver-only deps (must NOT appear in core):** `tokio`, `tokio-util`,
-  `tokio-stream`, `socket2`, `rlimit`, `parking_lot`, `async-stream`,
-  `futures-*`, the full `rand`, `env_logger`.
+- **Core deps:** RustCrypto (`aes`/`aes-gcm`/`cipher`/`ecb`/`hmac`/`sha2`/`md-5`,
+  `no_std`, default-features off — **do not hand-roll crypto**) · `rand_core`
+  (the `RngCore` trait only) · `serde_json` behind the D8 seam (dynamic dps maps
+  don't fit `serde-json-core`; don't pre-hand-roll JSON) · `base64`. Trimmed:
+  `byteorder` (→ `from_be_bytes`), `thiserror` (→ hand-rolled `CoreError`), `log`
+  (→ events).
+- **Driver-only deps (must NOT appear in core):** `tokio`, `tokio-stream`,
+  `socket2`, `futures-*`, the full `rand`.
 
-## Sans-I/O interface (shape)
+## Sans-I/O interface (D1 resolved → poll-split)
 
 ```rust
-// Device connection FSM — pure, single-owner, no I/O, no per-call allocation.
-// Inputs are pushed IN; outputs are pulled OUT separately (quinn-proto style).
 pub enum DevInput<'a> {
     Connected,
-    ConnectFailed(TransportError),  // neutral transport error (D5), not std::io
-    BytesReceived(&'a [u8]),        // driver read; core reassembles frames (D4)
-    CommandQueued(Command),
-    ConnectNow,                     // replaces wait_for_backoff sleep+watch coupling (P3); also connect_now()
+    ConnectFailed,                 // neutral transport failure (D5), not std::io
+    Received(&'a [u8]),            // driver read; core reassembles frames (D4)
+    Send { cmd, data, cid, t },
+    ConnectNow,                    // cancel backoff / revive terminal (P3)
     Closed,
 }
-impl DeviceCore {
-    // push inputs (mutate state; may arm/clear internal deadlines)
+impl Device {
     fn handle_input(&mut self, input: DevInput<'_>, now: Instant, rng: &mut impl RngCore);
     fn handle_timeout(&mut self, now: Instant, rng: &mut impl RngCore);
-
-    // pull outputs (driver drains each to None after any handle_*)
     fn poll_transmit(&mut self) -> Option<Vec<u8>>;    // bytes to send
-    fn poll_event(&mut self)    -> Option<DeviceEvent>;// app events for listener()
+    fn poll_event(&mut self)    -> Option<Event>;      // app events for listener()
     fn poll_timeout(&self)      -> Option<Instant>;    // THE single next deadline (D2)
 }
-// Discovery FSM is isomorphic: handle_input / handle_timeout, and
-// poll_transmit -> Option<(Vec<u8>, u16 /*port*/)>, poll_event -> Discovered.
+// Discovery FSM is isomorphic (poll_transmit -> (Vec<u8>, port); poll_event -> Found/Seen).
 ```
 
-> **D1 resolved → poll-split (B).** Driver loop: read `poll_timeout()` and arm
-> **one** timer; on socket-read / that-timer / command, call the matching
-> `handle_*`; then drain `poll_transmit()` and `poll_event()` to `None`. One
-> deadline (no timer ids), no per-event `Vec`, and send/event/timeout on
-> separate channels — the identical shape drives the tokio, blocking, and
-> embassy drivers.
+Driver loop: read `poll_timeout()` and arm **one** timer; on socket-read /
+timer / command, call the matching `handle_*`; drain `poll_transmit()` and
+`poll_event()` to `None`. One deadline (no timer ids), no per-event `Vec`.
+
+## Settled interface decisions
+
+- **D1 — poll-split** (over `step -> Vec<Action>`): no per-event allocation, a
+  single next-deadline so the driver tracks no timer ids, separate channels for
+  bytes/deadline/events. Battle-tested (quinn-proto).
+- **D2 — single next-deadline.** `poll_timeout()` returns the earliest of
+  {backoff, heartbeat, idle, handshake}; the driver arms one timer.
+- **D3 — injected monotonic `Instant(u64 millis)`** with saturating arithmetic;
+  each driver builds it from its own clock. No `std::time` in the core.
+- **D4 — RX reassembly buffer in the core, bounded** (`rx::RxBuffer`). Bounded by
+  `peek_header`'s `MAX_PAYLOAD_LEN` check; cleared on teardown.
+- **D5 — split error type.** `CoreError` carries no `std::io::Error`; transport
+  failures enter as `ConnectFailed`. The driver's `TuyaError` wraps io.
+- **D6 — fresh 0.4 Rust API.** The tokio driver defines a new surface
+  (`rustuya-tokio`); it is not a drop-in for the 0.3 crate, which stays on 0.3.x.
+- **D7 — concurrency primitives stay driver-side** (listener latch/replay,
+  watch/broadcast, mpsc, connect-concurrency cap). The core only *emits* events.
+- **D8 — JSON behind one seam** so `serde_json` ↔ `serde-json-core` is a swap.
 
 ---
 
-## Key design decisions to settle before M0
+## M0 — Core skeleton + `no_std` gate  (done)
 
-Each is a fork that is expensive to reverse once M0 lands. Listed with a
-**proposed** answer and the reasoning; these are for the maintainer to confirm
-or override *before* any code, so the core's spine is settled up front.
-
-- **D1 — Core API shape. RESOLVED (2026-07-09) → quinn-proto-style poll-split.**
-  Entry points: `handle_input(input, now, rng)` + `handle_timeout(now, rng)`;
-  outputs pulled via `poll_transmit() -> Option<Vec<u8>>`,
-  `poll_event() -> Option<DeviceEvent>`, `poll_timeout() -> Option<Instant>`.
-  The driver loops: feed input → drain transmits + events → arm the **one**
-  timer at `poll_timeout`. *Why over `step -> Vec<Action>`:* battle-tested for
-  exactly this (a connection state machine reused across runtimes incl.
-  embedded), no per-event `Vec` allocation, a **single** next-deadline so the
-  driver never tracks timer ids, and "bytes to send" / "next deadline" / "app
-  events" stay on separate channels. See the interface sketch above.
-
-- **D2 — Timer model: single next-deadline _(proposed)_ vs multiple named
-  timers.** Proposed: `poll_timeout()` returns the earliest of {backoff,
-  heartbeat, idle}; the driver arms exactly **one** timer; on fire it calls
-  `handle_timeout(now)` and the core recomputes internally. *Why:* the driver
-  manages one timer, no timer-id bookkeeping, trivial on `embassy-time` (one
-  `Timer`) and on tokio (one `sleep`).
-
-- **D3 — Clock: injected monotonic `Instant` newtype _(proposed)_.** Proposed:
-  the core defines `Instant(u64 /* monotonic millis */)` with saturating
-  arithmetic; each driver builds it from its own clock (tokio `Instant`,
-  `embassy-time::Instant`, `std::Instant`). No `std::time` in the core. *Why:*
-  simplest; a generic `<C: Clock>` adds type noise for no real gain here.
-
-- **D4 — RX reassembly buffer lives in the core, bounded. RESOLVED (2026-07-13)
-  → `rx::RxBuffer`.** The core owns the receive buffer; `Input::Received(bytes)`
-  appends any fragment and the FSM drains every whole frame via
-  `RxBuffer::next_frame()` (partial → `Ok(None)`; malformed/oversized prefix →
-  `Err` → teardown + `clear()`). Bounded by construction: `peek_header` rejects a
-  declared length past `MAX_PAYLOAD_LEN`, so the buffer never exceeds one
-  max-sized frame — predictable ESP32 RAM. The driver just pumps raw socket
-  bytes; only the partial-frame state is core. `RxBuffer` is cleared on every
-  teardown so a fresh socket starts empty.
-
-- **D5 — Split the error type: core vs transport.** Today `TuyaError` wraps
-  `std::io::Error` (not `no_std`). Proposed: the core error carries **no**
-  `std::io::Error`; transport/I/O failures are the driver's and enter the core
-  only as a neutral event (`ConnectFailed`) or a marker (`TuyaError::Transport`).
-  The public 0.3 `TuyaError` (with io) stays on the tokio driver for API
-  compatibility; the core gets a leaner `CoreError`.
-
-- **D6 — Public-API compatibility contract.** Proposed: the tokio driver
-  preserves the **exact** 0.3 `rustuya::{Device, Scanner}`, `rustuya::sync::*`,
-  and Python API — 0.3 → 0.4 is a non-breaking move for existing tokio/Python
-  users; sans-I/O is an internal boundary. The blocking and embassy drivers are
-  **additive** surface. Any 0.4 breakage should be a deliberate decision, never
-  an incidental fallout of the refactor.
-
-- **D7 — Concurrency primitives stay driver-side.** The listener latch/replay,
-  `watch`/`broadcast` fan-out, mpsc command queue, and connect-concurrency cap
-  remain in the tokio driver. The core only *emits* `DeviceEvent`s; how they are
-  delivered (lost-wakeup-safe, per [[concurrency-design-rules]]) is a driver
-  concern. Keeps the core single-threaded and allocation-light.
-
-- **D8 — JSON behind a seam.** Isolate JSON encode/decode behind one small
-  module so `serde_json` (alloc) ↔ `serde-json-core` (no-alloc) is a swap, not a
-  rewrite. Decide the seam's signature in M0 even if the swap comes later.
-
----
-
-## M0 — Core skeleton + `no_std` gate  (go/no-go)
-
-> Proof of concept. Move only what is already pure. **No behavior change; parity
-> + tuyamock stay green.** If M0 lands clean, the approach is validated.
-
-- [ ] **M0.1** Create the `rustuya-core` crate (`#![no_std]` + `extern crate alloc`), workspace wiring.
-- [ ] **M0.2** Move `protocol/` (pack/unpack, message types) into core. Swap `std::net` → `core::net`; `HashMap` → `alloc::collections::BTreeMap` (or `heapless`) where it appears in core paths.
-- [ ] **M0.3** Move `crypto.rs` into core with RustCrypto `default-features = false`. Confirm GCM + ECB paths byte-identical.
-- [ ] **M0.4** Thread the RNG through: replace every internal `rand::rng()` (GCM IV @ `protocol/mod.rs`, handshake nonce @ `prepare_session_key_negotiation`, backoff jitter) with an injected `&mut impl RngCore`. Driver supplies `rand::rng()`; tests supply a seeded RNG.
-- [ ] **M0.5** Define a core-local `Instant`/monotonic abstraction (no `std::time`), and a hand-rolled `CoreError` enum + `Display` (no `thiserror` in core; no `std::io::Error` — D5). Replace `byteorder` with `u32::from_be_bytes`/`to_be_bytes`.
-- [ ] **M0.6** Re-land the tokio `rustuya` crate as a **driver** calling core for pack/unpack/crypto. `sync` facade + Python unchanged.
-- [ ] **M0.7** **CI: bare-metal build gate.** `cargo build -p rustuya-core --no-default-features --target riscv32imc-unknown-none-elf` (add the target + a no-std smoke). Also `--target thumbv7em-none-eabi`.
-- [ ] **M0.8** Green gates: `tinytuya_parity` (210/210), `tuyamock` integration (fast + slow), clippy, MSRV.
-
-**Acceptance:** core compiles `no_std` for a bare-metal target; the tokio side is
-byte-for-byte behavior-identical under the existing oracles.
+- [x] **M0.1** `rustuya-core` crate (`#![no_std]` + `alloc`), workspace wiring.
+- [x] **M0.2** `protocol/` (pack/unpack, message types) in core; `core::net`;
+  `BTreeMap` in core paths.
+- [x] **M0.3** `crypto.rs` in core with RustCrypto `default-features = false`;
+  GCM + ECB byte-identical.
+- [x] **M0.4** RNG threaded through: every internal `rand::rng()` (GCM IV,
+  handshake nonce, backoff jitter) replaced by an injected `&mut impl RngCore`.
+- [x] **M0.5** Core-local `Instant`/`Duration`, hand-rolled `CoreError` +
+  `Display` (no `thiserror`, no `std::io::Error` — D5); `byteorder` → built-in.
+- [x] **M0.6** Tokio driver lands as a thin driver calling core for
+  pack/unpack/crypto — built from scratch as `rustuya-tokio` (M1.5), not a
+  re-land of the dropped root crate.
+- [x] **M0.7** CI bare-metal build gate: `cargo build -p rustuya-core
+  --no-default-features --target {riscv32imc,thumbv7em}-none-*`.
+- [x] **M0.8** Green gates: `tinytuya_parity`, `tuyamock` integration, clippy
+  (`-D warnings`), MSRV.
 
 ## M1 — Device connection FSM into the core
 
-> Extract the connection/handshake/reconnect lifecycle as `step()`. The tokio
-> actor becomes a translator (`DevAction` ↔ tokio TCP/timer).
+- [x] **M1.1** FSM states (Connecting → Handshaking → Connected → Backoff → …) +
+  `Input`/`Event` (poll-split). *`device.rs`.*
+- [x] **M1.2** Session-key negotiation (prepare/verify/finalize) in the FSM.
+  *`session.rs` + `device.rs`.*
+- [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout`
+  deadline (DESIGN P1/P2/P6). The wake half is `Input::ConnectNow` (one signal
+  for both discovery-rewake and explicit `connect_now`).
+- [x] **M1.4** Heartbeat + idle-timeout + handshake-timeout as timer events,
+  merged into the single `poll_timeout` via `earliest()` (DESIGN P4/P5).
+- [x] **M1.4b** `cid` threaded through the FSM so **sub-devices** work
+  (`Input::Send { cid }` → `command::generate`). Pinned by a zero-time envelope
+  test.
+- [x] **M1.5** **Tokio driver** — a thin actor per device over the FSM
+  (`rustuya-tokio`, from scratch; the legacy root crate is dropped). Loop:
+  `wants_connect → dial`, `select!{cmd, socket, one poll_timeout timer}`, drain
+  `poll_transmit`/`poll_event`. Injects only I/O (Send `StdRng`, `tokio::Instant`
+  clock, TCP). Surface: `DeviceBuilder → Device` (`status`/`set_dps`/`set_value`/
+  `request`), sub-devices `Device::sub(cid)`, `listener()` (a `Stream`),
+  `is_connected`/`wait_connected`/`close`, `connect_now()`. Addressless connect
+  via `DeviceBuilder::discover(&Discovery, timeout)` (resolves IP **and**
+  version). Live rewake and `connect_now` are one `Input::ConnectNow` (cancel
+  backoff / revive terminal `Closed`); the rewake carries a changed IP so a DHCP
+  renewal self-corrects the resolve-once address (`Discovery::last_seen` exposes
+  staleness as a fact, not a policy). Fleet routing is an O(1) `id → Route`
+  registry, not an O(N²) broadcast forwarder (DESIGN R1–R4). Constructor stays
+  `Device::builder`; the 0.3 addressless `Device::new` is intentionally dropped
+  (it would need a process-global scanner — DESIGN Q1). E2Es: `rediscovery`,
+  `connect_now`, `rediscovery_ip_change`, `discovery_seen_flap`, `fleet_scale`,
+  `discover_connect` + the `tokio_control` example.
+- [x] **M1.6** Deterministic FSM tests at zero wall-clock (backoff curve,
+  jitter bounds) + the seeded-RNG handshake-nonce / GCM-IV uniqueness tests.
+  *`device.rs`.*
+- [x] **M1.7** `tuyamock` E2E wired to the tokio driver
+  (`rustuya-tokio/tests/tuyamock*.rs`): spawns the real `tuyamock` subprocess
+  (opt-in via `RUSTUYA_TUYAMOCK`) and drives status/set across every version
+  (3.1/3.3/3.4/3.5) + device22. It caught a real bug the self-crafted
+  `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` retcode the core
+  decoded with `has_retcode=false` (the loopback mock, built on the library's own
+  encoder, was self-consistent and blind to it). Fixed; both mocks made faithful.
 
-- [x] **M1.1** Model the FSM: states (Connecting → Handshaking → Connected → Backoff → …) + `Input`/`Event` (poll-split). *v2, `device.rs`.*
-- [x] **M1.2** Port the session-key negotiation (prepare/verify/finalize) into the FSM. *v1, `session.rs` + `device.rs`.*
-- [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout` deadline (DESIGN P1/P2/P6). The wake half is `Input::ConnectNow` (one signal for both discovery-rewake and explicit `connect_now`) — in poll-split it's a driver channel, not core `select`. *v2, `device.rs` + `time.rs`.*
-- [x] **M1.4** Heartbeat + idle-timeout + handshake-timeout as timer events, all merged into the single `poll_timeout` via `earliest()` (DESIGN P4/P5 resolved; a stalled handshake no longer stalls forever). *v3, `device.rs`.* dev22 fallback decisions still to port from `decision.rs`.
-- [x] **M1.4b (core)** Thread `cid` through the FSM so **sub-devices** work:
-  `Input::Send` gained a `cid: Option<&'a str>` field, `on_send` forwards it into
-  `command::generate` (which already took `cid` but was called with `None`). Pinned
-  by `send_with_cid_targets_the_sub_device_in_the_envelope` (zero-time: the emitted
-  frame's `devId`/`cid` address the sub-device). 77 lib + parity + no_std(riscv)
-  green. Unblocks the sub-device half of M1.5.
-- [ ] **M1.5** Tokio driver as a thin loop over the FSM — **driver skeleton
-  landed, milestone not complete.** Built **from scratch** as a new
-  `rustuya-tokio` crate (standalone `[workspace]`, path dep on `rustuya-core`),
-  **not** an in-place rewrite of the legacy root `rustuya` crate (now
-  reference-only). One `tokio::spawn`ed actor per device runs the canonical
-  poll-split loop: `wants_connect → dial`, then
-  `select!{cmd_rx, socket-read, one poll_timeout timer}`, then drain
-  `poll_transmit → socket` / `poll_event → {waiters, listener bus}`. The driver
-  injects **only** I/O — a Send `StdRng` (OS-seeded, keeps IV/nonce uniqueness),
-  a `tokio::time::Instant` base for `now`, and TCP. *No protocol decisions in the
-  driver.* `persist`/`nowait` collapse into the core's `auto_reconnect` knob;
-  backoff/heartbeat/idle/handshake-timeout are all FSM-owned. Public surface so
-  far: `DeviceBuilder → Device` with `status`/`set_dps`/`set_value`/`request`,
-  lossless `listener()` (a `Stream`, so the README `while let Some(m) =
-  l.next().await` idiom works verbatim), `is_connected`/`wait_connected`, graceful
-  `close`, and **sub-devices** via `Device::sub(cid) → SubDevice` (rides M1.4b; a
-  loopback test asserts the `cid` reaches the wire envelope). Fire-and-forget FIFO
-  response correlation (no seqno matching — protocol has no token). A runnable
-  `examples/tokio_control.rs` mirrors the README async shape (explicit address).
-  *Addressless connect works:* `DeviceBuilder::discover(&Discovery, timeout)`
-  resolves IP **and** version from the LAN (via M2.3) and connects — see
-  `examples/discover_connect.rs`, pinned by a deterministic E2E (UDP announce →
-  discover → TCP connect → status). *`connect_now` + live rewake (P3) work and are
-  **one** mechanism:* the core has a single `Input::ConnectNow` (cancel backoff /
-  revive terminal `Closed`), fed by both `Device::connect_now()` and the discovery
-  forwarder (`DeviceBuilder::rediscover(&Discovery)`, auto-linked by `discover`).
-  Two deterministic E2Es: `tests/rediscovery.rs` (1-hour backoff, reconnect only
-  via a LAN re-announcement) and `tests/connect_now.rs` (`auto_reconnect(false)`
-  terminal device revived only by an explicit `connect_now()`).
-  *Constructor decided (A):* the entry stays `Device::builder(id, key) →
-  DeviceBuilder` — set an `address` or resolve one via `discover(&Discovery)`,
-  then `connect`. The 0.3 addressless-magic literal `Device::new("ID","KEY")`
-  (auto-connect with no address, returning a `Device`) is *intentionally dropped*,
-  not reproduced: REUSEPORT load-balances, so a per-device Discovery would drop
-  announcements — the magic needs a *process-shared* Discovery, i.e. exactly the
-  global scanner singleton DESIGN Q1 removed. Rather than reverse Q1, resolving an
-  address without a fixed IP stays **explicit** (pass a shared `Discovery` to
-  `discover`), which keeps error locality (`Result` at the fallible call),
-  deterministic lifetime, and fleet-correctness (one shared listener). *`new` was
-  considered and rejected as a smell:* under A a `Device` does not exist until it
-  is connected (connecting is fallible), so a `Device::new` returning a
-  `DeviceBuilder` would trip `clippy::new_ret_no_self` — the honest builder-entry
-  name is `builder`, and an `#[allow]` would only silence the messenger. The
-  published root `README.md` still shows the old `rustuya::sync::Device` /
-  `rustuya::Device` 0.3 crate and is deferred to the 0.4 release consolidation
-  (alongside Python + crate naming), not rewritten piecemeal here (doc-sync cost).
-  *Rewake carries the address + staleness is exposed, not policed:* the rediscovery
-  forwarder now sends `Cmd::ConnectNow { addr: Some(ip:port) }`, so a device that
-  re-announces at a **changed IP** (DHCP renewal) redials the new target — the
-  resolve-once address self-corrects instead of dialing the stale one forever
-  (`connect_now()` sends `addr: None`, keeping the current target). This fixes a
-  correctness gap in the earlier "self-heal" claim. The 0.3 scanner instead
-  read-gated a cached address behind a 30-min magic cooldown; 0.4 keeps no hidden
-  freshness policy — the driver's `known` map records a last-seen `Instant`,
-  surfaced by `Discovery::last_seen(id) -> Option<Duration>` so callers judge
-  staleness themselves. Pinned by `tests/rediscovery_ip_change.rs` (127.0.0.1 →
-  127.0.0.2 redial; verified to fail without the address-carrying rewake).
-  *Fleet-scale discovery hardening (DESIGN R1–R4):* the first per-device
-  broadcast-subscribe-and-filter forwarder regressed vs the 0.3 singleton at fleet
-  scale (the singleton's smell was its *global lifecycle*, not its *keyed
-  routing*). Replaced with an **`id → Route` registry** on the owned `Discovery`
-  (`register` at connect, lazy-prune on channel close): each announcement is one
-  O(1) map lookup + non-blocking `try_send` to just that device — no O(N²)
-  fan-out, no broadcast-lag drop of the reconnect trigger. A new core
-  `Event::Seen(id)` (unchanged re-announcement) wakes a **same-IP** flap from
-  backoff instantly (the common case the resolve-once design left stuck); `Found`
-  still carries the new address for an IP change. Multi-source active probing
-  restored (`local_ips: Vec` → one v3.5 probe per source, sent from a per-source
-  socket) and the driver `known` map now evicts at `cache_ttl`. Two new E2Es:
-  `tests/discovery_seen_flap.rs` (① same-IP Seen wake) and `tests/fleet_scale.rs`
-  (② 300 devices reconnect from one announcement burst; both verified to fail with
-  routing neutered). Broadcast is now used only for the `find`/`discovered`
-  enumerate API, not the reconnect fast path.
-  **Scope update (2026-07-14): 0.4 is a pure-Rust library — the Python surface is
-  out of scope** (shipped 0.3 Python suffices; add later only if needed). With
-  that, M1.5's device-driver surface is **complete**; no further blocker.
-- [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
-- [x] **M1.7** `tuyamock` E2E wired to the tokio driver (`rustuya-tokio/tests/tuyamock.rs`): spawns the real `tuyamock` subprocess (opt-in via `RUSTUYA_TUYAMOCK`/PATH; skips otherwise) and drives status/set across **every** version (3.1/3.3/3.4/3.5) plus device22. **This immediately paid for itself:** it caught a real bug the self-crafted `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` carries a 4-byte retcode (like every device→client message), but the core decoded it with `has_retcode=false`. The loopback mock, built on the library's own `encode_message`, was self-consistent and blind to it. Fixed in `device.rs` (decode the handshake response with `has_retcode=true`) + both mocks made faithful. `loopback.rs` remains as a zero-dependency stand-in.
-
-**Acceptance:** reconnect/handshake/dev22 covered by pure zero-time tests; tokio
-behavior unchanged under tuyamock.
-
-## M1.5 — Blocking (`std`, no-tokio) driver  [optional, high-value]
+## M1.5-blocking — Blocking (`std`, no-tokio) driver  [optional, not started]
 
 > A second driver over the same core using `std::net::TcpStream` +
-> `set_read_timeout` + `thread::sleep` — **no tokio**. Independent of M2; a
-> natural payoff right after the Device FSM (M1). This is also the **std-side
-> rehearsal for the ESP32 driver (M3)**: same core, blocking loop.
+> `set_read_timeout` + `thread::sleep` — no tokio. The std-side rehearsal for the
+> ESP32 driver (M3): same core, blocking loop.
 
-- [ ] **M1.5.1** One background `std::thread` per device runs the read → `handle_input` → drain-transmit → arm-`thread::sleep` loop, so `persist` keepalive + `listener()` work without a tokio runtime.
-- [ ] **M1.5.2** `blocking` feature on the `rustuya` crate; a pure-sync consumer compiles with **tokio / mio / socket2 absent** from the dependency tree.
-- [ ] **M1.5.3** Removes the `block_on`-from-within-a-runtime footgun (the M1.7 guard) for this path — there is no runtime to borrow.
-- [ ] **M1.5.4** Scope note in docs: **small-scale only** — one thread per device, NOT for fleet. Fleet/Python stay on the tokio driver.
-
-**Acceptance:** a single-device sync flow (status / set / persist / listener)
-runs with tokio absent from the dependency tree; same core, same oracle.
+- [ ] **B.1** One `std::thread` per device runs read → `handle_input` →
+  drain-transmit → arm-`thread::sleep`, so persist keepalive + `listener()` work
+  with no tokio runtime.
+- [ ] **B.2** `blocking` feature; a pure-sync consumer compiles with tokio / mio
+  / socket2 absent from the dependency tree.
+- [ ] **B.3** Removes the `block_on`-from-within-a-runtime footgun (no runtime to
+  borrow).
+- [ ] **B.4** Docs: small-scale only — one thread per device, not for fleet.
 
 ## M2 — Discovery FSM into the core
 
-> ESP32 is a **controller that needs local search**, so discovery is in scope.
-> The core decides ports/payloads/timing; the driver owns the UDP sockets and
-> broadcast.
+- [x] **M2.1** Discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`);
+  packet decode (6699/GCM + 55AA plaintext/ECB) + TTL cache/dedup in the core.
+  Renamed from `scanner`; singleton dropped (DESIGN Q1–Q3).
+- [x] **M2.2** Broadcast scheduling as timer actions (`StartScan`/`StopScan` +
+  `poll_timeout`/`handle_timeout`, injected interval/burst); payload/port
+  selection via a typed `Probe`/`Dialect` table (DESIGN Q4/Q5).
+- [x] **M2.3** Tokio UDP driver over the discovery FSM
+  (`rustuya-tokio/src/discovery.rs`). UDP bind (`SO_REUSEADDR`/`REUSEPORT`) +
+  `SO_BROADCAST`; one reader task per socket → actor. Surface: `Discovery` /
+  `DiscoveryBuilder` / `Discovered` (a `Stream`), `find(id, timeout)`,
+  `discover_for(window)`, `known()`. `find` is race-free — a driver-side `known`
+  map + subscribe-before-check resolves an already-announced device immediately
+  (no magic short-TTL hack).
+- [x] **M2.4** On-demand active probing — the 0.3 magic cadence constants
+  (6 s/60 s/30 min/3) are gone (DESIGN Q4). Passive receive is always on; an
+  active probe fires only on demand (a `find`/`scan` miss or a failed dial),
+  batch-drained to one round per burst (single-flight), re-spaced by the device's
+  own reconnect backoff. Multi-source probing restored (`local_ips`, one probe
+  per source). Standalone `Discovery::scan(window)`/`known()`/`discovered()`/
+  `request_scan()` work with no `Device`. E2E:
+  `tests/discovery_active_ondemand.rs`.
+- [x] **M2.4b** Discovery watch-channel semantics preserved — no lost wakeups
+  (`find`/`register` subscribe-before-check).
+- [x] **M2.5** Discovery behaviour under mock coverage
+  (`tests/tuyamock_discovery.rs`, the gold-standard gate for the decode path).
 
-- [x] **M2.1** Model the discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`); packet decode (6699/GCM + 55AA plaintext/ECB) + TTL cache/dedup moved into the core. *v1, passive receive only — `discovery.rs`.* (Renamed from `scanner`; singleton dropped — DESIGN Q1–Q3.)
-- [x] **M2.2** Broadcast scheduling as timer actions (`StartScan`/`StopScan` + `poll_timeout`/`handle_timeout`, injected interval/burst); payload/port selection as pure output via a typed `Probe`/`Dialect` table (DESIGN Q4/Q5). v3.5 source-IP is `Config::local_ip` (driver fills it — Q6). *v2, `discovery.rs`.* Scan-start cooldown/throttle stays a driver policy (when to send `StartScan`).
-- [x] **M2.3** Tokio UDP driver over the discovery FSM — `rustuya-tokio/src/discovery.rs`.
-  Owns UDP bind (`SO_REUSEADDR`/`REUSEPORT` so the well-known ports 6666/6667/7000
-  are shareable) + `SO_BROADCAST` send; one reader task per socket funnels
-  datagrams into a channel, and one actor runs `select!{datagram, control, one
-  poll_timeout timer}` → drain `poll_transmit → broadcast socket` /
-  `poll_event → announcement bus`. Public surface (no "scanner" name, matching the
-  core rename): `Discovery` / `DiscoveryBuilder` / `Discovered` (a `Stream`),
-  `find(id, timeout)`, `discover_for(window)`, `known()`. **Best-effort local-IP
-  detection** fills `Config::local_ip` (Q6). `find` is race-free by design — it
-  holds a driver-side `known` map (id → info) and subscribes *before* the cache
-  check, so it resolves an already-announced device immediately instead of hanging
-  on the dedup-suppressed re-announcement (this replaced a magic short-TTL test
-  hack). Two loopback E2E tests (crafted UDP announcement → `DeviceInfo`).
-- [x] **M2.4** **On-demand active probing — magic cadence constants removed.** The
-  0.3 scanner's active-scan was gated by author-chosen numbers (`BROADCAST_INTERVAL`
-  6 s, `SCAN_THROTTLE_INTERVAL` 60 s, `GLOBAL_SCAN_COOLDOWN` 30 min, `MAX_BROADCASTS`
-  3). The intent behind them was right (passive by default; active only when
-  needed; coalesce concurrent requests; don't storm) but the numbers were a smell.
-  0.4 keeps the intent with **zero discovery-specific constants**: (a) passive
-  receive is always on and does the bulk (devices self-announce, desynchronized);
-  (b) an active probe fires **only on demand** — a `find`/`scan` cache-miss, or a
-  device's failed dial (`ActorConfig::want_scan`) — never a perpetual beat; (c) the
-  discovery actor **batch-drains** the demand channel and emits **one round per
-  burst** (single-flight: 1000 concurrent `find`s → one broadcast; the coalesce is
-  keyed on *dispatch*, set synchronously, so the ms reply-latency can't race it into
-  N probes); (d) re-probe spacing rides the *device's own reconnect backoff*
-  (injected + jittered) — always ≫ reply latency, so the broadcast→N-reply storm is
-  bounded and self-extinguishing (stops when devices connect). The only time inputs
-  are caller-supplied (`find(timeout)`, `scan(window)`) and the reconnect `Backoff`
-  the user already injects. Standalone use preserved (0.3's Python `Scanner.scan()`):
-  `Discovery::scan(window)` / `known()` / `discovered()` / `request_scan()` work
-  with no `Device`. Same-id `register` is last-wins + warn (mirrors the 0.3 bridge
-  defense). The driver `known` map dropped its timer-TTL (naturally bounded by the
-  broadcast domain, ~13 MB worst case for a /16; `last_seen` exposes staleness as a
-  fact, not a policy). E2E: `tests/discovery_active_ondemand.rs` (a mock device
-  replies to a probe; find resolves on demand, 50 concurrent finds coalesce to ≤10
-  probes — both verified to fail with the demand signal neutered).
-- [ ] **M2.4b** Discovery watch-channel semantics preserved (no lost wakeups — cf. concurrency rules; `find`/`register` subscribe-before-check).
-- [ ] **M2.5** Parity of discovery behavior against 0.3 (unit + any mock discovery coverage).
-
-**Acceptance:** the scanner is a driver over a pure discovery FSM; behavior
-matches 0.3.
+**Acceptance:** discovery is a driver over a pure FSM; the decode path is
+mock-gated.
 
 ## M3 — ESP32 driver (`rustuya-embassy`)  [0.5+]
 
-> Only after M0–M2 are solid. This is where the Embassy-vs-esp-idf choice is
-> finally made, ideally validated on real hardware against a real Tuya device.
-> The M1.5 blocking driver is this one's std-side rehearsal — same core, same
-> blocking-loop shape — so most of the driver pattern is already proven by here.
+> Only after M0–M2 are solid. Where the Embassy-vs-esp-idf choice is made,
+> validated on real hardware. The blocking driver is its std-side rehearsal.
 
-- [ ] **M3.1** Decide runtime: bare-metal Embassy (`esp-hal` + `embassy-net`/smoltcp) vs esp-idf `std`. Record rationale.
-- [ ] **M3.2** `rustuya-embassy` driver: `embassy-net` TCP/UDP + `embassy-time` timers wired to the core FSMs; HW RNG (`esp-hal`) as the injected `RngCore`.
-- [ ] **M3.3** Memory profile: bounded buffers, one device, tiny channels; evaluate swapping `serde_json` → `serde-json-core` in core if RAM-bound.
-- [ ] **M3.4** Validate: connect + status + set + one reconnect against a real Tuya device (or the smoltcp-side of tuyamock) on ESP32.
-
-**Acceptance:** a real controller flow runs on ESP32 sharing the core with the
-tokio driver.
+- [ ] **M3.1** Decide runtime: bare-metal Embassy (`esp-hal` +
+  `embassy-net`/smoltcp) vs esp-idf `std`. Record rationale.
+- [ ] **M3.2** `rustuya-embassy` driver: `embassy-net` TCP/UDP + `embassy-time`
+  wired to the core FSMs; HW RNG as the injected `RngCore`.
+- [ ] **M3.3** Memory profile: bounded buffers, one device, tiny channels;
+  evaluate `serde_json` → `serde-json-core` if RAM-bound.
+- [ ] **M3.4** Validate connect + status + set + one reconnect against a real
+  Tuya device (or tuyamock's smoltcp side) on ESP32.
 
 ---
 
 ## Risk / landmine register
 
-- `std::time::Instant` → core abstraction / injected `now`. (M0.5)
-- `HashMap` in core → `alloc` `BTreeMap` or `heapless`. (M0.2)
-- `parking_lot` / locks → gone in core (single-owner FSM). (M1)
-- `rand::rng()` internal calls → injected `RngCore` everywhere. (M0.4)
-- **`serde_json` is the heaviest core dep (RAM).** Keep JSON handling behind one
-  seam so it can become `serde-json-core` later. (M0.2 / M3.3)
-- `thiserror` 2 `no_std` — verify; hand-roll the core error enum if needed. (M0.5)
-- **RX buffer growth** — handled: `rx::RxBuffer` is bounded by `peek_header`'s
-  `MAX_PAYLOAD_LEN` check (a malformed length field errors before it can balloon
-  RAM) and cleared on teardown. (D4 — resolved)
-- **Error-type split leakage** — if any `std::io::Error` sneaks into the core
-  error, `no_std` breaks. Enforce with the M0.7 bare-metal build gate. (D5)
-- **API drift during refactor** — the tokio/Python surface must stay 0.3-identical
-  (D6); guard with the unchanged public API + the parity/tuyamock oracles.
-- smoltcp broadcast constraints — absorbed in the embassy driver, not the core. (M3)
-- **Reopening 0.3 hardening bugs** — the single biggest risk. Mitigation: the
-  existing `tinytuya_parity` + `tuyamock` oracles gate every phase; no phase
-  merges to `master` without them green.
+- **`serde_json` is the heaviest core dep (RAM).** Keep it behind the D8 seam so
+  it can become `serde-json-core` later. (D8 / M3.3)
+- **Error-type split leakage** — any `std::io::Error` in the core breaks
+  `no_std`; enforced by the M0.7 bare-metal gate. (D5)
+- **Reopening 0.3 hardening bugs** — the biggest risk. Mitigation: the
+  `tinytuya_parity` + `tuyamock` oracles gate every phase; no phase merges to
+  `master` without them green.
+- **smoltcp broadcast constraints** — absorbed in the embassy driver, not the
+  core. (M3)
 
 ## Definition of done for 0.4
 
 - `rustuya-core` builds `no_std` for a bare-metal target in CI.
-- `rustuya` (tokio) is a thin driver over the core; Python + `sync` unchanged;
-  all 0.3 oracles green.
+- `rustuya-tokio` is a thin driver over the core; all oracles green.
 - Device + discovery lifecycle covered by pure, zero-wall-clock FSM tests.
 - (Stretch / 0.5) at least one working driver on ESP32.
