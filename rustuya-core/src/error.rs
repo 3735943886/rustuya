@@ -33,6 +33,22 @@ pub enum CoreError {
     NotConnected,
 }
 
+impl CoreError {
+    /// Whether this error is an **authentication/decryption failure** — a failed
+    /// CRC, HMAC, or GCM tag / PKCS7 check. On the Tuya LAN protocol the usual
+    /// cause is a **wrong local key or a wrong protocol version** (0.3 mapped both
+    /// `CrcMismatch` and `HmacMismatch` to a single "key or version" diagnostic).
+    /// The classification lives here, where the protocol semantics are; the driver
+    /// turns it into a human-facing message and surfaces it.
+    #[must_use]
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(
+            self,
+            CoreError::CrcMismatch | CoreError::HmacMismatch | CoreError::DecryptFailed
+        )
+    }
+}
+
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -50,3 +66,21 @@ impl fmt::Display for CoreError {
 }
 
 impl core::error::Error for CoreError {}
+
+#[cfg(test)]
+mod tests {
+    use super::CoreError;
+
+    #[test]
+    fn auth_failures_are_classified() {
+        // The "wrong key or version" class (0.3 ERR_KEY_OR_VER).
+        assert!(CoreError::CrcMismatch.is_auth_failure());
+        assert!(CoreError::HmacMismatch.is_auth_failure());
+        assert!(CoreError::DecryptFailed.is_auth_failure());
+        // Structural/transport errors are not.
+        assert!(!CoreError::Truncated.is_auth_failure());
+        assert!(!CoreError::BadHeader.is_auth_failure());
+        assert!(!CoreError::TooLong.is_auth_failure());
+        assert!(!CoreError::NotConnected.is_auth_failure());
+    }
+}

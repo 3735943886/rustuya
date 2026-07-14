@@ -74,9 +74,10 @@ use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Surface the driver's internal `log` output when RUST_LOG is set; silent
-    // otherwise. Example-only convenience — the library never installs a logger.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off")).init();
+    // Show the driver's `warn` logs by default (e.g. an authentication failure —
+    // wrong key/version); raise with RUST_LOG=rustuya_tokio=debug for the rest.
+    // Example-only convenience — the library never installs a logger.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -285,6 +286,15 @@ async fn monitor(mut args: Vec<String>) -> Result<()> {
     };
 
     let dev = connect_resolved(id, key, ip, version).await?;
+
+    // Surface a clear connect failure (e.g. wrong key/version) up front instead of
+    // silently flapping. A plain timeout is fine — the device may just be offline,
+    // and monitoring its eventual reconnect is the whole point.
+    match dev.wait_connected(Duration::from_secs(12)).await {
+        Ok(()) => {}
+        Err(TuyaError::Timeout) => println!("(not connected yet — will keep watching for it)"),
+        Err(e) => return Err(e),
+    }
 
     println!("monitoring; Ctrl-C to stop.");
     println!("=> power-cycle the device to watch it reconnect.");

@@ -247,6 +247,9 @@ impl DeviceBuilder {
         let (cmd_tx, cmd_rx) = mpsc::channel(self.command_capacity);
         let (bcast_tx, _) = broadcast::channel(self.listener_capacity);
         let (conn_tx, conn_rx) = watch::channel(false);
+        // Carries the last authentication failure (wrong key / version) so a
+        // connect attempt reports *why* rather than only timing out.
+        let (autherr_tx, autherr_rx) = watch::channel(None);
 
         // If a discovery is linked, register this device's actor so the discovery
         // loop wakes it directly (O(1)) on a re-announcement — carrying the fresh
@@ -267,13 +270,14 @@ impl DeviceBuilder {
         };
 
         let bcast_for_actor = bcast_tx.clone();
-        tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx));
+        tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx, autherr_tx));
 
         Ok(Device {
             id: self.id,
             cmd_tx,
             bcast_tx,
             conn_rx,
+            autherr_rx,
             request_timeout: self.request_timeout,
         })
     }
@@ -308,6 +312,7 @@ pub struct Device {
     cmd_tx: mpsc::Sender<Cmd>,
     bcast_tx: broadcast::Sender<Message>,
     conn_rx: watch::Receiver<bool>,
+    autherr_rx: watch::Receiver<Option<CoreError>>,
     request_timeout: StdDuration,
 }
 
@@ -352,15 +357,27 @@ impl Device {
     }
 
     /// Wait until the connection is up, or `dur` elapses.
+    ///
+    /// If the connection can't come up because the device rejects our
+    /// authentication — a wrong local key or protocol version — this returns that
+    /// [`CoreError`] (via [`TuyaError::Core`]) rather than waiting out the whole
+    /// `dur` for a bare [`Timeout`](TuyaError::Timeout). That is the common
+    /// misconfiguration, so naming it is worth more than a generic timeout.
     pub async fn wait_connected(&self, dur: StdDuration) -> Result<()> {
-        let mut rx = self.conn_rx.clone();
+        let mut conn = self.conn_rx.clone();
+        let mut err = self.autherr_rx.clone();
         let wait = async {
             loop {
-                if *rx.borrow() {
+                if *conn.borrow() {
                     return Ok(());
                 }
-                if rx.changed().await.is_err() {
-                    return Err(TuyaError::Closed);
+                if let Some(e) = err.borrow().clone() {
+                    return Err(TuyaError::Core(e));
+                }
+                // Wake on either a connection-state change or a new auth failure.
+                tokio::select! {
+                    r = conn.changed() => if r.is_err() { return Err(TuyaError::Closed); },
+                    r = err.changed() => if r.is_err() { return Err(TuyaError::Closed); },
                 }
             }
         };

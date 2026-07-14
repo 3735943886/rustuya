@@ -35,6 +35,11 @@ impl fmt::Display for TuyaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TuyaError::Io(e) => write!(f, "transport I/O error: {e}"),
+            // Name the common cause: a CRC/HMAC/GCM failure is almost always a
+            // wrong local key or protocol version (0.3's "key or version" error).
+            TuyaError::Core(e) if e.is_auth_failure() => {
+                write!(f, "authentication failed ({e}) — likely a wrong local key or protocol version")
+            }
             TuyaError::Core(e) => write!(f, "protocol error: {e}"),
             TuyaError::Timeout => f.write_str("request timed out"),
             TuyaError::Disconnected => f.write_str("connection dropped during request"),

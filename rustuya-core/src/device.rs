@@ -1061,6 +1061,25 @@ mod tests {
     }
 
     #[test]
+    fn inbound_frame_failing_integrity_surfaces_as_auth_failure() {
+        // A connected device that receives a frame it can't authenticate/decrypt
+        // (here a corrupted body → CRC mismatch; in the field a wrong key or a
+        // wrong protocol version) must surface it as an auth-failure ProtocolError,
+        // not swallow it — that's what lets the driver report "key or version".
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg_live(None, None), &mut rng);
+        let mut frame = inbound_data_frame();
+        let mid = frame.len() / 2;
+        frame[mid] ^= 0xff; // corrupt the body → integrity check fails
+        dev.handle_input(Input::Received(&frame), Instant::from_millis(0), &mut rng);
+        let ev = drain_events(&mut dev);
+        assert!(
+            matches!(&ev[..], [Event::ProtocolError(e)] if e.is_auth_failure()),
+            "integrity failure surfaces as an auth failure, got {ev:?}"
+        );
+    }
+
+    #[test]
     fn inbound_frame_pushes_idle_deadline_forward() {
         let mut rng = SeededRng(1);
         let mut dev = connected(cfg_live(None, Some(Duration::from_secs(30))), &mut rng);

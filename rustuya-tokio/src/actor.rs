@@ -81,6 +81,19 @@ fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The channels the actor publishes out on, grouped so `settle`/`dispatch_events`
+/// take one value instead of a growing argument list.
+struct Sinks {
+    /// The lossless push/response bus feeding every [`Listener`](crate::Listener).
+    bcast: broadcast::Sender<Message>,
+    /// Connection-up state feeding `is_connected` / `wait_connected`.
+    conn: watch::Sender<bool>,
+    /// The last authentication failure (wrong key / version), or `None` while the
+    /// connection is healthy — so `wait_connected` can report *why* it won't come
+    /// up instead of just timing out (the 0.3 "key or version" diagnostic).
+    autherr: watch::Sender<Option<CoreError>>,
+}
+
 /// The actor entry point. Runs until every command sender is dropped or a
 /// [`Cmd::Close`] arrives.
 pub(crate) async fn run(
@@ -88,6 +101,7 @@ pub(crate) async fn run(
     mut cmd_rx: mpsc::Receiver<Cmd>,
     bcast_tx: broadcast::Sender<Message>,
     conn_tx: watch::Sender<bool>,
+    autherr_tx: watch::Sender<Option<CoreError>>,
 ) {
     let ActorConfig {
         core,
@@ -96,6 +110,7 @@ pub(crate) async fn run(
         want_scan,
     } = acfg;
 
+    let sinks = Sinks { bcast: bcast_tx, conn: conn_tx, autherr: autherr_tx };
     let mut fsm = Device::new(core);
     // A Send CSPRNG (ChaCha), seeded from the OS. One instance for the task's
     // lifetime is fine: its period dwarfs any device's frame count, and pinning
@@ -137,7 +152,7 @@ pub(crate) async fn run(
                     }
                 }
             }
-            settle(&mut fsm, &mut stream, &mut waiters, &bcast_tx, &conn_tx, base, &mut rng).await;
+            settle(&mut fsm, &mut stream, &mut waiters, &sinks, base, &mut rng).await;
             continue;
         }
 
@@ -178,7 +193,7 @@ pub(crate) async fn run(
                     for w in waiters.drain(..) {
                         let _ = w.send(Err(TuyaError::Closed));
                     }
-                    let _ = conn_tx.send(false);
+                    let _ = sinks.conn.send(false);
                     return;
                 }
             },
@@ -195,7 +210,7 @@ pub(crate) async fn run(
             }
         }
 
-        settle(&mut fsm, &mut stream, &mut waiters, &bcast_tx, &conn_tx, base, &mut rng).await;
+        settle(&mut fsm, &mut stream, &mut waiters, &sinks, base, &mut rng).await;
     }
 }
 
@@ -213,8 +228,7 @@ async fn settle(
     fsm: &mut Device,
     stream: &mut Option<TcpStream>,
     waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>,
-    bcast_tx: &broadcast::Sender<Message>,
-    conn_tx: &watch::Sender<bool>,
+    sinks: &Sinks,
     base: TokioInstant,
     rng: &mut StdRng,
 ) {
@@ -229,7 +243,7 @@ async fn settle(
         }
         // Events out. If the core tore the connection down, drop the socket so the
         // next dial gets a fresh one.
-        if dispatch_events(fsm, waiters, bcast_tx, conn_tx) {
+        if dispatch_events(fsm, waiters, sinks) {
             *stream = None;
         }
         return;
@@ -253,30 +267,49 @@ async fn flush_tx(fsm: &mut Device, stream: &mut Option<TcpStream>) -> std::io::
 fn dispatch_events(
     fsm: &mut Device,
     waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>,
-    bcast_tx: &broadcast::Sender<Message>,
-    conn_tx: &watch::Sender<bool>,
+    sinks: &Sinks,
 ) -> bool {
     let mut tore_down = false;
     while let Some(ev) = fsm.poll_event() {
         match ev {
             Event::Ready => {
-                let _ = conn_tx.send(true);
+                let _ = sinks.conn.send(true);
+                // A healthy connection clears any stale auth-failure diagnostic.
+                let _ = sinks.autherr.send(None);
             }
             Event::Response(msg) => {
                 // Every response also feeds the listener bus (lossless attach is
                 // the listener's concern; here we only fan out).
-                let _ = bcast_tx.send(msg.clone());
+                let _ = sinks.bcast.send(msg.clone());
                 deliver_to_waiter(waiters, msg);
             }
             Event::Disconnected => {
                 tore_down = true;
-                let _ = conn_tx.send(false);
+                let _ = sinks.conn.send(false);
                 for w in waiters.drain(..) {
                     let _ = w.send(Err(TuyaError::Disconnected));
                 }
             }
             Event::ProtocolError(e) => {
-                log::debug!("protocol error: {e}");
+                if e.is_auth_failure() {
+                    // A CRC/HMAC/GCM failure means the payload didn't authenticate
+                    // — almost always a wrong local key or protocol version. Surface
+                    // it (0.3's ERR_KEY_OR_VER): publish it so `wait_connected`
+                    // reports the reason instead of a bare timeout, warn-log it, and
+                    // fail the oldest in-flight request with the real cause (this
+                    // `ProtocolError` precedes the vaguer `Disconnected`).
+                    log::warn!(
+                        "authentication failed ({e}): likely a wrong local key or protocol version"
+                    );
+                    let _ = sinks.autherr.send(Some(e.clone()));
+                    while let Some(w) = waiters.pop_front() {
+                        if w.send(Err(TuyaError::Core(e.clone()))).is_ok() {
+                            break;
+                        }
+                    }
+                } else {
+                    log::debug!("protocol error: {e}");
+                }
             }
         }
     }
