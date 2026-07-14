@@ -10,6 +10,15 @@ The tokio driver runs it on a desktop/server; the same core is built to run on a
 MCU (Embassy/ESP32) behind a different driver — one protocol implementation, many
 runtimes.
 
+## Scope
+
+rustuya is built to drive **many devices at once with minimal overhead**, staying
+low-level and close to the wire: raw data points (DPS) over the LAN protocol, with
+no per-device-type modelling and no cloud. If you want higher-level, per-device
+abstractions (`OutletDevice`, `CoverDevice`, `BulbDevice`, …) or the Tuya Cloud
+API, use [tinytuya](https://github.com/jasonacox/tinytuya) — rustuya deliberately
+stops at the local protocol layer those build on.
+
 > **Status.** 0.4 is a from-scratch redesign on the `0.4-sansio` branch. The
 > shipping 0.3 line — a monolithic `rustuya` crate with Python bindings — lives on
 > `master` and the `v0.3.x` tags. This README covers 0.4.
