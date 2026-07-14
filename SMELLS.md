@@ -58,11 +58,26 @@ The 0.3 `scanner.rs` is tinytuya-derived and singleton-heavy. Rewritten as a pur
 | Q4 | **Blocking sleeps / tokio `interval`** for broadcast cadence | `scanner.rs` `perform_discovery_loop` | **Resolved.** Broadcast cadence is `poll_timeout`/`handle_timeout`; `broadcast_interval` + `broadcast_burst` are injected policy (no hardcoded 6 s / 3-count). `StartScan`/`StopScan` inputs drive it; recv-error backoff is a driver concern. |
 | Q5 | **Port→behavior coupling by scattered `== 7000`** literals | `scanner.rs:809/829/841` | **Resolved.** A typed `Probe { port, Dialect::{Legacy, V35} }` descriptor table (`DEFAULT_PROBES`) drives frame kind / cmd / key — data-driven like `version::Profile`. |
 
-**Pending**:
+**Resolved** (driver, 0.4):
 
-| # | 0.3 smell | Where (0.3) | The question to settle |
-|---|-----------|-------------|------------------------|
-| Q6 | **`discover_local_ip_blocking` + `0.0.0.0` fallback** stamped into v3.5 probe | `scanner.rs:762-805` | Source-IP selection is a **driver** concern; the core takes `Config::local_ip` (`None` → documented `0.0.0.0` degrade) and the driver fills/binds the egress IP. Core half done; driver-side auto-detection pending the tokio driver. |
+| # | 0.3 smell | Where (0.3) | 0.4 resolution |
+|---|-----------|-------------|----------------|
+| Q6 | **`discover_local_ip_blocking` + `0.0.0.0` fallback** + `discovery_sources` multi-source send | `scanner.rs:762-805` | **Resolved.** `Config::local_ips: Vec<Ipv4Addr>` — **one v3.5 probe per source**, each tagged (`poll_transmit → (bytes, port, source)`) and sent from a driver socket bound to that IP, so a multi-homed host actively elicits across subnets (the 0.3 `discovery_sources`). Empty → best-effort auto-detect one (`detect_local_ipv4`), else `0.0.0.0` degrade. Core builds payloads; driver owns sockets. |
+
+## Fleet-scale discovery — 0.4 keyed-routing hardening
+
+The clean-slate 0.4 decomposition (an owned `Discovery` + a per-device broadcast
+subscribe-and-filter forwarder) was correct for one device but **regressed vs the
+0.3 singleton at fleet scale** — the singleton was smelly for its *global
+lifecycle*, not its *keyed routing*, and the first cut threw out the routing with
+the bathwater. Confronted head-on; all resolved without reintroducing a global.
+
+| # | Trap | 0.4 resolution |
+|---|------|----------------|
+| R1 | **Same-IP flap left stuck on backoff** — a device that drops and re-announces at the *same* IP within TTL is deduped (no `Found`), so the broadcast forwarder never woke it; reconnect fell back to backoff-max latency. | Core emits **`Event::Seen(id)`** on an unchanged re-announcement (a pure liveness tick, distinct from `Found`); the driver routes it to a bare `ConnectNow` that cancels backoff and redials the current address. The common case (brief WiFi drop, IP unchanged) now reconnects the instant the device reappears. Pinned by `tests/discovery_seen_flap.rs`. |
+| R2 | **O(N²) fan-out + bus-lag drop** — every announcement cloned to all N forwarder subscribers (N² wakeups on a fleet event); a slow subscriber `Lagged` and could skip *its own* device's reconnect trigger during a mass reboot. | An **`id → Route` registry** on the owned `Discovery` (`register` at connect, lazy-prune on channel close): each announcement does **one** map lookup and a non-blocking `try_send` to just that device — O(1), no fan-out, no bus to lag. Broadcast stays only for the `find`/`discovered` enumerate API. Pinned by `tests/fleet_scale.rs` (300 devices, one announcement burst, all reconnect; verified 0/300 without the registry). |
+| R3 | **Single-subnet active probing** — 0.3's per-source send sockets became one `local_ip`. | Q6 above — `local_ips` multi-source. |
+| R4 | **Driver `known` map never evicted** while the core cache does — unbounded growth + `find` handing out addresses the core already forgot. | The driver map now carries a last-seen `Instant`; reads (`find`/`known`) treat entries older than `cache_ttl` as a miss, and a `Found` insert prunes expired entries. Bounded growth, honest reads. |
 
 ## Notes
 

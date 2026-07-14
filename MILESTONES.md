@@ -286,6 +286,22 @@ byte-for-byte behavior-identical under the existing oracles.
   surfaced by `Discovery::last_seen(id) -> Option<Duration>` so callers judge
   staleness themselves. Pinned by `tests/rediscovery_ip_change.rs` (127.0.0.1 →
   127.0.0.2 redial; verified to fail without the address-carrying rewake).
+  *Fleet-scale discovery hardening (SMELLS R1–R4):* the first per-device
+  broadcast-subscribe-and-filter forwarder regressed vs the 0.3 singleton at fleet
+  scale (the singleton's smell was its *global lifecycle*, not its *keyed
+  routing*). Replaced with an **`id → Route` registry** on the owned `Discovery`
+  (`register` at connect, lazy-prune on channel close): each announcement is one
+  O(1) map lookup + non-blocking `try_send` to just that device — no O(N²)
+  fan-out, no broadcast-lag drop of the reconnect trigger. A new core
+  `Event::Seen(id)` (unchanged re-announcement) wakes a **same-IP** flap from
+  backoff instantly (the common case the resolve-once design left stuck); `Found`
+  still carries the new address for an IP change. Multi-source active probing
+  restored (`local_ips: Vec` → one v3.5 probe per source, sent from a per-source
+  socket) and the driver `known` map now evicts at `cache_ttl`. Two new E2Es:
+  `tests/discovery_seen_flap.rs` (① same-IP Seen wake) and `tests/fleet_scale.rs`
+  (② 300 devices reconnect from one announcement burst; both verified to fail with
+  routing neutered). Broadcast is now used only for the `find`/`discovered`
+  enumerate API, not the reconnect fast path.
   **Still required before this milestone can close:** the Python surface.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
 - [x] **M1.7** `tuyamock` E2E wired to the tokio driver (`rustuya-tokio/tests/tuyamock.rs`): spawns the real `tuyamock` subprocess (opt-in via `RUSTUYA_TUYAMOCK`/PATH; skips otherwise) and drives status/set across **every** version (3.1/3.3/3.4/3.5) plus device22. **This immediately paid for itself:** it caught a real bug the self-crafted `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` carries a 4-byte retcode (like every device→client message), but the core decoded it with `has_retcode=false`. The loopback mock, built on the library's own `encode_message`, was self-consistent and blind to it. Fixed in `device.rs` (decode the handshake response with `has_retcode=true`) + both mocks made faithful. `loopback.rs` remains as a zero-dependency stand-in.

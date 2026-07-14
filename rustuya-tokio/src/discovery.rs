@@ -27,6 +27,7 @@ use tokio::time::Instant as TokioInstant;
 use rustuya_core::discovery::{Config as CoreConfig, Discovery as DiscoveryFsm, Event, Input};
 use rustuya_core::time::Instant as CoreInstant;
 
+use crate::actor::Cmd;
 use crate::error::{Result, TuyaError};
 
 /// A discovered device announcement (re-exported from the core).
@@ -42,6 +43,20 @@ const DEFAULT_PORTS: &[u16] = &[6666, 6667, 7000];
 /// [`Discovery::last_seen`] so callers judge staleness themselves — the map keeps
 /// no hidden freshness policy and never evicts.
 type Known = Arc<Mutex<BTreeMap<String, (DeviceInfo, StdInstant)>>>;
+
+/// A registered device's reconnect route: where to deliver a targeted wake, plus
+/// the TCP port to rebuild `ip:port` from an announced IP.
+struct Route {
+    cmd_tx: mpsc::Sender<Cmd>,
+    port: u16,
+}
+
+/// `id → route`. This is the reconnect fast-path: on a device announcement the
+/// actor does **one** map lookup and wakes only that device — O(1), replacing an
+/// O(N) per-device broadcast-subscribe-and-filter forwarder (which made the fleet
+/// O(N²) and could drop the reconnect trigger under bus lag). Entries are
+/// lazily pruned when a device's actor has gone (its `cmd_tx` closes).
+type Routes = Arc<Mutex<BTreeMap<String, Route>>>;
 
 /// Control messages from a [`Discovery`] handle to its actor.
 enum Ctrl {
@@ -82,13 +97,19 @@ fn bind_recv(port: u16) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(sock.into())
 }
 
-/// Bind an ephemeral UDP socket for **sending** broadcasts (`SO_BROADCAST`).
-fn bind_send() -> std::io::Result<UdpSocket> {
+/// Bind an ephemeral UDP socket for **sending** broadcasts (`SO_BROADCAST`),
+/// egressing from `src` (`UNSPECIFIED` = default route / any interface).
+fn bind_send_from(src: Ipv4Addr) -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_broadcast(true)?;
     sock.set_nonblocking(true)?;
-    sock.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
+    sock.bind(&SocketAddr::from((src, 0)).into())?;
     UdpSocket::from_std(sock.into())
+}
+
+/// The default send socket (any interface).
+fn bind_send() -> std::io::Result<UdpSocket> {
+    bind_send_from(Ipv4Addr::UNSPECIFIED)
 }
 
 /// Builder for a [`Discovery`]. Sensible defaults; nothing is required.
@@ -98,7 +119,7 @@ pub struct DiscoveryBuilder {
     broadcast_interval: StdDuration,
     broadcast_burst: Option<u32>,
     active: bool,
-    local_ip: Option<Ipv4Addr>,
+    local_ips: Vec<Ipv4Addr>,
     capacity: usize,
 }
 
@@ -110,7 +131,7 @@ impl Default for DiscoveryBuilder {
             broadcast_interval: StdDuration::from_secs(6),
             broadcast_burst: None, // perpetual while active
             active: true,
-            local_ip: None, // auto-detect at build
+            local_ips: Vec::new(), // auto-detect one at build
             capacity: 256,
         }
     }
@@ -155,11 +176,20 @@ impl DiscoveryBuilder {
         self
     }
 
-    /// The local IPv4 stamped into v3.5 probes (so devices know where to reply).
-    /// Defaults to best-effort auto-detection.
+    /// A local IPv4 stamped into v3.5 probes (so devices know where to reply).
+    /// Sets a single source; defaults to best-effort auto-detection of one.
     #[must_use]
     pub fn local_ip(mut self, ip: Ipv4Addr) -> Self {
-        self.local_ip = Some(ip);
+        self.local_ips = vec![ip];
+        self
+    }
+
+    /// Multiple local IPv4 sources — **one v3.5 probe per source**, each sent from
+    /// a socket bound to that address, so a multi-homed host actively elicits
+    /// devices across several subnets (the 0.3 `discovery_sources`, SMELLS Q6).
+    #[must_use]
+    pub fn local_ips(mut self, ips: impl Into<Vec<Ipv4Addr>>) -> Self {
+        self.local_ips = ips.into();
         self
     }
 
@@ -178,33 +208,58 @@ impl DiscoveryBuilder {
         if recv_socks.is_empty() {
             return Err(TuyaError::Config("no discovery port could be bound"));
         }
-        let send_sock = bind_send().map_err(TuyaError::Io)?;
+
+        // Resolve probe sources: explicit list, else best-effort auto-detect one.
+        let local_ips: Vec<Ipv4Addr> = if self.local_ips.is_empty() {
+            detect_local_ipv4().into_iter().collect()
+        } else {
+            self.local_ips.clone()
+        };
+        // The default (any-interface) socket carries untagged probes; each source
+        // gets its own socket so its broadcast egresses that interface.
+        let default_send = bind_send().map_err(TuyaError::Io)?;
+        let mut send_socks: BTreeMap<Ipv4Addr, UdpSocket> = BTreeMap::new();
+        for &ip in &local_ips {
+            match bind_send_from(ip) {
+                Ok(s) => {
+                    send_socks.insert(ip, s);
+                }
+                // A source we can't bind (interface gone) falls back to default.
+                Err(e) => log::warn!("discovery: bind send from {ip} failed: {e}"),
+            }
+        }
 
         let core = CoreConfig {
             cache_ttl: crate::core_dur(self.cache_ttl),
             broadcast_interval: crate::core_dur(self.broadcast_interval),
             broadcast_burst: self.broadcast_burst,
-            local_ip: self.local_ip.or_else(detect_local_ipv4),
+            local_ips,
         };
 
         let (found_tx, _) = broadcast::channel(self.capacity);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
         let known: Known = Arc::new(Mutex::new(BTreeMap::new()));
+        let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
 
         tokio::spawn(run(
             core,
             recv_socks,
-            send_sock,
+            default_send,
+            send_socks,
             self.active,
             ctrl_rx,
             found_tx.clone(),
             known.clone(),
+            routes.clone(),
+            self.cache_ttl,
         ));
 
         Ok(Discovery {
             ctrl_tx,
             found_tx,
             known,
+            routes,
+            cache_ttl: self.cache_ttl,
         })
     }
 }
@@ -216,6 +271,8 @@ pub struct Discovery {
     ctrl_tx: mpsc::Sender<Ctrl>,
     found_tx: broadcast::Sender<DeviceInfo>,
     known: Known,
+    routes: Routes,
+    cache_ttl: StdDuration,
 }
 
 impl Discovery {
@@ -248,14 +305,26 @@ impl Discovery {
         let _ = self.ctrl_tx.send(Ctrl::Stop).await;
     }
 
-    /// Resolve a device by id: returns immediately if it was already discovered,
-    /// otherwise waits for its next announcement, up to `timeout`.
+    /// Register a device's actor so the discovery loop can wake it directly (O(1))
+    /// when that id announces — the reconnect fast-path replacing a per-device
+    /// broadcast forwarder. `port` rebuilds `ip:port` from an announced IP. The
+    /// entry is pruned automatically once the actor's channel closes.
+    pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
+        self.routes.lock().unwrap().insert(id, Route { cmd_tx, port });
+    }
+
+    /// Resolve a device by id: returns immediately if it was seen within
+    /// `cache_ttl` (a staler entry is treated as a miss so we don't hand out an
+    /// address the device no longer confirms), otherwise waits for its next
+    /// announcement, up to `timeout`.
     pub async fn find(&self, device_id: &str, timeout: StdDuration) -> Result<DeviceInfo> {
         // Subscribe *before* checking the cache: if the device announces in the
         // gap between the cache miss and awaiting the stream, the subscription
         // still catches it — no lost-wakeup.
         let mut stream = self.discovered();
-        if let Some((info, _)) = self.known.lock().unwrap().get(device_id).cloned() {
+        if let Some((info, at)) = self.known.lock().unwrap().get(device_id).cloned()
+            && at.elapsed() <= self.cache_ttl
+        {
             return Ok(info);
         }
         let wait = async {
@@ -273,13 +342,17 @@ impl Discovery {
         }
     }
 
-    /// A snapshot of every device discovered so far (id → info).
+    /// A snapshot of every device seen within `cache_ttl` (id → info). Entries
+    /// older than the TTL are omitted — a device silent longer than that is not
+    /// reported as present.
     #[must_use]
     pub fn known(&self) -> Vec<DeviceInfo> {
+        let ttl = self.cache_ttl;
         self.known
             .lock()
             .unwrap()
             .values()
+            .filter(|(_, at)| at.elapsed() <= ttl)
             .map(|(info, _)| info.clone())
             .collect()
     }
@@ -367,14 +440,18 @@ impl tokio_stream::Stream for Discovered {
 
 /// The discovery actor: reader tasks funnel datagrams into `dgram_rx`, and this
 /// loop drives the FSM and the outbound broadcast socket.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     core: CoreConfig,
     recv_socks: Vec<UdpSocket>,
-    send_sock: UdpSocket,
+    default_send: UdpSocket,
+    send_socks: BTreeMap<Ipv4Addr, UdpSocket>,
     active: bool,
     mut ctrl_rx: mpsc::Receiver<Ctrl>,
     found_tx: broadcast::Sender<DeviceInfo>,
     known: Known,
+    routes: Routes,
+    cache_ttl: StdDuration,
 ) {
     let mut fsm = DiscoveryFsm::new(core);
     let mut rng = StdRng::from_os_rng();
@@ -408,7 +485,7 @@ async fn run(
     if active {
         fsm.handle_input(Input::StartScan, now_since(base), &mut rng);
     }
-    settle(&mut fsm, &send_sock, &found_tx, &known).await;
+    settle(&mut fsm, &default_send, &send_socks, &found_tx, &known, &routes, cache_ttl).await;
 
     loop {
         let deadline =
@@ -436,30 +513,65 @@ async fn run(
             }
         }
 
-        settle(&mut fsm, &send_sock, &found_tx, &known).await;
+        settle(&mut fsm, &default_send, &send_socks, &found_tx, &known, &routes, cache_ttl).await;
     }
 }
 
-/// Push out probes (to the broadcast address per port) and announcements. Each
-/// `Found` updates the shared `known` map (so `find` resolves it later) and fans
-/// out to the announcement bus.
+/// Push out probes (each from the socket bound to its tagged source) and process
+/// events. `Found` updates the `known` map, fans out to the announcement bus, and
+/// wakes a registered device at its **new** address; `Seen` is a same-IP liveness
+/// tick that wakes a registered device at its current address (①). Both wakes are
+/// O(1) targeted `try_send`s — never blocking, never a broadcast fan-out.
+#[allow(clippy::too_many_arguments)]
 async fn settle(
     fsm: &mut DiscoveryFsm,
-    send_sock: &UdpSocket,
+    default_send: &UdpSocket,
+    send_socks: &BTreeMap<Ipv4Addr, UdpSocket>,
     found_tx: &broadcast::Sender<DeviceInfo>,
     known: &Known,
+    routes: &Routes,
+    cache_ttl: StdDuration,
 ) {
-    while let Some((bytes, port)) = fsm.poll_transmit() {
+    while let Some((bytes, port, source)) = fsm.poll_transmit() {
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, port));
-        if let Err(e) = send_sock.send_to(&bytes, dst).await {
+        // Send from the tagged source's socket; fall back to the default one.
+        let sock = source.and_then(|s| send_socks.get(&s)).unwrap_or(default_send);
+        if let Err(e) = sock.send_to(&bytes, dst).await {
             log::debug!("discovery probe send to {dst} failed: {e}");
         }
     }
-    while let Some(Event::Found(info)) = fsm.poll_event() {
-        known
-            .lock()
-            .unwrap()
-            .insert(info.id.clone(), (info.clone(), StdInstant::now()));
-        let _ = found_tx.send(info);
+    while let Some(ev) = fsm.poll_event() {
+        match ev {
+            Event::Found(info) => {
+                {
+                    let mut map = known.lock().unwrap();
+                    map.insert(info.id.clone(), (info.clone(), StdInstant::now()));
+                    // Bound growth: drop entries silent past the TTL (④).
+                    map.retain(|_, (_, at)| at.elapsed() <= cache_ttl);
+                }
+                // Changed/new: wake the registered device at its announced address.
+                route_wake(routes, &info.id, Some(&info.ip.to_string()));
+                let _ = found_tx.send(info);
+            }
+            // Same-IP re-announcement: wake to redial the *current* address.
+            Event::Seen(id) => route_wake(routes, &id, None),
+        }
+    }
+}
+
+/// Wake the device registered under `id`, if any: a non-blocking `try_send` of
+/// `ConnectNow`, carrying `ip` (joined to the registered port) when the address
+/// may have changed. A closed channel means the actor is gone → prune the route;
+/// a full channel means it's busy → drop this wake (another announcement follows).
+fn route_wake(routes: &Routes, id: &str, ip: Option<&str>) {
+    use tokio::sync::mpsc::error::TrySendError;
+    let mut map = routes.lock().unwrap();
+    let Some(route) = map.get(id) else { return };
+    let addr = ip.map(|ip| format!("{ip}:{}", route.port));
+    match route.cmd_tx.try_send(Cmd::ConnectNow { addr }) {
+        Ok(()) | Err(TrySendError::Full(_)) => {}
+        Err(TrySendError::Closed(_)) => {
+            map.remove(id);
+        }
     }
 }

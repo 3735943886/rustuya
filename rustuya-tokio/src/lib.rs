@@ -249,17 +249,13 @@ impl DeviceBuilder {
         let (bcast_tx, _) = broadcast::channel(self.listener_capacity);
         let (conn_tx, conn_rx) = watch::channel(false);
 
-        // If a discovery is linked, forward its re-announcements of this device to
-        // the actor as `Cmd::ConnectNow` — the same signal `connect_now()` sends
-        // (backoff cancellation, P3) — but carrying the freshly-announced address
-        // so an IP change redials the new target.
+        // If a discovery is linked, register this device's actor so the discovery
+        // loop wakes it directly (O(1)) on a re-announcement — carrying the fresh
+        // address on a change (IP self-corrects) or a bare `ConnectNow` on an
+        // unchanged sighting (same-IP reconnect, backoff cancellation, P3). No
+        // per-device forwarder task, no broadcast subscription for the fast path.
         if let Some(disco) = self.rediscover.as_ref() {
-            spawn_rediscovery_forwarder(
-                disco.clone(),
-                self.id.clone(),
-                self.port,
-                cmd_tx.clone(),
-            );
+            disco.register(self.id.clone(), cmd_tx.clone(), self.port);
         }
 
         let bcast_for_actor = bcast_tx.clone();
@@ -294,31 +290,6 @@ impl DeviceBuilder {
         self.rediscover.get_or_insert_with(|| disco.clone());
         self.connect()
     }
-}
-
-/// Subscribe to `disco`'s announcement bus and send the actor a `Cmd::ConnectNow`
-/// on each re-announcement of `device_id`, carrying the announced IP joined to the
-/// device's fixed `port` so a changed address redials the new target. Runs until
-/// the discovery bus closes or the actor drops its receiver.
-fn spawn_rediscovery_forwarder(
-    disco: Discovery,
-    device_id: String,
-    port: u16,
-    cmd_tx: mpsc::Sender<Cmd>,
-) {
-    tokio::spawn(async move {
-        let mut stream = disco.discovered();
-        // Ends when the discovery bus closes (`recv` yields `Err`, so the
-        // `while let Ok` pattern stops matching).
-        while let Ok(info) = stream.recv().await {
-            if info.id == device_id {
-                let addr = Some(format!("{}:{port}", info.ip));
-                if cmd_tx.send(Cmd::ConnectNow { addr }).await.is_err() {
-                    break; // actor gone
-                }
-            }
-        }
-    });
 }
 
 /// A handle to one device's driver task. Cheap to clone; all clones share the one

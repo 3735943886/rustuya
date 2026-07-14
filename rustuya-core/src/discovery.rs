@@ -92,8 +92,16 @@ pub enum Input<'a> {
 /// An event drained by the driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A device seen for the first time, or whose details changed.
+    /// A device seen for the first time, or whose details changed (ip / version /
+    /// productKey). Carries the full info — for the discovered bus and address
+    /// resolution.
     Found(DeviceInfo),
+    /// A device re-announced with **nothing changed** (still the same ip). Carries
+    /// only the id: a pure liveness tick the driver routes to a disconnected
+    /// device of that id so a **same-IP** reconnect fires the instant the device
+    /// reappears, rather than waiting out backoff — without the full-info churn a
+    /// `Found` implies (it's TTL-deduped away today). Unregistered ids are ignored.
+    Seen(String),
 }
 
 /// Discovery configuration (driver-injected policy).
@@ -107,10 +115,13 @@ pub struct Config {
     /// How many broadcast rounds one `StartScan` fires. `None` = broadcast
     /// perpetually (a long-lived controller); `Some(n)` = a bounded scan.
     pub broadcast_burst: Option<u32>,
-    /// Local IPv4 stamped into the v3.5 probe so the device knows where to reply.
-    /// Selecting it is the driver's job (SMELLS Q6); `None` degrades to
-    /// `0.0.0.0`, which some firmware ignores.
-    pub local_ip: Option<Ipv4Addr>,
+    /// Local IPv4 addresses stamped into v3.5 probes so devices know where to
+    /// reply. **One probe per source**, so a multi-homed host actively elicits
+    /// devices across several subnets (SMELLS Q6 — the 0.3 `discovery_sources`).
+    /// Selecting them is the driver's job; empty degrades to a single `0.0.0.0`
+    /// probe, which some firmware ignores. The driver sends each probe from the
+    /// socket bound to the tagged source (see [`poll_transmit`](Discovery::poll_transmit)).
+    pub local_ips: Vec<Ipv4Addr>,
 }
 
 struct CacheEntry {
@@ -131,9 +142,10 @@ pub struct Discovery {
     cfg: Config,
     cache: BTreeMap<String, CacheEntry>,
     events: VecDeque<Event>,
-    /// Outbound probe packets: (bytes, destination port). The driver sends each
-    /// to the local broadcast address on that port.
-    tx: VecDeque<(Vec<u8>, u16)>,
+    /// Outbound probe packets: (bytes, destination port, source IP to send from).
+    /// The driver sends each to the local broadcast address on that port, from the
+    /// socket bound to the tagged source (`None` = the default/any socket).
+    tx: VecDeque<(Vec<u8>, u16, Option<Ipv4Addr>)>,
     /// When the next active broadcast round is due (`None` = not scanning).
     next_broadcast: Option<Instant>,
     /// Broadcast rounds still to fire in the current burst (`None` = perpetual).
@@ -189,9 +201,10 @@ impl Discovery {
         self.events.pop_front()
     }
 
-    /// Outbound probe packets as `(bytes, port)` (drain to `None`). The driver
-    /// sends each to the broadcast address on that port.
-    pub fn poll_transmit(&mut self) -> Option<(Vec<u8>, u16)> {
+    /// Outbound probe packets as `(bytes, port, source)` (drain to `None`). The
+    /// driver sends each to the broadcast address on that port, from the socket
+    /// bound to `source` (`None` = the default socket).
+    pub fn poll_transmit(&mut self) -> Option<(Vec<u8>, u16, Option<Ipv4Addr>)> {
         self.tx.pop_front()
     }
 
@@ -220,27 +233,34 @@ impl Discovery {
 
     fn emit_probes(&mut self, rng: &mut impl RngCore) {
         for probe in DEFAULT_PROBES {
-            if let Some(pkt) = self.build_probe(probe, rng) {
-                self.tx.push_back(pkt);
+            match probe.dialect {
+                Dialect::Legacy => {
+                    // seqno 0, plaintext + CRC (no key, no source binding).
+                    let pkt = pack_55aa(
+                        0,
+                        CommandType::UdpNew as u32,
+                        br#"{"gwId":"","devId":""}"#,
+                        Integrity::Crc32,
+                    );
+                    self.tx.push_back((pkt, probe.port, None));
+                }
+                Dialect::V35 => {
+                    // One probe per configured source (so a multi-homed host
+                    // elicits across subnets); no sources → a single 0.0.0.0 probe.
+                    if self.cfg.local_ips.is_empty() {
+                        if let Some(pkt) = build_v35_probe(None, rng) {
+                            self.tx.push_back((pkt, probe.port, None));
+                        }
+                    } else {
+                        for src in self.cfg.local_ips.clone() {
+                            if let Some(pkt) = build_v35_probe(Some(src), rng) {
+                                self.tx.push_back((pkt, probe.port, Some(src)));
+                            }
+                        }
+                    }
+                }
             }
         }
-    }
-
-    fn build_probe(&self, probe: &Probe, rng: &mut impl RngCore) -> Option<(Vec<u8>, u16)> {
-        let bytes = match probe.dialect {
-            Dialect::Legacy => {
-                // seqno 0, plaintext + CRC (no key).
-                pack_55aa(0, CommandType::UdpNew as u32, br#"{"gwId":"","devId":""}"#, Integrity::Crc32)
-            }
-            Dialect::V35 => {
-                let ip = self.cfg.local_ip.map_or_else(|| "0.0.0.0".to_string(), |i| i.to_string());
-                let payload = alloc::format!(r#"{{"from":"app","ip":"{ip}"}}"#).into_bytes();
-                let mut iv = [0u8; 12];
-                rng.fill_bytes(&mut iv);
-                pack_6699(0, CommandType::ReqDevInfo as u32, &payload, &UDP_KEY_V35, &iv).ok()?
-            }
-        };
-        Some((bytes, probe.port))
     }
 
     fn on_datagram(&mut self, data: &[u8], now: Instant) {
@@ -265,6 +285,11 @@ impl Discovery {
         );
         if fresh {
             self.events.push_back(Event::Found(info));
+        } else {
+            // Known & unchanged: not a Found (deduped), but still a liveness tick
+            // for the driver to wake a disconnected device of this id (same-IP
+            // reconnect, ①).
+            self.events.push_back(Event::Seen(info.id));
         }
     }
 
@@ -276,6 +301,16 @@ impl Discovery {
 }
 
 // -- packet decode ----------------------------------------------------------
+
+/// Build one v3.5 (6699/GCM) active probe carrying `src` as the reply address
+/// (`0.0.0.0` when `None`). A fresh IV is drawn from the injected RNG.
+fn build_v35_probe(src: Option<Ipv4Addr>, rng: &mut impl RngCore) -> Option<Vec<u8>> {
+    let ip = src.map_or_else(|| "0.0.0.0".to_string(), |i| i.to_string());
+    let payload = alloc::format!(r#"{{"from":"app","ip":"{ip}"}}"#).into_bytes();
+    let mut iv = [0u8; 12];
+    rng.fill_bytes(&mut iv);
+    pack_6699(0, CommandType::ReqDevInfo as u32, &payload, &UDP_KEY_V35, &iv).ok()
+}
 
 /// Decrypt + parse a discovery datagram into a [`DeviceInfo`], or `None` if it
 /// isn't a recognizable announcement.
@@ -379,7 +414,7 @@ mod tests {
             cache_ttl: TTL,
             broadcast_interval: Duration::from_secs(6),
             broadcast_burst: Some(3),
-            local_ip: Some(Ipv4Addr::new(192, 168, 0, 100)),
+            local_ips: vec![Ipv4Addr::new(192, 168, 0, 100)],
         })
     }
 
@@ -425,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn found_emitted_once_then_deduped() {
+    fn found_once_then_seen_on_unchanged_reannounce() {
         let mut d = disco();
         let mut rng = SeededRng(1);
         let pkt = packet_6699("dev1", "192.168.0.42");
@@ -435,8 +470,10 @@ mod tests {
         assert!(matches!(d.poll_event(), Some(Event::Found(i)) if i.id == "dev1"));
         assert_eq!(d.cached(), 1);
 
-        // Same device, unchanged: no second Found.
+        // Same device, unchanged: not a second Found, but a Seen liveness tick
+        // (the driver routes it to wake a disconnected device — ①).
         d.handle_input(Input::Datagram { data: &pkt, from: IP }, now + Duration::from_secs(1), &mut rng);
+        assert!(matches!(d.poll_event(), Some(Event::Seen(id)) if id == "dev1"));
         assert!(d.poll_event().is_none());
     }
 
@@ -475,7 +512,7 @@ mod tests {
         let mut rng = SeededRng(1);
         let now = Instant::from_millis(0);
         d.handle_input(Input::Datagram { data: &[0, 1, 2, 3], from: IP }, now, &mut rng);
-        d.handle_input(Input::Datagram { data: &vec![0xff; 40], from: IP }, now, &mut rng);
+        d.handle_input(Input::Datagram { data: &[0xff; 40], from: IP }, now, &mut rng);
         assert!(d.poll_event().is_none());
         assert_eq!(d.cached(), 0);
     }
@@ -485,7 +522,7 @@ mod tests {
     /// Drain all queued probe packets, returning (port, decoded DeviceInfo-ok?).
     fn drain_probes(d: &mut Discovery) -> Vec<u16> {
         let mut ports = Vec::new();
-        while let Some((_, port)) = d.poll_transmit() {
+        while let Some((_, port, _)) = d.poll_transmit() {
             ports.push(port);
         }
         ports
@@ -511,7 +548,7 @@ mod tests {
         let mut rng = SeededRng(7);
         d.handle_input(Input::StartScan, Instant::from_millis(0), &mut rng);
         d.handle_timeout(Instant::from_millis(0), &mut rng);
-        while let Some((bytes, port)) = d.poll_transmit() {
+        while let Some((bytes, port, _)) = d.poll_transmit() {
             if port == 7000 {
                 let f = unpack_6699(&bytes, &UDP_KEY_V35).unwrap();
                 assert!(looks_like_json(&f.body), "v3.5 probe carries JSON: {:?}", f.body);
@@ -519,6 +556,43 @@ mod tests {
                 assert!(unpack_55aa(&bytes, Integrity::Crc32).is_ok(), "legacy probe is 55AA/CRC");
             }
         }
+    }
+
+    #[test]
+    fn multi_source_emits_one_v35_probe_per_source() {
+        // Two source IPs → one v3.5 (7000) probe each, tagged with its source and
+        // carrying that source as the reply `ip`; legacy ports stay single.
+        let mut d = Discovery::new(Config {
+            cache_ttl: TTL,
+            broadcast_interval: Duration::from_secs(6),
+            broadcast_burst: Some(1),
+            local_ips: vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 1, 1)],
+        });
+        let mut rng = SeededRng(7);
+        let t0 = Instant::from_millis(0);
+        d.handle_input(Input::StartScan, t0, &mut rng);
+        d.handle_timeout(t0, &mut rng);
+
+        let mut v35_sources = Vec::new();
+        let mut legacy = 0;
+        while let Some((bytes, port, source)) = d.poll_transmit() {
+            if port == 7000 {
+                // The tagged source is echoed inside the decrypted payload `ip`.
+                let body = unpack_6699(&bytes, &UDP_KEY_V35).unwrap().body;
+                let ip = source.expect("v3.5 probe tagged with its source");
+                assert!(
+                    core::str::from_utf8(&body).unwrap().contains(&ip.to_string()),
+                    "probe payload carries its source ip"
+                );
+                v35_sources.push(ip);
+            } else {
+                assert!(source.is_none(), "legacy probes have no source binding");
+                legacy += 1;
+            }
+        }
+        v35_sources.sort();
+        assert_eq!(v35_sources, vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 1, 1)]);
+        assert_eq!(legacy, 2, "6666 + 6667 legacy probes");
     }
 
     #[test]
@@ -545,7 +619,7 @@ mod tests {
             cache_ttl: TTL,
             broadcast_interval: Duration::from_secs(6),
             broadcast_burst: None, // perpetual
-            local_ip: None,
+            local_ips: Vec::new(),
         });
         let mut rng = SeededRng(7);
         let mut t = Instant::from_millis(0);
@@ -576,7 +650,7 @@ mod tests {
             cache_ttl: TTL,
             broadcast_interval: Duration::from_secs(6),
             broadcast_burst: None,
-            local_ip: Some(Ipv4Addr::new(10, 0, 0, 5)),
+            local_ips: vec![Ipv4Addr::new(10, 0, 0, 5)],
         });
         let mut rng = SeededRng(7);
         let mut ivs = Vec::new();
@@ -584,7 +658,7 @@ mod tests {
         d.handle_input(Input::StartScan, t, &mut rng);
         for _ in 0..5 {
             d.handle_timeout(t, &mut rng);
-            while let Some((bytes, port)) = d.poll_transmit() {
+            while let Some((bytes, port, _)) = d.poll_transmit() {
                 if port == 7000 {
                     ivs.push(bytes[18..30].to_vec()); // 6699 IV
                 }
