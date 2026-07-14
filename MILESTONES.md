@@ -262,7 +262,7 @@ byte-for-byte behavior-identical under the existing oracles.
   surface; a literal addressless `Device::new` is the last bit of the exact README
   snippet.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
-- [ ] **M1.7** `tuyamock` E2E unchanged and green (the regression gate for this extraction). *Interim:* `rustuya-tokio/tests/loopback.rs` drives the full stack (dial → connect → send → framed reply → decode → correlate) against a hand-rolled v3.3 device **and** a real v3.4 session-key handshake over loopback TCP — a from-scratch stand-in until `tuyamock` is wired to the new driver.
+- [x] **M1.7** `tuyamock` E2E wired to the tokio driver (`rustuya-tokio/tests/tuyamock.rs`): spawns the real `tuyamock` subprocess (opt-in via `RUSTUYA_TUYAMOCK`/PATH; skips otherwise) and drives status/set across **every** version (3.1/3.3/3.4/3.5) plus device22. **This immediately paid for itself:** it caught a real bug the self-crafted `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` carries a 4-byte retcode (like every device→client message), but the core decoded it with `has_retcode=false`. The loopback mock, built on the library's own `encode_message`, was self-consistent and blind to it. Fixed in `device.rs` (decode the handshake response with `has_retcode=true`) + both mocks made faithful. `loopback.rs` remains as a zero-dependency stand-in.
 
 **Acceptance:** reconnect/handshake/dev22 covered by pure zero-time tests; tokio
 behavior unchanged under tuyamock.

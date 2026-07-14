@@ -384,10 +384,12 @@ impl Device {
 
     fn on_handshake_response(&mut self, data: &[u8], now: Instant, rng: &mut impl RngCore) {
         // The SessKeyNegResp payload is `remote_nonce(16) || HMAC(32)`, framed
-        // with the local key and (unlike data responses) no retcode prefix. A
-        // failure at any step lost the negotiation, so disconnect (+ backoff).
+        // with the local key. Like every device→client message it carries a
+        // 4-byte retcode (outside the ECB for 55AA, inside the GCM for 6699) that
+        // must be stripped — `has_retcode = true`. A failure at any step lost the
+        // negotiation, so disconnect (+ backoff).
         let key = self.cfg.local_key;
-        let payload = match message::decode_message(self.cfg.version, data, &key, false) {
+        let payload = match message::decode_message(self.cfg.version, data, &key, true) {
             Ok(m) => m.payload,
             Err(e) => return self.fail(e, now, rng),
         };
@@ -627,9 +629,29 @@ mod tests {
         let remote_nonce = [7u8; 16];
         let mut mac = Hmac::<Sha256>::new_from_slice(&KEY).unwrap();
         mac.update(&local_nonce);
-        let mut resp_payload = remote_nonce.to_vec();
-        resp_payload.extend_from_slice(&mac.finalize().into_bytes());
-        message::encode_message(version, CommandType::SessKeyNegResp as u32, 1, &resp_payload, &KEY, &[3u8; 12]).unwrap()
+        let mut reply = remote_nonce.to_vec();
+        reply.extend_from_slice(&mac.finalize().into_bytes());
+        craft_device_frame(version, CommandType::SessKeyNegResp as u32, 1, &reply)
+    }
+
+    /// Build a faithful device→client frame: a 4-byte retcode plus the version-
+    /// encoded `inner` payload (retcode outside the ECB for 55AA, inside the GCM
+    /// plaintext for 6699), matching what a real device / tuyamock emits.
+    fn craft_device_frame(version: Version, cmd: u32, seqno: u32, inner: &[u8]) -> Vec<u8> {
+        use crate::crypto::TuyaCipher;
+        use crate::frame::{self, Integrity};
+        use crate::payload::encode_payload;
+        let cipher = TuyaCipher::new(&KEY).unwrap();
+        let encoded = encode_payload(version, cmd, inner, &cipher).unwrap();
+        let mut body = vec![0u8; 4]; // retcode 0, ahead of the encoded payload
+        body.extend_from_slice(&encoded);
+        match version {
+            // 6699: the retcode rides inside the GCM plaintext.
+            Version::V3_5 => frame::pack_6699(seqno, cmd, &body, &KEY, &[3u8; 12]).unwrap(),
+            // 55AA: the retcode sits in the frame body, outside the ciphertext.
+            Version::V3_4 => frame::pack_55aa(seqno, cmd, &body, Integrity::Hmac(&KEY)),
+            _ => frame::pack_55aa(seqno, cmd, &body, Integrity::Crc32),
+        }
     }
 
     /// Drives a v3.4/v3.5 handshake to Connected in one feed.
@@ -734,16 +756,9 @@ mod tests {
         dev.handle_input(Input::Connected, T0, &mut rng);
         let _ = dev.poll_transmit();
 
-        // Garbage response of the right length (48 bytes) -> HMAC mismatch.
-        let resp = message::encode_message(
-            Version::V3_4,
-            CommandType::SessKeyNegResp as u32,
-            1,
-            &[0u8; 48],
-            &KEY,
-            &[0u8; 12],
-        )
-        .unwrap();
+        // A well-formed response frame but with a bad HMAC (48 zero bytes =
+        // remote_nonce(16) + wrong hmac(32)) -> verify_response HMAC mismatch.
+        let resp = craft_device_frame(Version::V3_4, CommandType::SessKeyNegResp as u32, 1, &[0u8; 48]);
         dev.handle_input(Input::Received(&resp), T0, &mut rng);
         assert!(!dev.is_connected());
         let events = drain_events(&mut dev);

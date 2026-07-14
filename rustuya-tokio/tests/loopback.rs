@@ -104,7 +104,7 @@ async fn set_value_encodes_a_control_and_reads_the_ack() {
 async fn serve_v34_handshake(listener: TcpListener) {
     use hmac::digest::KeyInit;
     use hmac::{Hmac, Mac};
-    use rustuya_core::message::{decode_message, encode_message};
+    use rustuya_core::message::decode_message;
     use sha2::Sha256;
 
     let (mut sock, _) = listener.accept().await.unwrap();
@@ -115,21 +115,18 @@ async fn serve_v34_handshake(listener: TcpListener) {
     let start = decode_message(Version::V3_4, &buf[..n], KEY, false).unwrap();
     let local_nonce = start.payload;
 
-    // 2. Reply with remote_nonce || HMAC-SHA256(local_nonce, key).
+    // 2. Reply with remote_nonce || HMAC-SHA256(local_nonce, key), framed as a
+    //    real device does: a 4-byte retcode sits in the 55AA body *outside* the
+    //    ECB ciphertext (like tuyamock's pack_response), then HMAC framing.
     let remote_nonce = [7u8; 16];
     let mut mac = Hmac::<Sha256>::new_from_slice(KEY).unwrap();
     mac.update(&local_nonce);
-    let mut resp = remote_nonce.to_vec();
-    resp.extend_from_slice(&mac.finalize().into_bytes());
-    let wire = encode_message(
-        Version::V3_4,
-        CommandType::SessKeyNegResp as u32,
-        1,
-        &resp,
-        KEY,
-        &[3u8; 12],
-    )
-    .unwrap();
+    let mut reply = remote_nonce.to_vec();
+    reply.extend_from_slice(&mac.finalize().into_bytes());
+    let cipher = TuyaCipher::new(KEY).unwrap();
+    let mut body = 0u32.to_be_bytes().to_vec(); // retcode 0
+    body.extend_from_slice(&cipher.ecb_encrypt(&reply).unwrap());
+    let wire = frame::pack_55aa(1, CommandType::SessKeyNegResp as u32, &body, frame::Integrity::Hmac(KEY));
     sock.write_all(&wire).await.unwrap();
 
     // 3. Absorb the SessKeyNegFinish so the driver's write completes; the driver
