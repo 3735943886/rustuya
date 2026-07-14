@@ -12,7 +12,7 @@
 //! integrity or authenticated encryption. Splitting a retcode out of `body` and
 //! deciding *whether* one is present is the protocol layer's job — the 0.3 core
 //! guessed it by sniffing payload bytes, which this design removes (see
-//! `SMELLS.md`, S1).
+//! `docs/DESIGN.md`, S1).
 
 use alloc::vec::Vec;
 use cipher::KeyInit;

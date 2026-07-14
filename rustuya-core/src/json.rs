@@ -3,8 +3,8 @@
 //! The **single** module that touches `serde_json`, so a later swap to a leaner
 //! backend (`serde-json-core`, a hand-rolled writer) stays local. The byte-level
 //! core — `frame`, `crypto`, `version` — does not use this at all; only the
-//! command-generation / response-parsing layer does. See `MILESTONES.md` (D8)
-//! and `SMELLS.md`.
+//! command-generation / response-parsing layer does. See `docs/MILESTONES.md` (D8)
+//! and `docs/DESIGN.md`.
 
 use alloc::vec::Vec;
 

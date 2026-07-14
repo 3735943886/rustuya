@@ -13,7 +13,7 @@
 //! across formats (outside the ECB for 55AA, inside the GCM for 6699 — but
 //! `frame::unpack` hands back the body either way). Clients never *send* a
 //! retcode, so [`encode_message`] has none; [`decode_message`] strips it when
-//! the caller says a response carries one (`SMELLS.md`, S1 — no byte-sniffing).
+//! the caller says a response carries one (`docs/DESIGN.md`, S1 — no byte-sniffing).
 
 use alloc::vec::Vec;
 

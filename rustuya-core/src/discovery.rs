@@ -43,7 +43,7 @@ const UDP_KEY_V35: [u8; 16] = [
 /// The v3.3 UDP discovery key — a plain ASCII key, **not** md5-derived.
 const UDP_KEY_V33: &[u8; 16] = b"yG9shRKIBrIBUjc3";
 
-/// Which wire dialect an active probe uses on a given port (SMELLS Q5: a typed
+/// Which wire dialect an active probe uses on a given port (DESIGN Q5: a typed
 /// descriptor replacing the 0.3 scattered `== 7000` literals).
 #[derive(Debug, Clone, Copy)]
 enum Dialect {
@@ -121,7 +121,7 @@ pub struct Config {
     /// How long a cached device is remembered before a re-announcement counts as
     /// "new" again.
     pub cache_ttl: Duration,
-    /// Delay between active broadcast rounds (SMELLS Q4: injected, not a
+    /// Delay between active broadcast rounds (DESIGN Q4: injected, not a
     /// hardcoded 6 s).
     pub broadcast_interval: Duration,
     /// How many broadcast rounds one `StartScan` fires. `None` = broadcast
@@ -129,7 +129,7 @@ pub struct Config {
     pub broadcast_burst: Option<u32>,
     /// Local IPv4 addresses stamped into v3.5 probes so devices know where to
     /// reply. **One probe per source**, so a multi-homed host actively elicits
-    /// devices across several subnets (SMELLS Q6 — the 0.3 `discovery_sources`).
+    /// devices across several subnets (DESIGN Q6 — the 0.3 `discovery_sources`).
     /// Selecting them is the driver's job; empty degrades to a single `0.0.0.0`
     /// probe, which some firmware ignores. The driver sends each probe from the
     /// socket bound to the tagged source (see [`poll_transmit`](Discovery::poll_transmit)).

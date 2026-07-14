@@ -206,7 +206,7 @@ impl DiscoveryBuilder {
 
     /// Multiple local IPv4 sources — **one v3.5 probe per source**, each sent from
     /// a socket bound to that address, so a multi-homed host actively elicits
-    /// devices across several subnets (the 0.3 `discovery_sources`, SMELLS Q6).
+    /// devices across several subnets (the 0.3 `discovery_sources`, DESIGN Q6).
     #[must_use]
     pub fn local_ips(mut self, ips: impl Into<Vec<Ipv4Addr>>) -> Self {
         self.local_ips = ips.into();

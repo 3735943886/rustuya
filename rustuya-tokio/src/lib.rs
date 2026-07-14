@@ -208,7 +208,7 @@ impl DeviceBuilder {
 
     /// Link a [`Discovery`] so a live re-announcement of this device **cancels a
     /// pending reconnect backoff and redials immediately** (the core's
-    /// `ConnectNow`, SMELLS P3). Independent of [`address`](Self::address):
+    /// `ConnectNow`, DESIGN P3). Independent of [`address`](Self::address):
     /// use it with a fixed address to cut reconnect latency when the device
     /// reappears, instead of waiting out the backoff. [`discover`](Self::discover)
     /// links this automatically.
@@ -345,7 +345,7 @@ impl Device {
     /// device only exists once connected, and connecting is fallible, so there is
     /// no infallible `Self` to hand back before the address is known. Unlike 0.3,
     /// there is also **no** hidden global scanner behind an "auto" address
-    /// (SMELLS Q1): resolving an address without a fixed IP is explicit — pass a
+    /// (DESIGN Q1): resolving an address without a fixed IP is explicit — pass a
     /// shared [`Discovery`] to [`discover`](DeviceBuilder::discover).
     #[must_use]
     pub fn builder(id: impl Into<String>, local_key: impl Into<Vec<u8>>) -> DeviceBuilder {

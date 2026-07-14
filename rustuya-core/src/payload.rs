@@ -6,7 +6,7 @@
 //! ciphertext), and v3.1's md5/base64 scheme.
 //!
 //! It does **not** deal with the retcode. The 0.3 core sniffed payload bytes to
-//! guess whether a 4-byte return code was present (`SMELLS.md`, S1); in practice
+//! guess whether a 4-byte return code was present (`docs/DESIGN.md`, S1); in practice
 //! the actor always passed "retcode present", so the heuristic was dead code.
 //! Here retcode splitting is the message layer's explicit, caller-known concern.
 

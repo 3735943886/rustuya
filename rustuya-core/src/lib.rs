@@ -3,7 +3,7 @@
 //! Pure protocol logic only: framing, crypto, and (progressively) the Device
 //! and Discovery state machines. There is **no** I/O, no timers, and no async
 //! here — a driver crate (tokio / blocking-std / embassy) injects `now` and the
-//! RNG, pumps bytes in, and executes what the core asks for. See `MILESTONES.md`
+//! RNG, pumps bytes in, and executes what the core asks for. See `docs/MILESTONES.md`
 //! for the 0.4 clean-slate design.
 #![no_std]
 #![forbid(unsafe_code)]

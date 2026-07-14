@@ -4,7 +4,7 @@
 //! one impl per version (`v31.rs` … `v35.rs`), most of it near-duplicated. Here
 //! the parts that are genuinely *data* — which frame, which integrity, whether a
 //! session key is negotiated, where the version header sits — live in a single
-//! [`Profile`] table (`SMELLS.md`, S7). Only the truly version-specific
+//! [`Profile`] table (`docs/DESIGN.md`, S7). Only the truly version-specific
 //! behaviour (v3.1's md5/base64 wrapping) stays as code, in the payload codec.
 
 /// Tuya local-protocol version. `Auto` is a config placeholder resolved before
@@ -98,7 +98,7 @@ impl Version {
 /// Device architecture dialect. `Device22` is a wrapper applied on top of a base
 /// version (v3.2 is always Device22); it is orthogonal to [`Version`].
 ///
-/// **No runtime auto-detection (SMELLS P7, a deliberate decision).** There is no
+/// **No runtime auto-detection (DESIGN P7, a deliberate decision).** There is no
 /// agreed algorithm for sniffing a "22-character device id" dialect from the wire
 /// — the 0.3 heuristic was not tinytuya-authoritative and is a known-unknown. So
 /// the core never guesses: [`Auto`](Self::Auto) behaves as [`Default`](Self::Default)

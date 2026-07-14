@@ -13,7 +13,7 @@
 //! [`Input::Connected`] or [`Input::ConnectFailed`]; the *whether* and the *when*
 //! (backoff delay) are the core's policy, testable at zero wall-clock.
 //!
-//! Smells confronted here (SMELLS.md): **P1** — no 16 s hard floor; the backoff
+//! Smells confronted here (docs/DESIGN.md): **P1** — no 16 s hard floor; the backoff
 //! curve is [`Backoff`] policy the driver injects, and tests set it to zero.
 //! **P2** — jitter is drawn from the injected RNG, not an internal `rand::rng()`.
 //! **P6** — persist / non-persist collapse into one path: [`Config::auto_reconnect`]
@@ -36,7 +36,7 @@ use crate::session::Handshake;
 use crate::time::{Duration, Instant};
 use crate::version::{DeviceType, Version};
 
-/// Exponential-backoff policy for reconnect attempts (SMELLS.md P1/P2).
+/// Exponential-backoff policy for reconnect attempts (docs/DESIGN.md P1/P2).
 ///
 /// Delay for attempt `n` (0-based) is `min(base * 2^n, max)` plus a random
 /// `[0, jitter)` drawn from the injected RNG. There is **no** hard floor — a
@@ -75,7 +75,7 @@ pub struct Config {
     pub local_key: [u8; 16],
     /// Whether a dropped / failed connection re-arms a backoff timer (`true`) or
     /// drops to a terminal closed state (`false`). Unifies the 0.3
-    /// persist-vs-nowait split into one policy knob (SMELLS.md P6).
+    /// persist-vs-nowait split into one policy knob (docs/DESIGN.md P6).
     pub auto_reconnect: bool,
     /// Backoff curve used when `auto_reconnect` is set.
     pub backoff: Backoff,
@@ -89,7 +89,7 @@ pub struct Config {
     pub heartbeat: Option<Duration>,
     /// If set, a connection with no inbound frame for this long is declared dead
     /// and disconnected — this is what makes a *silent* peer drop surface
-    /// promptly instead of at the next reconnect (SMELLS.md P4/P5). `None`
+    /// promptly instead of at the next reconnect (docs/DESIGN.md P4/P5). `None`
     /// disables liveness timing (the driver's `Closed` is then the only signal).
     pub idle_timeout: Option<Duration>,
     /// If set, a v3.4/v3.5 handshake that does not complete within this window is
@@ -122,7 +122,7 @@ pub enum Input<'a> {
     /// "connect now" signal, fed either by an explicit user `connect_now()` or by
     /// the `discovery` FSM seeing this device on the LAN — both mean the same
     /// thing to the core, so there is one input. This is the sans-io replacement
-    /// for the 0.3 `wait_for_backoff` sleep-vs-rediscovery `select` (SMELLS P3).
+    /// for the 0.3 `wait_for_backoff` sleep-vs-rediscovery `select` (DESIGN P3).
     /// The backoff *attempt* counter is left intact, so repeated wakes (a flapping
     /// device, or `connect_now` spam) can't defeat the escalation; a successful
     /// connection resets it.
@@ -221,7 +221,7 @@ impl Device {
     /// this evaluates whichever deadline(s) elapsed:
     ///  * `Backoff` elapsed → return to `Connecting` so the driver redials;
     ///  * `Connected` idle elapsed → declare the peer dead and disconnect (the
-    ///    silent-drop fix, SMELLS P4/P5) — checked first so a dead link doesn't
+    ///    silent-drop fix, DESIGN P4/P5) — checked first so a dead link doesn't
     ///    also emit a doomed heartbeat;
     ///  * `Connected` heartbeat elapsed → emit a keepalive frame (needs the
     ///    injected RNG for the v3.5 GCM IV) and re-arm.
