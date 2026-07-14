@@ -251,9 +251,15 @@ impl DeviceBuilder {
 
         // If a discovery is linked, forward its re-announcements of this device to
         // the actor as `Cmd::ConnectNow` — the same signal `connect_now()` sends
-        // (backoff cancellation, P3).
+        // (backoff cancellation, P3) — but carrying the freshly-announced address
+        // so an IP change redials the new target.
         if let Some(disco) = self.rediscover.as_ref() {
-            spawn_rediscovery_forwarder(disco.clone(), self.id.clone(), cmd_tx.clone());
+            spawn_rediscovery_forwarder(
+                disco.clone(),
+                self.id.clone(),
+                self.port,
+                cmd_tx.clone(),
+            );
         }
 
         let bcast_for_actor = bcast_tx.clone();
@@ -291,16 +297,25 @@ impl DeviceBuilder {
 }
 
 /// Subscribe to `disco`'s announcement bus and send the actor a `Cmd::ConnectNow`
-/// on each re-announcement of `device_id`. Runs until the discovery bus closes or
-/// the actor drops its receiver.
-fn spawn_rediscovery_forwarder(disco: Discovery, device_id: String, cmd_tx: mpsc::Sender<Cmd>) {
+/// on each re-announcement of `device_id`, carrying the announced IP joined to the
+/// device's fixed `port` so a changed address redials the new target. Runs until
+/// the discovery bus closes or the actor drops its receiver.
+fn spawn_rediscovery_forwarder(
+    disco: Discovery,
+    device_id: String,
+    port: u16,
+    cmd_tx: mpsc::Sender<Cmd>,
+) {
     tokio::spawn(async move {
         let mut stream = disco.discovered();
         // Ends when the discovery bus closes (`recv` yields `Err`, so the
         // `while let Ok` pattern stops matching).
         while let Ok(info) = stream.recv().await {
-            if info.id == device_id && cmd_tx.send(Cmd::ConnectNow).await.is_err() {
-                break; // actor gone
+            if info.id == device_id {
+                let addr = Some(format!("{}:{port}", info.ip));
+                if cmd_tx.send(Cmd::ConnectNow { addr }).await.is_err() {
+                    break; // actor gone
+                }
             }
         }
     });
@@ -467,7 +482,9 @@ impl Device {
     /// already connected/connecting. Returns once queued; pair with
     /// [`wait_connected`](Self::wait_connected) to await the outcome.
     pub async fn connect_now(&self) {
-        let _ = self.cmd_tx.send(Cmd::ConnectNow).await;
+        // No address: keep the current dial target (only the rewake forwarder,
+        // which has a freshly-announced IP, supplies one).
+        let _ = self.cmd_tx.send(Cmd::ConnectNow { addr: None }).await;
     }
 
     /// Gracefully stop the driver task. Idempotent; further requests error with

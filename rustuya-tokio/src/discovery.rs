@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -35,10 +35,13 @@ pub use rustuya_core::discovery::DeviceInfo;
 /// The standard Tuya discovery ports the driver listens on by default.
 const DEFAULT_PORTS: &[u16] = &[6666, 6667, 7000];
 
-/// Devices seen so far, `id → latest info`. Shared between the actor (writer) and
-/// the handle (reader), so `find` can resolve an already-discovered device
-/// immediately instead of only awaiting the next (dedup-suppressed) announcement.
-type Known = Arc<Mutex<BTreeMap<String, DeviceInfo>>>;
+/// Devices seen so far, `id → (latest info, when it was last seen)`. Shared
+/// between the actor (writer) and the handle (reader), so `find` can resolve an
+/// already-discovered device immediately instead of only awaiting the next
+/// (dedup-suppressed) announcement. The timestamp is exposed via
+/// [`Discovery::last_seen`] so callers judge staleness themselves — the map keeps
+/// no hidden freshness policy and never evicts.
+type Known = Arc<Mutex<BTreeMap<String, (DeviceInfo, StdInstant)>>>;
 
 /// Control messages from a [`Discovery`] handle to its actor.
 enum Ctrl {
@@ -252,7 +255,7 @@ impl Discovery {
         // gap between the cache miss and awaiting the stream, the subscription
         // still catches it — no lost-wakeup.
         let mut stream = self.discovered();
-        if let Some(info) = self.known.lock().unwrap().get(device_id).cloned() {
+        if let Some((info, _)) = self.known.lock().unwrap().get(device_id).cloned() {
             return Ok(info);
         }
         let wait = async {
@@ -273,7 +276,28 @@ impl Discovery {
     /// A snapshot of every device discovered so far (id → info).
     #[must_use]
     pub fn known(&self) -> Vec<DeviceInfo> {
-        self.known.lock().unwrap().values().cloned().collect()
+        self.known
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(info, _)| info.clone())
+            .collect()
+    }
+
+    /// How long ago `device_id` was last announced, or `None` if never seen.
+    ///
+    /// Exposes the raw fact so the caller decides what "too stale" means — a
+    /// resolved address (from [`find`](Self::find) or a linked device) is only a
+    /// hint, and the map never evicts, so a device that went offline keeps its
+    /// last address indefinitely. Pair this with [`known`](Self::known) to filter
+    /// out long-silent devices at your own threshold.
+    #[must_use]
+    pub fn last_seen(&self, device_id: &str) -> Option<StdDuration> {
+        self.known
+            .lock()
+            .unwrap()
+            .get(device_id)
+            .map(|(_, at)| at.elapsed())
     }
 
     /// Collect every distinct device seen during a `window` (deduped by id, latest
@@ -432,7 +456,10 @@ async fn settle(
         }
     }
     while let Some(Event::Found(info)) = fsm.poll_event() {
-        known.lock().unwrap().insert(info.id.clone(), info.clone());
+        known
+            .lock()
+            .unwrap()
+            .insert(info.id.clone(), (info.clone(), StdInstant::now()));
         let _ = found_tx.send(info);
     }
 }

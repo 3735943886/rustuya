@@ -4,7 +4,7 @@
 //! The device is given a **1-hour** backoff, so after the mock drops the first
 //! connection it would otherwise be stuck for an hour. A crafted UDP announcement
 //! into the linked `Discovery` is the *only* thing that can bring it back within
-//! the test's patience — proving the `DiscoveryUpdated` wake path drives a redial.
+//! the test's patience — proving the `ConnectNow` wake path drives a redial.
 //!
 //! Deterministic: the mock blocks on `accept()` for the redial (no timing guess),
 //! and the announcement is injected only after the device is observed disconnected
@@ -94,7 +94,7 @@ async fn rediscovery_cancels_backoff_and_reconnects() {
 
     // The mock dropped conn1: wait until the device actually observes the drop and
     // enters backoff (spin on the real predicate, no sleep). Only then does a
-    // DiscoveryUpdated have a backoff to cancel.
+    // ConnectNow has a backoff to cancel.
     tokio::time::timeout(Duration::from_secs(3), async {
         while dev.is_connected() {
             tokio::task::yield_now().await;
@@ -103,7 +103,7 @@ async fn rediscovery_cancels_backoff_and_reconnects() {
     .await
     .expect("device observes the conn1 drop");
 
-    // Inject a LAN re-announcement → forwarder → Input::DiscoveryUpdated → redial,
+    // Inject a LAN re-announcement → forwarder → Input::ConnectNow → redial,
     // long before the 1-hour backoff would ever fire.
     let sender = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
     sender.send_to(&announcement(), ("127.0.0.1", DISCO_PORT)).await.unwrap();

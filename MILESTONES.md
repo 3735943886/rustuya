@@ -275,6 +275,17 @@ byte-for-byte behavior-identical under the existing oracles.
   published root `README.md` still shows the old `rustuya::sync::Device` /
   `rustuya::Device` 0.3 crate and is deferred to the 0.4 release consolidation
   (alongside Python + crate naming), not rewritten piecemeal here (doc-sync cost).
+  *Rewake carries the address + staleness is exposed, not policed:* the rediscovery
+  forwarder now sends `Cmd::ConnectNow { addr: Some(ip:port) }`, so a device that
+  re-announces at a **changed IP** (DHCP renewal) redials the new target — the
+  resolve-once address self-corrects instead of dialing the stale one forever
+  (`connect_now()` sends `addr: None`, keeping the current target). This fixes a
+  correctness gap in the earlier "self-heal" claim. The 0.3 scanner instead
+  read-gated a cached address behind a 30-min magic cooldown; 0.4 keeps no hidden
+  freshness policy — the driver's `known` map records a last-seen `Instant`,
+  surfaced by `Discovery::last_seen(id) -> Option<Duration>` so callers judge
+  staleness themselves. Pinned by `tests/rediscovery_ip_change.rs` (127.0.0.1 →
+  127.0.0.2 redial; verified to fail without the address-carrying rewake).
   **Still required before this milestone can close:** the Python surface.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
 - [x] **M1.7** `tuyamock` E2E wired to the tokio driver (`rustuya-tokio/tests/tuyamock.rs`): spawns the real `tuyamock` subprocess (opt-in via `RUSTUYA_TUYAMOCK`/PATH; skips otherwise) and drives status/set across **every** version (3.1/3.3/3.4/3.5) plus device22. **This immediately paid for itself:** it caught a real bug the self-crafted `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` carries a 4-byte retcode (like every device→client message), but the core decoded it with `has_retcode=false`. The loopback mock, built on the library's own `encode_message`, was self-consistent and blind to it. Fixed in `device.rs` (decode the handshake response with `has_retcode=true`) + both mocks made faithful. `loopback.rs` remains as a zero-dependency stand-in.

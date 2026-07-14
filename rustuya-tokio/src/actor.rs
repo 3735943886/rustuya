@@ -48,8 +48,10 @@ pub(crate) enum Cmd {
     },
     /// (Re)connect now: cancel any backoff wait and revive a terminal device.
     /// Fed by an explicit `connect_now()` or by the discovery rewake forwarder —
-    /// both are the core's `Input::ConnectNow`.
-    ConnectNow,
+    /// both are the core's `Input::ConnectNow`. `addr` carries a freshly-discovered
+    /// dial target (`Some` from the rewake forwarder when the device re-announces a
+    /// possibly-changed IP); `None` (explicit `connect_now`) keeps the current one.
+    ConnectNow { addr: Option<String> },
     /// Graceful shutdown: fail any in-flight waiters and exit the task.
     Close,
 }
@@ -85,7 +87,7 @@ pub(crate) async fn run(
 ) {
     let ActorConfig {
         core,
-        addr,
+        mut addr,
         connect_timeout,
     } = acfg;
 
@@ -148,8 +150,14 @@ pub(crate) async fn run(
                         let _ = resp.send(Err(TuyaError::Core(CoreError::NotConnected)));
                     }
                 }
-                // (Re)connect now: cancel backoff / revive a terminal device.
-                Some(Cmd::ConnectNow) => {
+                // (Re)connect now: cancel backoff / revive a terminal device. A
+                // rewake may carry a freshly-discovered address — adopt it so an
+                // IP change (DHCP renewal, etc.) redials the *new* target rather
+                // than the stale one fixed at spawn.
+                Some(Cmd::ConnectNow { addr: new_addr }) => {
+                    if let Some(a) = new_addr {
+                        addr = a;
+                    }
                     fsm.handle_input(Input::ConnectNow, now_since(base), &mut rng);
                 }
                 // All senders dropped, or an explicit Close: shut the task down.
