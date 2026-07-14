@@ -61,6 +61,10 @@ pub(crate) struct ActorConfig {
     pub core: CoreConfig,
     pub addr: String,
     pub connect_timeout: StdDuration,
+    /// Demand signal to the linked discovery: pinged on a failed dial so an
+    /// active-only device (or one that moved IP) gets re-elicited. `None` when no
+    /// discovery is linked. Coalesced at the discovery end (single-flight).
+    pub want_scan: Option<mpsc::Sender<()>>,
 }
 
 /// Convert the driver's monotonic clock into the core's injected `now`.
@@ -89,6 +93,7 @@ pub(crate) async fn run(
         core,
         mut addr,
         connect_timeout,
+        want_scan,
     } = acfg;
 
     let mut fsm = Device::new(core);
@@ -117,11 +122,19 @@ pub(crate) async fn run(
                     log::debug!("connect {addr} failed: {e}");
                     stream = None;
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
+                    // Ask discovery to re-elicit: the address may be stale, or this
+                    // is an active-only device passive can't hear. Coalesced there.
+                    if let Some(w) = &want_scan {
+                        let _ = w.try_send(());
+                    }
                 }
                 Err(_) => {
                     log::debug!("connect {addr} timed out");
                     stream = None;
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
+                    if let Some(w) = &want_scan {
+                        let _ = w.try_send(());
+                    }
                 }
             }
             settle(&mut fsm, &mut stream, &mut waiters, &bcast_tx, &conn_tx, base, &mut rng).await;

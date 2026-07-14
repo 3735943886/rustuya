@@ -8,8 +8,10 @@
 //!
 //! Shape mirrors the device driver: one reader task per bound socket funnels
 //! datagrams into a single channel, and one actor task runs
-//! `select!{datagram, control, one poll_timeout timer}` → drain
-//! `poll_transmit → broadcast socket` / `poll_event → discovered bus`.
+//! `select!{datagram, scan-demand, control, one poll_timeout timer}` → drain
+//! `poll_transmit → broadcast socket` / `poll_event → discovered bus + routes`.
+//! Active probing is **on demand** (a batch-coalesced `want` signal), never a
+//! perpetual beat; passive receive is always on.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -41,7 +43,10 @@ const DEFAULT_PORTS: &[u16] = &[6666, 6667, 7000];
 /// already-discovered device immediately instead of only awaiting the next
 /// (dedup-suppressed) announcement. The timestamp is exposed via
 /// [`Discovery::last_seen`] so callers judge staleness themselves — the map keeps
-/// no hidden freshness policy and never evicts.
+/// no hidden freshness policy. It does not time-evict: present devices keep their
+/// entries fresh by re-announcing (passive), and a stale entry for a departed
+/// device is harmless (a connect to it just fails). Size is bounded by the
+/// broadcast domain (one entry per device id ever seen), not by a clock.
 type Known = Arc<Mutex<BTreeMap<String, (DeviceInfo, StdInstant)>>>;
 
 /// A registered device's reconnect route: where to deliver a targeted wake, plus
@@ -58,12 +63,20 @@ struct Route {
 /// lazily pruned when a device's actor has gone (its `cmd_tx` closes).
 type Routes = Arc<Mutex<BTreeMap<String, Route>>>;
 
+/// Everything the actor pushes results out through, grouped so `run` and `settle`
+/// pass one value instead of a long argument list: the outbound probe sockets
+/// (default + per-source), the announcement bus, the `known` cache, and the
+/// reconnect routing registry.
+struct Sinks {
+    default_send: UdpSocket,
+    send_socks: BTreeMap<Ipv4Addr, UdpSocket>,
+    found_tx: broadcast::Sender<DeviceInfo>,
+    known: Known,
+    routes: Routes,
+}
+
 /// Control messages from a [`Discovery`] handle to its actor.
 enum Ctrl {
-    /// (Re)start active broadcast probing.
-    Start,
-    /// Stop active probing; passive receive continues.
-    Stop,
     /// Shut the actor (and its reader tasks) down.
     Close,
 }
@@ -129,7 +142,9 @@ impl Default for DiscoveryBuilder {
             ports: DEFAULT_PORTS.to_vec(),
             cache_ttl: StdDuration::from_secs(60),
             broadcast_interval: StdDuration::from_secs(6),
-            broadcast_burst: None, // perpetual while active
+            // One round per on-demand scan (demand-driven, not a perpetual beat).
+            // Raise via `probe_cadence` for a multi-round burst per scan.
+            broadcast_burst: Some(1),
             active: true,
             local_ips: Vec::new(), // auto-detect one at build
             capacity: 256,
@@ -138,8 +153,9 @@ impl Default for DiscoveryBuilder {
 }
 
 impl DiscoveryBuilder {
-    /// Start a builder with defaults (ports 6666/6667/7000, 60 s TTL, active
-    /// probing every 6 s).
+    /// Start a builder with defaults (ports 6666/6667/7000, 60 s dedup TTL, active
+    /// probing **on demand** — one round per `find`/`scan`/failed-dial, not a
+    /// perpetual beat).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -167,8 +183,12 @@ impl DiscoveryBuilder {
         self
     }
 
-    /// Delay between active probe rounds, and how many rounds one scan fires
-    /// (`None` = probe forever while active).
+    /// How many rounds one on-demand scan fires, and the delay between them.
+    /// Default `Some(1)` — a single round per scan request. `Some(n)` spaces `n`
+    /// rounds by `interval` (robustness against UDP loss). `None` makes a scan
+    /// **perpetual** once triggered (the 0.3 always-on behavior) — an explicit
+    /// opt-in that runs until the discovery is dropped, since there is no runtime
+    /// stop; prefer a small `Some(n)` for a polite network.
     #[must_use]
     pub fn probe_cadence(mut self, interval: StdDuration, burst: Option<u32>) -> Self {
         self.broadcast_interval = interval;
@@ -238,28 +258,27 @@ impl DiscoveryBuilder {
 
         let (found_tx, _) = broadcast::channel(self.capacity);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        // Depth 1: a single pending "please probe" is all the coalescing needs —
+        // extra requests while one is queued are redundant (try_send drops them).
+        let (want_tx, want_rx) = mpsc::channel(1);
         let known: Known = Arc::new(Mutex::new(BTreeMap::new()));
         let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
 
-        tokio::spawn(run(
-            core,
-            recv_socks,
+        let sinks = Sinks {
             default_send,
             send_socks,
-            self.active,
-            ctrl_rx,
-            found_tx.clone(),
-            known.clone(),
-            routes.clone(),
-            self.cache_ttl,
-        ));
+            found_tx: found_tx.clone(),
+            known: known.clone(),
+            routes: routes.clone(),
+        };
+        tokio::spawn(run(core, recv_socks, self.active, ctrl_rx, want_rx, sinks));
 
         Ok(Discovery {
             ctrl_tx,
+            want_tx,
             found_tx,
             known,
             routes,
-            cache_ttl: self.cache_ttl,
         })
     }
 }
@@ -269,10 +288,14 @@ impl DiscoveryBuilder {
 #[derive(Clone)]
 pub struct Discovery {
     ctrl_tx: mpsc::Sender<Ctrl>,
+    /// Demand signal for an on-demand active probe. Sent by `find`/`scan` and by a
+    /// device that just failed to dial; the actor batch-drains these and emits at
+    /// most one probe round per drain (single-flight). Non-blocking `try_send`, so
+    /// a full channel simply means a probe is already pending — the ideal coalesce.
+    want_tx: mpsc::Sender<()>,
     found_tx: broadcast::Sender<DeviceInfo>,
     known: Known,
     routes: Routes,
-    cache_ttl: StdDuration,
 }
 
 impl Discovery {
@@ -295,38 +318,61 @@ impl Discovery {
         }
     }
 
-    /// (Re)start active probing (harmless if already active).
-    pub async fn start(&self) {
-        let _ = self.ctrl_tx.send(Ctrl::Start).await;
+    /// Request one on-demand active probe round. Non-blocking and coalescing: if a
+    /// probe is already pending the request is dropped (the pending one covers it),
+    /// so N callers at once yield **one** broadcast. A no-op if the discovery was
+    /// built `active(false)`. This is the single explicit active trigger; there is
+    /// no perpetual beat.
+    pub fn request_scan(&self) {
+        let _ = self.want_tx.try_send(());
     }
 
-    /// Stop active probing; passive receive continues.
-    pub async fn stop(&self) {
-        let _ = self.ctrl_tx.send(Ctrl::Stop).await;
+    /// The demand sender, handed to a device actor so a failed dial can ask for a
+    /// probe (active-only devices, or a moved IP the cache hasn't caught).
+    pub(crate) fn want_sender(&self) -> mpsc::Sender<()> {
+        self.want_tx.clone()
+    }
+
+    /// Fire an active scan and collect every device seen during `window` (deduped
+    /// by id). The standalone enumerate — "list the Tuya devices on my LAN" — that
+    /// needs no [`Device`](crate::Device). `window` is caller-chosen (no library
+    /// cadence). Combines the active-probe replies with ongoing passive traffic.
+    pub async fn scan(&self, window: StdDuration) -> Vec<DeviceInfo> {
+        self.request_scan();
+        self.discover_for(window).await
     }
 
     /// Register a device's actor so the discovery loop can wake it directly (O(1))
     /// when that id announces — the reconnect fast-path replacing a per-device
     /// broadcast forwarder. `port` rebuilds `ip:port` from an announced IP. The
     /// entry is pruned automatically once the actor's channel closes.
+    ///
+    /// **Last-wins** upsert (mirrors the 0.3 bridge's same-id defense): a second
+    /// device registered under an id supersedes the first's route (the displaced
+    /// one falls back to plain backoff). A collision is almost always a
+    /// misconfiguration, so it is logged.
     pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
-        self.routes.lock().unwrap().insert(id, Route { cmd_tx, port });
+        let prev = self.routes.lock().unwrap().insert(id.clone(), Route { cmd_tx, port });
+        if prev.is_some() {
+            log::warn!("discovery: device id {id} re-registered; superseding previous route");
+        }
     }
 
-    /// Resolve a device by id: returns immediately if it was seen within
-    /// `cache_ttl` (a staler entry is treated as a miss so we don't hand out an
-    /// address the device no longer confirms), otherwise waits for its next
-    /// announcement, up to `timeout`.
+    /// Resolve a device by id. Returns immediately if it is in the cache (kept
+    /// current by passive re-announcements for a present device; a stale entry for
+    /// a departed device is harmless — a connect to it just fails and recovers).
+    /// On a miss it fires one on-demand probe and awaits the next announcement, up
+    /// to `timeout`.
     pub async fn find(&self, device_id: &str, timeout: StdDuration) -> Result<DeviceInfo> {
         // Subscribe *before* checking the cache: if the device announces in the
         // gap between the cache miss and awaiting the stream, the subscription
         // still catches it — no lost-wakeup.
         let mut stream = self.discovered();
-        if let Some((info, at)) = self.known.lock().unwrap().get(device_id).cloned()
-            && at.elapsed() <= self.cache_ttl
-        {
+        if let Some((info, _)) = self.known.lock().unwrap().get(device_id).cloned() {
             return Ok(info);
         }
+        // Miss: elicit it with one probe (coalesced), then wait.
+        self.request_scan();
         let wait = async {
             loop {
                 match stream.recv().await {
@@ -342,17 +388,15 @@ impl Discovery {
         }
     }
 
-    /// A snapshot of every device seen within `cache_ttl` (id → info). Entries
-    /// older than the TTL are omitted — a device silent longer than that is not
-    /// reported as present.
+    /// A snapshot of every device discovered so far (id → info). Not time-filtered;
+    /// pair with [`last_seen`](Self::last_seen) to drop long-silent devices at your
+    /// own threshold.
     #[must_use]
     pub fn known(&self) -> Vec<DeviceInfo> {
-        let ttl = self.cache_ttl;
         self.known
             .lock()
             .unwrap()
             .values()
-            .filter(|(_, at)| at.elapsed() <= ttl)
             .map(|(info, _)| info.clone())
             .collect()
     }
@@ -440,18 +484,13 @@ impl tokio_stream::Stream for Discovered {
 
 /// The discovery actor: reader tasks funnel datagrams into `dgram_rx`, and this
 /// loop drives the FSM and the outbound broadcast socket.
-#[allow(clippy::too_many_arguments)]
 async fn run(
     core: CoreConfig,
     recv_socks: Vec<UdpSocket>,
-    default_send: UdpSocket,
-    send_socks: BTreeMap<Ipv4Addr, UdpSocket>,
     active: bool,
     mut ctrl_rx: mpsc::Receiver<Ctrl>,
-    found_tx: broadcast::Sender<DeviceInfo>,
-    known: Known,
-    routes: Routes,
-    cache_ttl: StdDuration,
+    mut want_rx: mpsc::Receiver<()>,
+    sinks: Sinks,
 ) {
     let mut fsm = DiscoveryFsm::new(core);
     let mut rng = StdRng::from_os_rng();
@@ -482,10 +521,10 @@ async fn run(
     }
     drop(dgram_tx); // only the reader tasks keep the sender alive
 
-    if active {
-        fsm.handle_input(Input::StartScan, now_since(base), &mut rng);
-    }
-    settle(&mut fsm, &default_send, &send_socks, &found_tx, &known, &routes, cache_ttl).await;
+    // No perpetual scan: discovery starts passive. Active probes are on-demand,
+    // driven by `want_rx` (find/scan, or a device that failed to dial), and
+    // batch-coalesced below — one probe round per drained burst (single-flight).
+    settle(&mut fsm, &sinks).await;
 
     loop {
         let deadline =
@@ -498,9 +537,21 @@ async fn run(
                 }
                 None => { /* all readers ended; keep serving control/timer */ }
             },
+            // Demand-driven active probe. Drain the whole burst so N simultaneous
+            // requests collapse to one `StartScan` (single-flight). `active(false)`
+            // discovery ignores the demand (passive only).
+            want = want_rx.recv() => match want {
+                Some(()) => {
+                    while want_rx.try_recv().is_ok() {} // coalesce the burst
+                    if active {
+                        // Fire one round now (the burst config decides how many);
+                        // StartScan arms `next_broadcast = now`, the timer arm emits.
+                        fsm.handle_input(Input::StartScan, now_since(base), &mut rng);
+                    }
+                }
+                None => { /* all want-senders dropped; keep serving */ }
+            },
             ctrl = ctrl_rx.recv() => match ctrl {
-                Some(Ctrl::Start) => fsm.handle_input(Input::StartScan, now_since(base), &mut rng),
-                Some(Ctrl::Stop) => fsm.handle_input(Input::StopScan, now_since(base), &mut rng),
                 Some(Ctrl::Close) | None => {
                     for r in readers {
                         r.abort();
@@ -513,7 +564,7 @@ async fn run(
             }
         }
 
-        settle(&mut fsm, &default_send, &send_socks, &found_tx, &known, &routes, cache_ttl).await;
+        settle(&mut fsm, &sinks).await;
     }
 }
 
@@ -522,20 +573,13 @@ async fn run(
 /// wakes a registered device at its **new** address; `Seen` is a same-IP liveness
 /// tick that wakes a registered device at its current address (①). Both wakes are
 /// O(1) targeted `try_send`s — never blocking, never a broadcast fan-out.
-#[allow(clippy::too_many_arguments)]
-async fn settle(
-    fsm: &mut DiscoveryFsm,
-    default_send: &UdpSocket,
-    send_socks: &BTreeMap<Ipv4Addr, UdpSocket>,
-    found_tx: &broadcast::Sender<DeviceInfo>,
-    known: &Known,
-    routes: &Routes,
-    cache_ttl: StdDuration,
-) {
+async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
     while let Some((bytes, port, source)) = fsm.poll_transmit() {
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, port));
         // Send from the tagged source's socket; fall back to the default one.
-        let sock = source.and_then(|s| send_socks.get(&s)).unwrap_or(default_send);
+        let sock = source
+            .and_then(|s| sinks.send_socks.get(&s))
+            .unwrap_or(&sinks.default_send);
         if let Err(e) = sock.send_to(&bytes, dst).await {
             log::debug!("discovery probe send to {dst} failed: {e}");
         }
@@ -543,18 +587,17 @@ async fn settle(
     while let Some(ev) = fsm.poll_event() {
         match ev {
             Event::Found(info) => {
-                {
-                    let mut map = known.lock().unwrap();
-                    map.insert(info.id.clone(), (info.clone(), StdInstant::now()));
-                    // Bound growth: drop entries silent past the TTL (④).
-                    map.retain(|_, (_, at)| at.elapsed() <= cache_ttl);
-                }
+                sinks
+                    .known
+                    .lock()
+                    .unwrap()
+                    .insert(info.id.clone(), (info.clone(), StdInstant::now()));
                 // Changed/new: wake the registered device at its announced address.
-                route_wake(routes, &info.id, Some(&info.ip.to_string()));
-                let _ = found_tx.send(info);
+                route_wake(&sinks.routes, &info.id, Some(&info.ip.to_string()));
+                let _ = sinks.found_tx.send(info);
             }
             // Same-IP re-announcement: wake to redial the *current* address.
-            Event::Seen(id) => route_wake(routes, &id, None),
+            Event::Seen(id) => route_wake(&sinks.routes, &id, None),
         }
     }
 }

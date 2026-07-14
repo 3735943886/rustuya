@@ -345,7 +345,31 @@ runs with tokio absent from the dependency tree; same core, same oracle.
   check, so it resolves an already-announced device immediately instead of hanging
   on the dedup-suppressed re-announcement (this replaced a magic short-TTL test
   hack). Two loopback E2E tests (crafted UDP announcement → `DeviceInfo`).
-- [ ] **M2.4** Discovery cache / watch-channel semantics preserved (no lost wakeups — cf. concurrency rules).
+- [x] **M2.4** **On-demand active probing — magic cadence constants removed.** The
+  0.3 scanner's active-scan was gated by author-chosen numbers (`BROADCAST_INTERVAL`
+  6 s, `SCAN_THROTTLE_INTERVAL` 60 s, `GLOBAL_SCAN_COOLDOWN` 30 min, `MAX_BROADCASTS`
+  3). The intent behind them was right (passive by default; active only when
+  needed; coalesce concurrent requests; don't storm) but the numbers were a smell.
+  0.4 keeps the intent with **zero discovery-specific constants**: (a) passive
+  receive is always on and does the bulk (devices self-announce, desynchronized);
+  (b) an active probe fires **only on demand** — a `find`/`scan` cache-miss, or a
+  device's failed dial (`ActorConfig::want_scan`) — never a perpetual beat; (c) the
+  discovery actor **batch-drains** the demand channel and emits **one round per
+  burst** (single-flight: 1000 concurrent `find`s → one broadcast; the coalesce is
+  keyed on *dispatch*, set synchronously, so the ms reply-latency can't race it into
+  N probes); (d) re-probe spacing rides the *device's own reconnect backoff*
+  (injected + jittered) — always ≫ reply latency, so the broadcast→N-reply storm is
+  bounded and self-extinguishing (stops when devices connect). The only time inputs
+  are caller-supplied (`find(timeout)`, `scan(window)`) and the reconnect `Backoff`
+  the user already injects. Standalone use preserved (0.3's Python `Scanner.scan()`):
+  `Discovery::scan(window)` / `known()` / `discovered()` / `request_scan()` work
+  with no `Device`. Same-id `register` is last-wins + warn (mirrors the 0.3 bridge
+  defense). The driver `known` map dropped its timer-TTL (naturally bounded by the
+  broadcast domain, ~13 MB worst case for a /16; `last_seen` exposes staleness as a
+  fact, not a policy). E2E: `tests/discovery_active_ondemand.rs` (a mock device
+  replies to a probe; find resolves on demand, 50 concurrent finds coalesce to ≤10
+  probes — both verified to fail with the demand signal neutered).
+- [ ] **M2.4b** Discovery watch-channel semantics preserved (no lost wakeups — cf. concurrency rules; `find`/`register` subscribe-before-check).
 - [ ] **M2.5** Parity of discovery behavior against 0.3 (unit + any mock discovery coverage).
 
 **Acceptance:** the scanner is a driver over a pure discovery FSM; behavior

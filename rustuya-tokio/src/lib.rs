@@ -239,12 +239,6 @@ impl DeviceBuilder {
             handshake_timeout: self.handshake_timeout.map(core_dur),
         };
 
-        let acfg = ActorConfig {
-            core,
-            addr: format!("{address}:{}", self.port),
-            connect_timeout: self.connect_timeout,
-        };
-
         let (cmd_tx, cmd_rx) = mpsc::channel(self.command_capacity);
         let (bcast_tx, _) = broadcast::channel(self.listener_capacity);
         let (conn_tx, conn_rx) = watch::channel(false);
@@ -254,9 +248,18 @@ impl DeviceBuilder {
         // address on a change (IP self-corrects) or a bare `ConnectNow` on an
         // unchanged sighting (same-IP reconnect, backoff cancellation, P3). No
         // per-device forwarder task, no broadcast subscription for the fast path.
-        if let Some(disco) = self.rediscover.as_ref() {
+        // The actor also gets the demand sender so a failed dial re-elicits a probe.
+        let want_scan = self.rediscover.as_ref().map(|disco| {
             disco.register(self.id.clone(), cmd_tx.clone(), self.port);
-        }
+            disco.want_sender()
+        });
+
+        let acfg = ActorConfig {
+            core,
+            addr: format!("{address}:{}", self.port),
+            connect_timeout: self.connect_timeout,
+            want_scan,
+        };
 
         let bcast_for_actor = bcast_tx.clone();
         tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx));
