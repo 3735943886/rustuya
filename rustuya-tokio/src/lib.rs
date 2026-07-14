@@ -203,7 +203,7 @@ impl DeviceBuilder {
 
     /// Link a [`Discovery`] so a live re-announcement of this device **cancels a
     /// pending reconnect backoff and redials immediately** (the core's
-    /// `DiscoveryUpdated`, SMELLS P3). Independent of [`address`](Self::address):
+    /// `ConnectNow`, SMELLS P3). Independent of [`address`](Self::address):
     /// use it with a fixed address to cut reconnect latency when the device
     /// reappears, instead of waiting out the backoff. [`discover`](Self::discover)
     /// links this automatically.
@@ -296,14 +296,11 @@ impl DeviceBuilder {
 fn spawn_rediscovery_forwarder(disco: Discovery, device_id: String, cmd_tx: mpsc::Sender<Cmd>) {
     tokio::spawn(async move {
         let mut stream = disco.discovered();
-        loop {
-            match stream.recv().await {
-                Ok(info) => {
-                    if info.id == device_id && cmd_tx.send(Cmd::ConnectNow).await.is_err() {
-                        break; // actor gone
-                    }
-                }
-                Err(_) => break, // discovery closed
+        // Ends when the discovery bus closes (`recv` yields `Err`, so the
+        // `while let Ok` pattern stops matching).
+        while let Ok(info) = stream.recv().await {
+            if info.id == device_id && cmd_tx.send(Cmd::ConnectNow).await.is_err() {
+                break; // actor gone
             }
         }
     });
@@ -321,7 +318,28 @@ pub struct Device {
 }
 
 impl Device {
-    /// Start a [`DeviceBuilder`].
+    /// Start configuring a device with the given 22-char id and 16-byte local key
+    /// — the entry point. Returns a [`DeviceBuilder`]: set an
+    /// [`address`](DeviceBuilder::address) (or resolve one via
+    /// [`discover`](DeviceBuilder::discover)) and any other knobs, then
+    /// [`connect`](DeviceBuilder::connect).
+    ///
+    /// ```no_run
+    /// # async fn ex() -> rustuya_tokio::Result<()> {
+    /// use rustuya_tokio::{Device, Version};
+    /// let dev = Device::builder("device_id_22chars0000", "0123456789abcdef")
+    ///     .address("192.168.1.50")
+    ///     .version(Version::V3_4)
+    ///     .connect()?;
+    /// # let _ = dev; Ok(()) }
+    /// ```
+    ///
+    /// This is a **builder** entry, not a `Device::new` returning a `Device`: a
+    /// device only exists once connected, and connecting is fallible, so there is
+    /// no infallible `Self` to hand back before the address is known. Unlike 0.3,
+    /// there is also **no** hidden global scanner behind an "auto" address
+    /// (SMELLS Q1): resolving an address without a fixed IP is explicit — pass a
+    /// shared [`Discovery`] to [`discover`](DeviceBuilder::discover).
     #[must_use]
     pub fn builder(id: impl Into<String>, local_key: impl Into<Vec<u8>>) -> DeviceBuilder {
         DeviceBuilder::new(id, local_key)

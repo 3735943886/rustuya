@@ -258,8 +258,24 @@ byte-for-byte behavior-identical under the existing oracles.
   Two deterministic E2Es: `tests/rediscovery.rs` (1-hour backoff, reconnect only
   via a LAN re-announcement) and `tests/connect_now.rs` (`auto_reconnect(false)`
   terminal device revived only by an explicit `connect_now()`).
-  **Still required before this milestone can close:** the Python surface; a literal
-  addressless `Device::new` is the last bit of the exact README snippet.
+  *Constructor decided (A):* the entry stays `Device::builder(id, key) →
+  DeviceBuilder` — set an `address` or resolve one via `discover(&Discovery)`,
+  then `connect`. The 0.3 addressless-magic literal `Device::new("ID","KEY")`
+  (auto-connect with no address, returning a `Device`) is *intentionally dropped*,
+  not reproduced: REUSEPORT load-balances, so a per-device Discovery would drop
+  announcements — the magic needs a *process-shared* Discovery, i.e. exactly the
+  global scanner singleton SMELLS Q1 removed. Rather than reverse Q1, resolving an
+  address without a fixed IP stays **explicit** (pass a shared `Discovery` to
+  `discover`), which keeps error locality (`Result` at the fallible call),
+  deterministic lifetime, and fleet-correctness (one shared listener). *`new` was
+  considered and rejected as a smell:* under A a `Device` does not exist until it
+  is connected (connecting is fallible), so a `Device::new` returning a
+  `DeviceBuilder` would trip `clippy::new_ret_no_self` — the honest builder-entry
+  name is `builder`, and an `#[allow]` would only silence the messenger. The
+  published root `README.md` still shows the old `rustuya::sync::Device` /
+  `rustuya::Device` 0.3 crate and is deferred to the 0.4 release consolidation
+  (alongside Python + crate naming), not rewritten piecemeal here (doc-sync cost).
+  **Still required before this milestone can close:** the Python surface.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
 - [x] **M1.7** `tuyamock` E2E wired to the tokio driver (`rustuya-tokio/tests/tuyamock.rs`): spawns the real `tuyamock` subprocess (opt-in via `RUSTUYA_TUYAMOCK`/PATH; skips otherwise) and drives status/set across **every** version (3.1/3.3/3.4/3.5) plus device22. **This immediately paid for itself:** it caught a real bug the self-crafted `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` carries a 4-byte retcode (like every device→client message), but the core decoded it with `has_retcode=false`. The loopback mock, built on the library's own `encode_message`, was self-consistent and blind to it. Fixed in `device.rs` (decode the handshake response with `has_retcode=true`) + both mocks made faithful. `loopback.rs` remains as a zero-dependency stand-in.
 
