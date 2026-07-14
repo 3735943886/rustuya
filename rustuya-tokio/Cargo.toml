@@ -44,3 +44,7 @@ tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time"
 # versions as rustuya-core, so no duplicate in the tree).
 hmac = "0.13"
 sha2 = "0.11"
+# The `real_device` example installs a logger so the driver's internal
+# log::{debug,warn} (probe sends, route pruning, listener lag) surface under
+# RUST_LOG. Example-only; not a library dependency.
+env_logger = "0.11"
