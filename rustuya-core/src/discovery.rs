@@ -317,60 +317,72 @@ fn build_v35_probe(src: Option<Ipv4Addr>, rng: &mut impl RngCore) -> Option<Vec<
 ///
 /// Like dev22 detection, the exact per-version discovery encoding is not cleanly
 /// self-describing; this is a **structured, bounded** decode (6699/GCM, then
-/// 55AA plaintext / ECB with an optional version-header strip), not the 0.3
-/// open-ended brute force. It is validated against self-crafted packets only —
-/// not authoritative against every real firmware.
+/// 55AA plaintext / ECB), not the 0.3 open-ended brute force.
+///
+/// **A real device announcement carries a 4-byte return code between the frame
+/// header and the payload** — self-crafted test packets omit it (the
+/// self-consistent-mock blindspot). The frame layer leaves that retcode in
+/// `body`, so both the ECB and JSON paths below try the body with a leading
+/// 4-byte retcode stripped (ECB needs the block-aligned form), and JSON parsing
+/// skips to the first `{` and tolerates trailing padding.
 fn decode(data: &[u8]) -> Option<DeviceInfo> {
+    // Port 6666: the whole datagram can be plaintext JSON with no frame at all.
+    if let Some(info) = parse_json_lenient(data) {
+        return Some(info);
+    }
     let header = peek_header(data).ok()??;
-    let body = match header.prefix {
-        // v3.5: 6699 frame, GCM under the v3.5 UDP key; body is plaintext JSON.
-        PREFIX_6699 => unpack_6699(data, &UDP_KEY_V35).ok()?.body,
-        // v3.1/3.3: 55AA/CRC frame; body is plaintext or ECB-encrypted JSON.
-        PREFIX_55AA => {
-            let raw = unpack_55aa(data, Integrity::Crc32).ok()?.body;
-            decode_55aa_body(&raw)?
-        }
-        _ => return None,
-    };
-    parse_json(&body)
+    match header.prefix {
+        // v3.5: 6699 frame, GCM under the v3.5 UDP key; plaintext may lead with a
+        // retcode, so parse leniently.
+        PREFIX_6699 => parse_json_lenient(&unpack_6699(data, &UDP_KEY_V35).ok()?.body),
+        // v3.1/3.3: 55AA/CRC frame; body is plaintext or ECB-encrypted JSON, with
+        // an optional leading retcode.
+        PREFIX_55AA => decode_55aa_body(&unpack_55aa(data, Integrity::Crc32).ok()?.body),
+        _ => None,
+    }
 }
 
-/// Recover JSON bytes from a 55AA discovery body: plaintext, or AES-ECB under a
-/// UDP key, each also tried after stripping a leading 15-byte version header.
-fn decode_55aa_body(raw: &[u8]) -> Option<Vec<u8>> {
-    for candidate in [raw, strip_version_header(raw)] {
-        if looks_like_json(candidate) {
-            return Some(candidate.to_vec());
+/// Recover a [`DeviceInfo`] from a 55AA discovery body: plaintext JSON, or AES-ECB
+/// under a UDP key. Each is tried on the body as-is and with a leading 4-byte
+/// retcode stripped (real announcements carry one; the stripped, block-aligned
+/// form is what lets real ECB ciphertext decrypt).
+fn decode_55aa_body(raw: &[u8]) -> Option<DeviceInfo> {
+    for cand in [raw, raw.get(4..).unwrap_or(raw)] {
+        // Plaintext JSON (skips a leading retcode/version header via the `{` scan).
+        if let Some(info) = parse_json_lenient(cand) {
+            return Some(info);
         }
+        // ECB under a UDP key — needs block-aligned input, so the retcode-stripped
+        // candidate is the one that decodes a real packet.
         for key in [UDP_KEY_V33.as_slice(), UDP_KEY_V35.as_slice()] {
             if let Ok(cipher) = TuyaCipher::new(key)
-                && let Ok(pt) = cipher.ecb_decrypt(candidate)
-                && looks_like_json(&pt)
+                && let Ok(pt) = cipher.ecb_decrypt(cand)
+                && let Some(info) = parse_json_lenient(&pt)
             {
-                return Some(pt);
+                return Some(info);
             }
         }
     }
     None
 }
 
-/// If `raw` begins with a `"3.x"` version header, return the bytes after the
-/// 15-byte header; otherwise `raw` unchanged.
-fn strip_version_header(raw: &[u8]) -> &[u8] {
-    if raw.len() > 15 && raw[0] == b'3' && raw[1] == b'.' {
-        &raw[15..]
-    } else {
-        raw
-    }
-}
-
-/// Cheap "is this a JSON object" check: first non-space byte is `{`.
+/// Cheap "is this a JSON object" check: first non-space byte is `{`. Test-only —
+/// the decode path uses [`parse_json_lenient`], which actually parses.
+#[cfg(test)]
 fn looks_like_json(b: &[u8]) -> bool {
     matches!(b.iter().find(|c| !c.is_ascii_whitespace()), Some(b'{'))
 }
 
+/// Parse a device announcement out of `bytes`, tolerating a leading prefix (a
+/// 4-byte retcode, a version header) by scanning to the first `{`, and trailing
+/// padding via [`json::from_bytes_prefix`].
+fn parse_json_lenient(bytes: &[u8]) -> Option<DeviceInfo> {
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    parse_json(&bytes[start..])
+}
+
 fn parse_json(body: &[u8]) -> Option<DeviceInfo> {
-    let value = json::from_bytes(body)?;
+    let value = json::from_bytes_prefix(body)?;
     let obj = value.as_object()?;
     let id = obj
         .get("gwId")
@@ -457,6 +469,35 @@ mod tests {
         assert_eq!(info.ip, "192.168.0.3".parse::<IpAddr>().unwrap());
         assert_eq!(info.version, Some(Version::V3_5));
         assert_eq!(info.product_key.as_deref(), Some("pk"));
+    }
+
+    /// A real device announcement carries a 4-byte return code between the frame
+    /// header and the payload (self-crafted packets omit it — the mock blindspot
+    /// that hid this). The ECB ciphertext then sits at a +4 offset, so the body is
+    /// no longer block-aligned unless the retcode is stripped first. These pin the
+    /// retcode-tolerant decode for both the ECB (55AA) and plaintext (6699) paths.
+    #[test]
+    fn decodes_ecb_with_leading_retcode() {
+        let cipher = TuyaCipher::new(UDP_KEY_V33).unwrap();
+        let ct = cipher.ecb_encrypt(&json_bytes("rc", "192.168.0.7", "3.3")).unwrap();
+        // body = retcode(4) ++ ECB(json), exactly the on-wire shape.
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&ct);
+        let pkt = pack_55aa(0, 0x13, &body, Integrity::Crc32);
+        let info = decode(&pkt).expect("retcode-prefixed ECB announcement decodes");
+        assert_eq!(info.id, "rc");
+        assert_eq!(info.ip, "192.168.0.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn decodes_v35_with_leading_retcode() {
+        // 6699/GCM plaintext = retcode(4) ++ json.
+        let mut payload = vec![0u8, 0, 0, 0];
+        payload.extend_from_slice(&json_bytes("rc5", "192.168.0.8", "3.5"));
+        let pkt = pack_6699(0, 0x25, &payload, &UDP_KEY_V35, &[9u8; 12]).unwrap();
+        let info = decode(&pkt).expect("retcode-prefixed v3.5 announcement decodes");
+        assert_eq!(info.id, "rc5");
+        assert_eq!(info.version, Some(Version::V3_5));
     }
 
     #[test]
