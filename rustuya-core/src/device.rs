@@ -20,7 +20,7 @@
 //! decides *whether* to retry; the delay policy is single and identical.
 //!
 //! Still deferred to later increments: heartbeat / idle timers (P4/P5) and the
-//! `DiscoveryUpdated` wake input (P3).
+//! `ConnectNow` wake input (P3).
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -112,12 +112,16 @@ pub enum Input<'a> {
         cid: Option<&'a str>,
         t: u64,
     },
-    /// The `discovery` FSM saw this device broadcast on the LAN. While backing
-    /// off, this cancels the remaining wait and redials **now** — the sans-io
-    /// replacement for the 0.3 `wait_for_backoff` sleep-vs-rediscovery `select`
-    /// (SMELLS P3). Address-less: the core holds no address, so the driver just
-    /// updates its own dial target and pushes this wake.
-    DiscoveryUpdated,
+    /// (Re)connect **now**: cancel any backoff wait and redial immediately, and
+    /// revive a terminal `Closed` (`auto_reconnect = false`) device. The single
+    /// "connect now" signal, fed either by an explicit user `connect_now()` or by
+    /// the `discovery` FSM seeing this device on the LAN — both mean the same
+    /// thing to the core, so there is one input. This is the sans-io replacement
+    /// for the 0.3 `wait_for_backoff` sleep-vs-rediscovery `select` (SMELLS P3).
+    /// The backoff *attempt* counter is left intact, so repeated wakes (a flapping
+    /// device, or `connect_now` spam) can't defeat the escalation; a successful
+    /// connection resets it.
+    ConnectNow,
     /// The connection was closed / dropped.
     Closed,
 }
@@ -202,7 +206,7 @@ impl Device {
             Input::ConnectFailed => self.on_connect_failed(now, rng),
             Input::Received(data) => self.on_received(data, now, rng),
             Input::Send { cmd, data, cid, t } => self.on_send(cmd, data, cid, t, rng),
-            Input::DiscoveryUpdated => self.on_discovery_updated(),
+            Input::ConnectNow => self.on_connect_now(),
             Input::Closed => self.on_closed(now, rng),
         }
     }
@@ -327,11 +331,12 @@ impl Device {
         }
     }
 
-    fn on_discovery_updated(&mut self) {
-        // Only meaningful while waiting out a backoff: skip the wait and redial.
-        // The backoff *attempt* counter is left intact, so a flapping device
-        // can't reset the escalation by re-announcing each cycle.
-        if self.state == State::Backoff {
+    fn on_connect_now(&mut self) {
+        // Cancel a backoff wait and revive a terminal `Closed`; the driver then
+        // dials (`wants_connect`). The backoff *attempt* counter is left intact —
+        // a flapping device or repeated `connect_now` can't reset the escalation;
+        // a successful connection (`reach_connected`) is what resets it.
+        if matches!(self.state, State::Backoff | State::Closed) {
             self.deadline = None;
             self.state = State::Connecting;
         }
@@ -900,10 +905,10 @@ mod tests {
         assert!(dev.wants_connect());
     }
 
-    // -- discovery-wake (P3) -------------------------------------------------
+    // -- connect-now / discovery-wake (P3) -----------------------------------
 
     #[test]
-    fn discovery_wake_cancels_backoff_and_redials() {
+    fn connect_now_cancels_backoff_and_redials() {
         let backoff = Backoff {
             base: Duration::from_secs(30),
             max: Duration::from_secs(30),
@@ -918,15 +923,30 @@ mod tests {
         assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(30)));
         assert!(!dev.wants_connect());
 
-        // Rediscovered on the LAN → skip the 30 s wait, redial immediately.
-        dev.handle_input(Input::DiscoveryUpdated, T0, &mut rng);
+        // Woken (LAN sighting or explicit connect_now) → skip the 30 s wait.
+        dev.handle_input(Input::ConnectNow, T0, &mut rng);
         assert!(dev.wants_connect());
         assert_eq!(dev.poll_timeout(), None);
     }
 
     #[test]
-    fn discovery_wake_preserves_backoff_escalation() {
-        // A flapping device that re-announces each cycle must not reset the curve.
+    fn connect_now_revives_a_terminal_closed_device() {
+        // auto_reconnect = false → Closed on drop; ConnectNow brings it back.
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg_with(Version::V3_3, false, zero_backoff()));
+        dev.handle_input(Input::Connected, T0, &mut rng);
+        let _ = drain_events(&mut dev);
+        dev.handle_input(Input::Closed, T0, &mut rng);
+        assert!(!dev.wants_connect(), "terminal Closed");
+        assert_eq!(dev.poll_timeout(), None);
+
+        dev.handle_input(Input::ConnectNow, T0, &mut rng);
+        assert!(dev.wants_connect(), "revived → wants to dial");
+    }
+
+    #[test]
+    fn connect_now_preserves_backoff_escalation() {
+        // Repeated wakes (flapping device / connect_now spam) must not reset the curve.
         let backoff = Backoff {
             base: Duration::from_secs(2),
             max: Duration::from_secs(100),
@@ -938,16 +958,16 @@ mod tests {
         let _ = drain_events(&mut dev);
         dev.handle_input(Input::Closed, T0, &mut rng); // attempt 0 → 2 s
         assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(2)));
-        dev.handle_input(Input::DiscoveryUpdated, T0, &mut rng); // → Connecting, counter intact
+        dev.handle_input(Input::ConnectNow, T0, &mut rng); // → Connecting, counter intact
         dev.handle_input(Input::ConnectFailed, T0, &mut rng); // attempt 1 → 4 s, not reset to 2 s
         assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(4)));
     }
 
     #[test]
-    fn discovery_wake_is_noop_when_connected() {
+    fn connect_now_is_noop_when_connected() {
         let mut rng = SeededRng(1);
         let mut dev = connected(cfg(Version::V3_3), &mut rng);
-        dev.handle_input(Input::DiscoveryUpdated, T0, &mut rng);
+        dev.handle_input(Input::ConnectNow, T0, &mut rng);
         assert!(dev.is_connected());
         assert!(dev.poll_event().is_none());
     }

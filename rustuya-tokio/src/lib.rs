@@ -249,16 +249,15 @@ impl DeviceBuilder {
         let (bcast_tx, _) = broadcast::channel(self.listener_capacity);
         let (conn_tx, conn_rx) = watch::channel(false);
 
-        // If a discovery is linked, spawn a forwarder that nudges the actor on
-        // each re-announcement of this device id (backoff cancellation, P3).
-        let wake_rx = self.rediscover.as_ref().map(|disco| {
-            let (wake_tx, wake_rx) = mpsc::channel(4);
-            spawn_rediscovery_forwarder(disco.clone(), self.id.clone(), wake_tx);
-            wake_rx
-        });
+        // If a discovery is linked, forward its re-announcements of this device to
+        // the actor as `Cmd::ConnectNow` — the same signal `connect_now()` sends
+        // (backoff cancellation, P3).
+        if let Some(disco) = self.rediscover.as_ref() {
+            spawn_rediscovery_forwarder(disco.clone(), self.id.clone(), cmd_tx.clone());
+        }
 
         let bcast_for_actor = bcast_tx.clone();
-        tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx, wake_rx));
+        tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx));
 
         Ok(Device {
             id: self.id,
@@ -291,16 +290,16 @@ impl DeviceBuilder {
     }
 }
 
-/// Subscribe to `disco`'s announcement bus and nudge the actor (`wake_tx`) on each
-/// re-announcement of `device_id`. Runs until the discovery bus closes or the
-/// actor drops its receiver.
-fn spawn_rediscovery_forwarder(disco: Discovery, device_id: String, wake_tx: mpsc::Sender<()>) {
+/// Subscribe to `disco`'s announcement bus and send the actor a `Cmd::ConnectNow`
+/// on each re-announcement of `device_id`. Runs until the discovery bus closes or
+/// the actor drops its receiver.
+fn spawn_rediscovery_forwarder(disco: Discovery, device_id: String, cmd_tx: mpsc::Sender<Cmd>) {
     tokio::spawn(async move {
         let mut stream = disco.discovered();
         loop {
             match stream.recv().await {
                 Ok(info) => {
-                    if info.id == device_id && wake_tx.send(()).await.is_err() {
+                    if info.id == device_id && cmd_tx.send(Cmd::ConnectNow).await.is_err() {
                         break; // actor gone
                     }
                 }
@@ -442,6 +441,15 @@ impl Device {
         Listener {
             stream: BroadcastStream::new(self.bcast_tx.subscribe()),
         }
+    }
+
+    /// Force an immediate (re)connection attempt: cancel any pending reconnect
+    /// backoff and revive a device that has stopped reconnecting
+    /// ([`auto_reconnect(false)`](DeviceBuilder::auto_reconnect)). A no-op while
+    /// already connected/connecting. Returns once queued; pair with
+    /// [`wait_connected`](Self::wait_connected) to await the outcome.
+    pub async fn connect_now(&self) {
+        let _ = self.cmd_tx.send(Cmd::ConnectNow).await;
     }
 
     /// Gracefully stop the driver task. Idempotent; further requests error with

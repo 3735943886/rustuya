@@ -105,7 +105,7 @@ pub enum DevInput<'a> {
     ConnectFailed(TransportError),  // neutral transport error (D5), not std::io
     BytesReceived(&'a [u8]),        // driver read; core reassembles frames (D4)
     CommandQueued(Command),
-    DiscoveryUpdated(IpAddr),       // replaces wait_for_backoff sleep+watch coupling
+    ConnectNow,                     // replaces wait_for_backoff sleep+watch coupling (P3); also connect_now()
     Closed,
 }
 impl DeviceCore {
@@ -221,7 +221,7 @@ byte-for-byte behavior-identical under the existing oracles.
 
 - [x] **M1.1** Model the FSM: states (Connecting → Handshaking → Connected → Backoff → …) + `Input`/`Event` (poll-split). *v2, `device.rs`.*
 - [x] **M1.2** Port the session-key negotiation (prepare/verify/finalize) into the FSM. *v1, `session.rs` + `device.rs`.*
-- [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout` deadline (SMELLS P1/P2/P6). Discovery-wake half (`DiscoveryUpdated`) deferred to the discovery increment — in poll-split it's a driver `select!` arm, not core `select`. *v2, `device.rs` + `time.rs`.*
+- [x] **M1.3** Backoff + jitter as an injected `Backoff` policy + `poll_timeout` deadline (SMELLS P1/P2/P6). The wake half is `Input::ConnectNow` (one signal for both discovery-rewake and explicit `connect_now`) — in poll-split it's a driver channel, not core `select`. *v2, `device.rs` + `time.rs`.*
 - [x] **M1.4** Heartbeat + idle-timeout + handshake-timeout as timer events, all merged into the single `poll_timeout` via `earliest()` (SMELLS P4/P5 resolved; a stalled handshake no longer stalls forever). *v3, `device.rs`.* dev22 fallback decisions still to port from `decision.rs`.
 - [x] **M1.4b (core)** Thread `cid` through the FSM so **sub-devices** work:
   `Input::Send` gained a `cid: Option<&'a str>` field, `on_send` forwards it into
@@ -248,19 +248,18 @@ byte-for-byte behavior-identical under the existing oracles.
   loopback test asserts the `cid` reaches the wire envelope). Fire-and-forget FIFO
   response correlation (no seqno matching — protocol has no token). A runnable
   `examples/tokio_control.rs` mirrors the README async shape (explicit address).
-  **Still required by this milestone before it can close:** `connect_now` (M1.5
-  explicitly lists it) and the Python surface. *Addressless connect now works:*
-  `DeviceBuilder::discover(&Discovery, timeout)` resolves IP **and** version from
-  the LAN (via M2.3) and connects — see `examples/discover_connect.rs`, pinned by a
-  deterministic E2E (UDP announce → discover → TCP connect → status). *Live
-  rediscovery-wake now works too (P3):* `DeviceBuilder::rediscover(&Discovery)`
-  (also auto-linked by `discover`) spawns a forwarder that feeds the core's
-  `Input::DiscoveryUpdated` on each re-announcement, so a device backing off
-  redials the instant it reappears on the LAN — pinned by a deterministic E2E
-  (1-hour backoff, reconnect happens *only* via the wake; `tests/rediscovery.rs`).
-  **Still required before this milestone can close:** `connect_now` and the Python
-  surface; a literal addressless `Device::new` is the last bit of the exact README
-  snippet.
+  *Addressless connect works:* `DeviceBuilder::discover(&Discovery, timeout)`
+  resolves IP **and** version from the LAN (via M2.3) and connects — see
+  `examples/discover_connect.rs`, pinned by a deterministic E2E (UDP announce →
+  discover → TCP connect → status). *`connect_now` + live rewake (P3) work and are
+  **one** mechanism:* the core has a single `Input::ConnectNow` (cancel backoff /
+  revive terminal `Closed`), fed by both `Device::connect_now()` and the discovery
+  forwarder (`DeviceBuilder::rediscover(&Discovery)`, auto-linked by `discover`).
+  Two deterministic E2Es: `tests/rediscovery.rs` (1-hour backoff, reconnect only
+  via a LAN re-announcement) and `tests/connect_now.rs` (`auto_reconnect(false)`
+  terminal device revived only by an explicit `connect_now()`).
+  **Still required before this milestone can close:** the Python surface; a literal
+  addressless `Device::new` is the last bit of the exact README snippet.
 - [ ] **M1.6** **Deterministic FSM tests at zero wall-clock** (e.g. `ConnectFailed → [StartTimer(Backoff, 16 s)]`), plus the seeded-RNG IV/nonce-uniqueness test. The 0.3 `slow` reconnect test can now have a fast pure-FSM twin.
 - [x] **M1.7** `tuyamock` E2E wired to the tokio driver (`rustuya-tokio/tests/tuyamock.rs`): spawns the real `tuyamock` subprocess (opt-in via `RUSTUYA_TUYAMOCK`/PATH; skips otherwise) and drives status/set across **every** version (3.1/3.3/3.4/3.5) plus device22. **This immediately paid for itself:** it caught a real bug the self-crafted `loopback.rs` mock could not — the v3.4/v3.5 `SessKeyNegResp` carries a 4-byte retcode (like every device→client message), but the core decoded it with `has_retcode=false`. The loopback mock, built on the library's own `encode_message`, was self-consistent and blind to it. Fixed in `device.rs` (decode the handshake response with `has_retcode=true`) + both mocks made faithful. `loopback.rs` remains as a zero-dependency stand-in.
 
