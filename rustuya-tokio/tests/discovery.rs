@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::net::UdpSocket;
 
-use rustuya_core::{frame, CommandType};
+use rustuya_core::{CommandType, frame};
 use rustuya_tokio::Discovery;
 
 /// A fixed high port, unlikely to collide with the real 6666/6667/7000 or with

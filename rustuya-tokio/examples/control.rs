@@ -37,7 +37,10 @@ async fn main() -> Result<()> {
         }
     };
     // After id/key, a remaining `dp value` pair means "also set this DP".
-    let set = args.get(2).zip(args.get(3)).map(|(dp, v)| (dp.clone(), v.clone()));
+    let set = args
+        .get(2)
+        .zip(args.get(3))
+        .map(|(dp, v)| (dp.clone(), v.clone()));
 
     let dev = connect_resolved(id, key, ip, version).await?;
     // `status()` waits internally, but wait explicitly so a handshake failure

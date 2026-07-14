@@ -27,6 +27,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rand_core::RngCore;
 
+use crate::CoreError;
 use crate::command::{self, CommandType};
 use crate::json::{self, Value};
 use crate::message::{self, Message};
@@ -34,7 +35,6 @@ use crate::rx::RxBuffer;
 use crate::session::Handshake;
 use crate::time::{Duration, Instant};
 use crate::version::{DeviceType, Version};
-use crate::CoreError;
 
 /// Exponential-backoff policy for reconnect attempts (SMELLS.md P1/P2).
 ///
@@ -311,7 +311,12 @@ impl Device {
             rng.fill_bytes(&mut nonce);
             let hs = Handshake::new(nonce);
             let key = self.cfg.local_key;
-            match self.encode(CommandType::SessKeyNegStart as u32, hs.local_nonce(), &key, rng) {
+            match self.encode(
+                CommandType::SessKeyNegStart as u32,
+                hs.local_nonce(),
+                &key,
+                rng,
+            ) {
                 Ok(bytes) => {
                     self.tx.push_back(bytes);
                     self.handshake = Some(hs);
@@ -417,7 +422,12 @@ impl Device {
         // SessKeyNegFinish is framed with the local key (before the session key
         // takes effect). For v3.5 this is a 6699/GCM frame, so it needs a fresh
         // random IV from the injected RNG — never a fixed one (S3/P2).
-        match self.encode(CommandType::SessKeyNegFinish as u32, &finished.finish_hmac, &key, rng) {
+        match self.encode(
+            CommandType::SessKeyNegFinish as u32,
+            &finished.finish_hmac,
+            &key,
+            rng,
+        ) {
             Ok(bytes) => self.tx.push_back(bytes),
             Err(e) => return self.fail(e, now, rng),
         }
@@ -435,7 +445,8 @@ impl Device {
         rng: &mut impl RngCore,
     ) {
         if self.state != State::Connected {
-            self.events.push_back(Event::ProtocolError(CoreError::NotConnected));
+            self.events
+                .push_back(Event::ProtocolError(CoreError::NotConnected));
             return;
         }
         let (code, value) = command::generate(
@@ -585,7 +596,10 @@ mod tests {
     struct SeededRng(u64);
     impl RngCore for SeededRng {
         fn next_u32(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u32
         }
         fn next_u64(&mut self) -> u64 {
@@ -740,7 +754,10 @@ mod tests {
         let msg = decode_message(Version::V3_3, &wire, &KEY, false).unwrap();
         let v = json::from_bytes(&msg.payload).unwrap();
         assert_eq!(v["cid"], "subchannel01", "cid field present");
-        assert_eq!(v["devId"], "subchannel01", "envelope addresses the sub-device");
+        assert_eq!(
+            v["devId"], "subchannel01",
+            "envelope addresses the sub-device"
+        );
         assert_eq!(v["dps"], json::from_bytes(br#"{"1":true}"#).unwrap());
     }
 
@@ -749,11 +766,19 @@ mod tests {
         let mut rng = SeededRng(3);
         let mut dev = Device::new(cfg(Version::V3_5));
         dev.handle_input(
-            Input::Send { cmd: CommandType::DpQuery, data: None, cid: None, t: 1 },
+            Input::Send {
+                cmd: CommandType::DpQuery,
+                data: None,
+                cid: None,
+                t: 1,
+            },
             T0,
             &mut rng,
         );
-        assert_eq!(drain_events(&mut dev), vec![Event::ProtocolError(CoreError::NotConnected)]);
+        assert_eq!(
+            drain_events(&mut dev),
+            vec![Event::ProtocolError(CoreError::NotConnected)]
+        );
     }
 
     #[test]
@@ -762,11 +787,20 @@ mod tests {
             let mut rng = SeededRng(42);
             let mut dev = Device::new(cfg(version));
             dev.handle_input(Input::Connected, T0, &mut rng);
-            assert!(!dev.is_connected(), "{version:?} handshaking, not yet ready");
+            assert!(
+                !dev.is_connected(),
+                "{version:?} handshaking, not yet ready"
+            );
             complete_handshake(&mut dev, version, &mut rng);
             assert!(dev.is_connected(), "{version:?} connected after handshake");
-            assert!(drain_events(&mut dev).contains(&Event::Ready), "{version:?}");
-            assert!(dev.poll_transmit().is_some(), "{version:?} sent SessKeyNegFinish");
+            assert!(
+                drain_events(&mut dev).contains(&Event::Ready),
+                "{version:?}"
+            );
+            assert!(
+                dev.poll_transmit().is_some(),
+                "{version:?} sent SessKeyNegFinish"
+            );
         }
     }
 
@@ -779,7 +813,12 @@ mod tests {
 
         // A well-formed response frame but with a bad HMAC (48 zero bytes =
         // remote_nonce(16) + wrong hmac(32)) -> verify_response HMAC mismatch.
-        let resp = craft_device_frame(Version::V3_4, CommandType::SessKeyNegResp as u32, 1, &[0u8; 48]);
+        let resp = craft_device_frame(
+            Version::V3_4,
+            CommandType::SessKeyNegResp as u32,
+            1,
+            &[0u8; 48],
+        );
         dev.handle_input(Input::Received(&resp), T0, &mut rng);
         assert!(!dev.is_connected());
         let events = drain_events(&mut dev);
@@ -866,7 +905,11 @@ mod tests {
         for secs in expected {
             dev.handle_input(Input::ConnectFailed, now, &mut rng);
             let deadline = dev.poll_timeout().expect("armed");
-            assert_eq!(deadline, now + Duration::from_secs(secs), "attempt at {now:?}");
+            assert_eq!(
+                deadline,
+                now + Duration::from_secs(secs),
+                "attempt at {now:?}"
+            );
             now = deadline;
             dev.handle_timeout(now, &mut rng); // elapse -> Connecting
             assert!(dev.wants_connect());
@@ -876,7 +919,11 @@ mod tests {
         dev.handle_input(Input::Connected, now, &mut rng);
         let _ = drain_events(&mut dev);
         dev.handle_input(Input::Closed, now, &mut rng);
-        assert_eq!(dev.poll_timeout(), Some(now + Duration::from_secs(2)), "curve reset to base");
+        assert_eq!(
+            dev.poll_timeout(),
+            Some(now + Duration::from_secs(2)),
+            "curve reset to base"
+        );
     }
 
     #[test]
@@ -897,7 +944,10 @@ mod tests {
             assert!((1000..2000).contains(&ms), "seed {seed}: {ms} out of range");
             seen.push(ms);
         }
-        assert!(seen.iter().any(|&ms| ms != seen[0]), "jitter should vary with the RNG");
+        assert!(
+            seen.iter().any(|&ms| ms != seen[0]),
+            "jitter should vary with the RNG"
+        );
     }
 
     #[test]
@@ -991,14 +1041,26 @@ mod tests {
     // -- heartbeat / idle liveness (P4/P5) -----------------------------------
 
     fn cfg_live(heartbeat: Option<Duration>, idle_timeout: Option<Duration>) -> Config {
-        Config { heartbeat, idle_timeout, ..cfg(Version::V3_3) }
+        Config {
+            heartbeat,
+            idle_timeout,
+            ..cfg(Version::V3_3)
+        }
     }
 
     /// A valid inbound data frame (retcode(4) || json), as a device would send.
     fn inbound_data_frame() -> Vec<u8> {
         let mut body = vec![0u8; 4]; // retcode 0
         body.extend_from_slice(br#"{"dps":{"1":true}}"#);
-        message::encode_message(Version::V3_3, CommandType::DpQuery as u32, 9, &body, &KEY, &[0u8; 12]).unwrap()
+        message::encode_message(
+            Version::V3_3,
+            CommandType::DpQuery as u32,
+            9,
+            &body,
+            &KEY,
+            &[0u8; 12],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1028,20 +1090,34 @@ mod tests {
 
         // A command goes out at t=6s → keepalive defers to 6+10 = 16s.
         dev.handle_input(
-            Input::Send { cmd: CommandType::DpQuery, data: None, cid: None, t: 1 },
+            Input::Send {
+                cmd: CommandType::DpQuery,
+                data: None,
+                cid: None,
+                t: 1,
+            },
             Instant::from_millis(6_000),
             &mut rng,
         );
         let _ = dev.poll_transmit(); // the DpQuery frame itself
-        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(16_000)), "send deferred the heartbeat");
+        assert_eq!(
+            dev.poll_timeout(),
+            Some(Instant::from_millis(16_000)),
+            "send deferred the heartbeat"
+        );
 
         // The superseded 10s deadline fires nothing.
         dev.handle_timeout(Instant::from_millis(10_000), &mut rng);
-        assert!(dev.poll_transmit().is_none(), "no heartbeat at the deferred-away 10s deadline");
+        assert!(
+            dev.poll_transmit().is_none(),
+            "no heartbeat at the deferred-away 10s deadline"
+        );
 
         // At 16s the heartbeat finally goes out.
         dev.handle_timeout(Instant::from_millis(16_000), &mut rng);
-        let wire = dev.poll_transmit().expect("heartbeat at the deferred deadline");
+        let wire = dev
+            .poll_transmit()
+            .expect("heartbeat at the deferred deadline");
         let msg = decode_message(Version::V3_3, &wire, &KEY, false).unwrap();
         assert_eq!(msg.cmd, CommandType::HeartBeat as u32);
     }
@@ -1057,7 +1133,10 @@ mod tests {
         dev.handle_timeout(Instant::from_millis(30_000), &mut rng);
         assert!(!dev.is_connected());
         assert_eq!(drain_events(&mut dev), vec![Event::Disconnected]);
-        assert!(dev.poll_timeout().is_some(), "dropped into backoff (auto_reconnect)");
+        assert!(
+            dev.poll_timeout().is_some(),
+            "dropped into backoff (auto_reconnect)"
+        );
     }
 
     #[test]
@@ -1085,7 +1164,11 @@ mod tests {
         let mut dev = connected(cfg_live(None, Some(Duration::from_secs(30))), &mut rng);
         // A frame arrives at t=20s → idle resets to 20+30 = 50s (peer is alive).
         let frame = inbound_data_frame();
-        dev.handle_input(Input::Received(&frame), Instant::from_millis(20_000), &mut rng);
+        dev.handle_input(
+            Input::Received(&frame),
+            Instant::from_millis(20_000),
+            &mut rng,
+        );
         let _ = drain_events(&mut dev);
         assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(50_000)));
         // Firing at the *old* 30s deadline is now a no-op — still connected.
@@ -1121,7 +1204,11 @@ mod tests {
         dev.handle_input(Input::Connected, T0, &mut rng);
         let _ = dev.poll_transmit(); // SessKeyNegStart went out
         assert!(!dev.is_connected());
-        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(5_000)), "handshake deadline armed");
+        assert_eq!(
+            dev.poll_timeout(),
+            Some(Instant::from_millis(5_000)),
+            "handshake deadline armed"
+        );
 
         // Device never answers: at the deadline the FSM tears the socket down
         // (Disconnected → driver closes it) and re-arms backoff.
@@ -1143,7 +1230,11 @@ mod tests {
         complete_handshake(&mut dev, Version::V3_4, &mut rng);
         assert!(dev.is_connected());
         // No heartbeat/idle configured → the deadline is gone, not left stale.
-        assert_eq!(dev.poll_timeout(), None, "handshake deadline cleared on connect");
+        assert_eq!(
+            dev.poll_timeout(),
+            None,
+            "handshake deadline cleared on connect"
+        );
     }
 
     // -- RX reassembly (D4) --------------------------------------------------
@@ -1180,8 +1271,15 @@ mod tests {
     fn malformed_stream_tears_down() {
         let mut rng = SeededRng(1);
         let mut dev = connected(cfg(Version::V3_3), &mut rng);
-        dev.handle_input(Input::Received(&[0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0]), T0, &mut rng);
-        assert!(!dev.is_connected(), "a bad prefix corrupts the stream → teardown");
+        dev.handle_input(
+            Input::Received(&[0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0]),
+            T0,
+            &mut rng,
+        );
+        assert!(
+            !dev.is_connected(),
+            "a bad prefix corrupts the stream → teardown"
+        );
         let events = drain_events(&mut dev);
         assert!(events.iter().any(|e| matches!(e, Event::ProtocolError(_))));
         assert!(events.contains(&Event::Disconnected));
@@ -1200,7 +1298,10 @@ mod tests {
         dev.handle_input(Input::Received(&resp[4..20]), T0, &mut rng);
         assert!(!dev.is_connected());
         dev.handle_input(Input::Received(&resp[20..]), T0, &mut rng);
-        assert!(dev.is_connected(), "handshake completes once the last fragment arrives");
+        assert!(
+            dev.is_connected(),
+            "handshake completes once the last fragment arrives"
+        );
     }
 
     // -- randomness uniqueness (injected RNG; tinytuya #722 immunity) ---------
@@ -1219,7 +1320,10 @@ mod tests {
     fn assert_all_distinct(items: &[Vec<u8>]) {
         for i in 0..items.len() {
             for j in (i + 1)..items.len() {
-                assert_ne!(items[i], items[j], "duplicate at ({i}, {j}) — randomness reuse");
+                assert_ne!(
+                    items[i], items[j],
+                    "duplicate at ({i}, {j}) — randomness reuse"
+                );
             }
         }
     }
@@ -1243,7 +1347,11 @@ mod tests {
             dev.handle_input(Input::Connected, T0, &mut rng);
             let start = dev.poll_transmit().expect("SessKeyNegStart");
             // The SessKeyNegStart payload is the raw 16-byte local_nonce.
-            nonces.push(decode_message(Version::V3_4, &start, &KEY, false).unwrap().payload);
+            nonces.push(
+                decode_message(Version::V3_4, &start, &KEY, false)
+                    .unwrap()
+                    .payload,
+            );
         }
         assert_all_distinct(&nonces);
     }
@@ -1272,7 +1380,10 @@ mod tests {
     #[test]
     fn timer_driven_heartbeats_use_distinct_ivs() {
         let mut rng = SeededRng(3);
-        let cfg = Config { heartbeat: Some(Duration::from_secs(10)), ..cfg(Version::V3_5) };
+        let cfg = Config {
+            heartbeat: Some(Duration::from_secs(10)),
+            ..cfg(Version::V3_5)
+        };
         let mut dev = connected_v35(cfg, &mut rng);
         let mut ivs = Vec::new();
         for k in 1..=5u64 {

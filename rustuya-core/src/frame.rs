@@ -118,7 +118,12 @@ pub fn peek_header(data: &[u8]) -> Result<Option<Header>> {
     } else {
         (rd_u32(data, 6)?, rd_u32(data, 10)?)
     };
-    Ok(Some(Header { prefix, seqno, cmd, frame_len }))
+    Ok(Some(Header {
+        prefix,
+        seqno,
+        cmd,
+        frame_len,
+    }))
 }
 
 // -- 55AA -------------------------------------------------------------------
@@ -170,7 +175,8 @@ pub fn unpack_55aa(data: &[u8], integrity: Integrity<'_>) -> Result<RawFrame> {
         Integrity::Hmac(key) => {
             let mut mac = HmacSha256::new_from_slice(key).expect("HMAC takes any key length");
             mac.update(signed);
-            mac.verify_slice(footer).map_err(|_| CoreError::HmacMismatch)?;
+            mac.verify_slice(footer)
+                .map_err(|_| CoreError::HmacMismatch)?;
         }
     }
     Ok(RawFrame {
@@ -264,7 +270,14 @@ mod tests {
     fn roundtrip_55aa_crc() {
         let bytes = pack_55aa(5, 0x0a, b"hello", Integrity::Crc32);
         let f = unpack_55aa(&bytes, Integrity::Crc32).unwrap();
-        assert_eq!(f, RawFrame { seqno: 5, cmd: 0x0a, body: b"hello".to_vec() });
+        assert_eq!(
+            f,
+            RawFrame {
+                seqno: 5,
+                cmd: 0x0a,
+                body: b"hello".to_vec()
+            }
+        );
         // peek agrees on the total length
         assert_eq!(peek_header(&bytes).unwrap().unwrap().frame_len, bytes.len());
     }
@@ -282,12 +295,18 @@ mod tests {
         let mut c = pack_55aa(1, 1, b"xyz", Integrity::Crc32);
         let n = c.len();
         c[n - 6] ^= 0xff; // flip a payload byte
-        assert_eq!(unpack_55aa(&c, Integrity::Crc32), Err(CoreError::CrcMismatch));
+        assert_eq!(
+            unpack_55aa(&c, Integrity::Crc32),
+            Err(CoreError::CrcMismatch)
+        );
 
         let mut h = pack_55aa(1, 1, b"xyz", Integrity::Hmac(KEY));
         let n = h.len();
         h[n - 6] ^= 0xff;
-        assert_eq!(unpack_55aa(&h, Integrity::Hmac(KEY)), Err(CoreError::HmacMismatch));
+        assert_eq!(
+            unpack_55aa(&h, Integrity::Hmac(KEY)),
+            Err(CoreError::HmacMismatch)
+        );
     }
 
     #[test]
@@ -295,7 +314,14 @@ mod tests {
         let iv = [3u8; 12];
         let bytes = pack_6699(42, 0x10, b"the plaintext", KEY, &iv).unwrap();
         let f = unpack_6699(&bytes, KEY).unwrap();
-        assert_eq!(f, RawFrame { seqno: 42, cmd: 0x10, body: b"the plaintext".to_vec() });
+        assert_eq!(
+            f,
+            RawFrame {
+                seqno: 42,
+                cmd: 0x10,
+                body: b"the plaintext".to_vec()
+            }
+        );
         assert_eq!(peek_header(&bytes).unwrap().unwrap().frame_len, bytes.len());
     }
 
@@ -323,12 +349,18 @@ mod tests {
         let hdr = peek_header(&bytes[..H55AA]).unwrap().unwrap();
         assert_eq!(hdr.frame_len, bytes.len());
         // a short buffer fails the whole-frame check
-        assert_eq!(unpack_55aa(&bytes[..bytes.len() - 1], Integrity::Crc32), Err(CoreError::Truncated));
+        assert_eq!(
+            unpack_55aa(&bytes[..bytes.len() - 1], Integrity::Crc32),
+            Err(CoreError::Truncated)
+        );
     }
 
     #[test]
     fn bad_prefix_and_oversized_rejected() {
-        assert_eq!(peek_header(&[0, 0, 0, 0, 0, 0, 0, 0]), Err(CoreError::BadHeader));
+        assert_eq!(
+            peek_header(&[0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(CoreError::BadHeader)
+        );
         // 55AA header claiming a huge length
         let mut oversized = Vec::new();
         oversized.extend_from_slice(&PREFIX_55AA.to_be_bytes());

@@ -251,7 +251,10 @@ mod tests {
             T,
         );
         assert_eq!(code, 0x0d); // Control -> ControlNew
-        assert_eq!(p, json!({"protocol": 5, "t": 1700000000, "data": {"dps": {"1": true}}}));
+        assert_eq!(
+            p,
+            json!({"protocol": 5, "t": 1700000000, "data": {"dps": {"1": true}}})
+        );
 
         let (code, p) = generate_payload(Version::V3_5, ID, CommandType::DpQuery, None, None, T);
         assert_eq!(code, 0x10); // DpQuery -> DpQueryNew
@@ -270,7 +273,10 @@ mod tests {
             T,
         );
         assert_eq!(code, 0x0d);
-        assert_eq!(p, json!({"devId": ID, "uid": ID, "t": "1700000000", "dps": {"1": null}}));
+        assert_eq!(
+            p,
+            json!({"devId": ID, "uid": ID, "t": "1700000000", "dps": {"1": null}})
+        );
 
         // v3.2 is device22 even with dev_type=Auto
         let (code, _) = generate(

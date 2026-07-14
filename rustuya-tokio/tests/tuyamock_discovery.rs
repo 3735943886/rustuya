@@ -40,13 +40,19 @@ impl Mock {
     fn spawn(version: &str, port: u16, id: &str, dev22: bool) -> Option<Mock> {
         let mut cmd = Command::new(tuyamock_bin());
         cmd.args([
-            "--version", version,
-            "--port", &port.to_string(),
-            "--local-key", KEY,
-            "--dps", r#"{"1":true,"20":"white"}"#,
-            "--gw-id", id,
+            "--version",
+            version,
+            "--port",
+            &port.to_string(),
+            "--local-key",
+            KEY,
+            "--dps",
+            r#"{"1":true,"20":"white"}"#,
+            "--gw-id",
+            id,
             "--discovery",
-            "--discovery-addr", "127.0.0.1",
+            "--discovery-addr",
+            "127.0.0.1",
         ]);
         if dev22 {
             cmd.arg("--dev22");
@@ -95,18 +101,78 @@ async fn discovery_connect_setvalue_matrix() {
     // valid quirk (tuyamock enforces dev22 ∈ {3.2, 3.3, 3.4}, matching tinytuya's
     // recoverable set — it rejects dev22 on 3.1/3.5).
     let scenarios = [
-        Scenario { wire: "3.1", version: Version::V3_1, dev_type: DeviceType::Auto, dev22: false, port: 56740, id: "discov31000000000000aa" },
-        Scenario { wire: "3.2", version: Version::V3_2, dev_type: DeviceType::Auto, dev22: false, port: 56741, id: "discov32000000000000aa" },
-        Scenario { wire: "3.2", version: Version::V3_2, dev_type: DeviceType::Device22, dev22: true, port: 56742, id: "discov32d22000000000aa" },
-        Scenario { wire: "3.3", version: Version::V3_3, dev_type: DeviceType::Auto, dev22: false, port: 56743, id: "discov33000000000000aa" },
-        Scenario { wire: "3.3", version: Version::V3_3, dev_type: DeviceType::Device22, dev22: true, port: 56744, id: "discov33d22000000000aa" },
-        Scenario { wire: "3.4", version: Version::V3_4, dev_type: DeviceType::Auto, dev22: false, port: 56745, id: "discov34000000000000aa" },
-        Scenario { wire: "3.4", version: Version::V3_4, dev_type: DeviceType::Device22, dev22: true, port: 56746, id: "discov34d22000000000aa" },
-        Scenario { wire: "3.5", version: Version::V3_5, dev_type: DeviceType::Auto, dev22: false, port: 56747, id: "discov35000000000000aa" },
+        Scenario {
+            wire: "3.1",
+            version: Version::V3_1,
+            dev_type: DeviceType::Auto,
+            dev22: false,
+            port: 56740,
+            id: "discov31000000000000aa",
+        },
+        Scenario {
+            wire: "3.2",
+            version: Version::V3_2,
+            dev_type: DeviceType::Auto,
+            dev22: false,
+            port: 56741,
+            id: "discov32000000000000aa",
+        },
+        Scenario {
+            wire: "3.2",
+            version: Version::V3_2,
+            dev_type: DeviceType::Device22,
+            dev22: true,
+            port: 56742,
+            id: "discov32d22000000000aa",
+        },
+        Scenario {
+            wire: "3.3",
+            version: Version::V3_3,
+            dev_type: DeviceType::Auto,
+            dev22: false,
+            port: 56743,
+            id: "discov33000000000000aa",
+        },
+        Scenario {
+            wire: "3.3",
+            version: Version::V3_3,
+            dev_type: DeviceType::Device22,
+            dev22: true,
+            port: 56744,
+            id: "discov33d22000000000aa",
+        },
+        Scenario {
+            wire: "3.4",
+            version: Version::V3_4,
+            dev_type: DeviceType::Auto,
+            dev22: false,
+            port: 56745,
+            id: "discov34000000000000aa",
+        },
+        Scenario {
+            wire: "3.4",
+            version: Version::V3_4,
+            dev_type: DeviceType::Device22,
+            dev22: true,
+            port: 56746,
+            id: "discov34d22000000000aa",
+        },
+        Scenario {
+            wire: "3.5",
+            version: Version::V3_5,
+            dev_type: DeviceType::Auto,
+            dev22: false,
+            port: 56747,
+            id: "discov35000000000000aa",
+        },
     ];
 
     for s in &scenarios {
-        let label = if s.dev22 { format!("v{} dev22", s.wire) } else { format!("v{}", s.wire) };
+        let label = if s.dev22 {
+            format!("v{} dev22", s.wire)
+        } else {
+            format!("v{}", s.wire)
+        };
         let mock = match Mock::spawn(s.wire, s.port, s.id, s.dev22) {
             Some(m) => m,
             None => {
@@ -122,7 +188,11 @@ async fn discovery_connect_setvalue_matrix() {
             .find(s.id, Duration::from_secs(15))
             .await
             .unwrap_or_else(|_| panic!("{label}: not discovered within 15s"));
-        assert_eq!(info.version, Some(s.version), "{label}: beacon-reported version");
+        assert_eq!(
+            info.version,
+            Some(s.version),
+            "{label}: beacon-reported version"
+        );
         assert_eq!(info.ip.to_string(), "127.0.0.1", "{label}: beacon ip");
 
         // 2. Addressless connect: resolve IP+version from discovery, then dial.
@@ -138,11 +208,21 @@ async fn discovery_connect_setvalue_matrix() {
             .unwrap_or_else(|e| panic!("{label}: connect failed: {e:?}"));
 
         // 3. status + set_value round-trip against the live device.
-        let dps = dps_of(&dev.status().await.unwrap_or_else(|e| panic!("{label}: status: {e:?}")));
+        let dps = dps_of(
+            &dev.status()
+                .await
+                .unwrap_or_else(|e| panic!("{label}: status: {e:?}")),
+        );
         assert_eq!(dps["1"], true, "{label}: initial dp1 = {dps}");
 
-        dev.set_value("1", false).await.unwrap_or_else(|e| panic!("{label}: set_value: {e:?}"));
-        let dps = dps_of(&dev.status().await.unwrap_or_else(|e| panic!("{label}: status2: {e:?}")));
+        dev.set_value("1", false)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: set_value: {e:?}"));
+        let dps = dps_of(
+            &dev.status()
+                .await
+                .unwrap_or_else(|e| panic!("{label}: status2: {e:?}")),
+        );
         assert_eq!(dps["1"], false, "{label}: dp1 after set_value = {dps}");
 
         dev.close().await;

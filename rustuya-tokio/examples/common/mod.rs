@@ -76,7 +76,11 @@ pub async fn resolve(
             if need {
                 println!("resolving {id} via discovery...");
             }
-            let timeout = if need { Duration::from_secs(8) } else { Duration::from_secs(2) };
+            let timeout = if need {
+                Duration::from_secs(8)
+            } else {
+                Duration::from_secs(2)
+            };
             d.find(id, timeout).await.ok()
         }
         None => None,
@@ -125,7 +129,9 @@ pub async fn connect_resolved(
     }
     let (addr, ver) = resolve(disco.as_ref(), &id, ip, version).await?;
     println!("connecting to {addr} as {ver:?}...");
-    let mut builder = Device::builder(id, key.into_bytes()).address(addr).version(ver);
+    let mut builder = Device::builder(id, key.into_bytes())
+        .address(addr)
+        .version(ver);
     if let Some(d) = &disco {
         builder = builder.rediscover(d);
     }

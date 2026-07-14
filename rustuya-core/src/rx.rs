@@ -15,8 +15,8 @@
 
 use alloc::vec::Vec;
 
-use crate::frame::peek_header;
 use crate::Result;
+use crate::frame::peek_header;
 
 /// Accumulates socket bytes and yields complete frames.
 #[derive(Debug, Default)]
@@ -78,7 +78,7 @@ impl RxBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{pack_55aa, Integrity};
+    use crate::frame::{Integrity, pack_55aa};
 
     fn frame(seqno: u32, body: &[u8]) -> Vec<u8> {
         pack_55aa(seqno, 0x0a, body, Integrity::Crc32)

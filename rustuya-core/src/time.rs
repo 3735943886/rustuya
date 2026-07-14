@@ -109,14 +109,26 @@ mod tests {
         // earlier-in-future clamps to zero, never underflows
         assert_eq!((t0 - t1), Duration::ZERO);
         // overflow clamps instead of panicking
-        assert_eq!(Instant::from_millis(u64::MAX) + Duration::from_millis(5), Instant::from_millis(u64::MAX));
+        assert_eq!(
+            Instant::from_millis(u64::MAX) + Duration::from_millis(5),
+            Instant::from_millis(u64::MAX)
+        );
     }
 
     #[test]
     fn duration_helpers() {
         assert_eq!(Duration::from_secs(1), Duration::from_millis(1000));
-        assert_eq!(Duration::from_millis(10).saturating_mul(3), Duration::from_millis(30));
-        assert_eq!(Duration::from_millis(u64::MAX).saturating_mul(2), Duration::from_millis(u64::MAX));
-        assert_eq!(Duration::from_millis(5).min(Duration::from_millis(9)), Duration::from_millis(5));
+        assert_eq!(
+            Duration::from_millis(10).saturating_mul(3),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            Duration::from_millis(u64::MAX).saturating_mul(2),
+            Duration::from_millis(u64::MAX)
+        );
+        assert_eq!(
+            Duration::from_millis(5).min(Duration::from_millis(9)),
+            Duration::from_millis(5)
+        );
     }
 }

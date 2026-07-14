@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use rustuya_core::crypto::TuyaCipher;
-use rustuya_core::{frame, CommandType};
+use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Discovery, Version};
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
@@ -28,13 +28,23 @@ fn v33_response(json: &[u8]) -> Vec<u8> {
     let cipher = TuyaCipher::new(KEY).unwrap();
     let mut body = 0u32.to_be_bytes().to_vec();
     body.extend_from_slice(&cipher.ecb_encrypt(json).unwrap());
-    frame::pack_55aa(1, CommandType::DpQuery as u32, &body, frame::Integrity::Crc32)
+    frame::pack_55aa(
+        1,
+        CommandType::DpQuery as u32,
+        &body,
+        frame::Integrity::Crc32,
+    )
 }
 
 /// A plaintext 55AA discovery announcement for `ID` at loopback.
 fn announcement() -> Vec<u8> {
     let json = format!(r#"{{"gwId":"{ID}","ip":"127.0.0.1","version":"3.3"}}"#);
-    frame::pack_55aa(0, CommandType::UdpNew as u32, json.as_bytes(), frame::Integrity::Crc32)
+    frame::pack_55aa(
+        0,
+        CommandType::UdpNew as u32,
+        json.as_bytes(),
+        frame::Integrity::Crc32,
+    )
 }
 
 /// Read until the client half-closes — a real sync edge, no wall-clock.
@@ -83,7 +93,11 @@ async fn rediscovery_cancels_backoff_and_reconnects() {
         .port(port)
         .version(Version::V3_3)
         // 1-hour backoff: without a rewake, the device stays down for the test.
-        .backoff(Duration::from_secs(3600), Duration::from_secs(3600), Duration::ZERO)
+        .backoff(
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::ZERO,
+        )
         .rediscover(&disco)
         .connect()
         .unwrap();
@@ -106,10 +120,16 @@ async fn rediscovery_cancels_backoff_and_reconnects() {
     // Inject a LAN re-announcement → forwarder → Input::ConnectNow → redial,
     // long before the 1-hour backoff would ever fire.
     let sender = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-    sender.send_to(&announcement(), ("127.0.0.1", DISCO_PORT)).await.unwrap();
+    sender
+        .send_to(&announcement(), ("127.0.0.1", DISCO_PORT))
+        .await
+        .unwrap();
 
     // The redial reconnects to the mock; a fresh status proves conn2 is live.
-    let s2 = dev.status().await.expect("reconnected via rediscovery, second status round-trips");
+    let s2 = dev
+        .status()
+        .await
+        .expect("reconnected via rediscovery, second status round-trips");
     assert_eq!(s2["dps"]["2"], 99);
 
     dev.close().await;

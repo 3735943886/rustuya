@@ -41,8 +41,8 @@ mod error;
 use std::time::Duration as StdDuration;
 
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt as _};
 
 use rustuya_core::device::{Backoff, Config as CoreConfig};
@@ -221,7 +221,9 @@ impl DeviceBuilder {
     /// Spawn the device actor and return a handle. Fails if `address` is unset or
     /// the local key is not 16 bytes.
     pub fn connect(self) -> Result<Device> {
-        let address = self.address.ok_or(TuyaError::Config("address is required"))?;
+        let address = self
+            .address
+            .ok_or(TuyaError::Config("address is required"))?;
         let local_key: [u8; 16] = self
             .local_key
             .as_slice()
@@ -270,7 +272,13 @@ impl DeviceBuilder {
         };
 
         let bcast_for_actor = bcast_tx.clone();
-        tokio::spawn(actor::run(acfg, cmd_rx, bcast_for_actor, conn_tx, autherr_tx));
+        tokio::spawn(actor::run(
+            acfg,
+            cmd_rx,
+            bcast_for_actor,
+            conn_tx,
+            autherr_tx,
+        ));
 
         Ok(Device {
             id: self.id,
@@ -418,11 +426,7 @@ impl Device {
 
     /// Like [`request`](Self::request) but returns the raw decoded [`Message`]
     /// (seqno / cmd / retcode / payload).
-    pub async fn request_message(
-        &self,
-        cmd: CommandType,
-        data: Option<Value>,
-    ) -> Result<Message> {
+    pub async fn request_message(&self, cmd: CommandType, data: Option<Value>) -> Result<Message> {
         self.send_request(cmd, data, None).await
     }
 
@@ -452,7 +456,12 @@ impl Device {
 
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Cmd::Request { cmd, data, cid, resp: resp_tx })
+            .send(Cmd::Request {
+                cmd,
+                data,
+                cid,
+                resp: resp_tx,
+            })
             .await
             .map_err(|_| TuyaError::Closed)?;
 

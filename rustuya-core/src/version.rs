@@ -201,7 +201,13 @@ mod tests {
 
     #[test]
     fn version_parse_roundtrip_and_aliases() {
-        for v in [Version::V3_1, Version::V3_2, Version::V3_3, Version::V3_4, Version::V3_5] {
+        for v in [
+            Version::V3_1,
+            Version::V3_2,
+            Version::V3_3,
+            Version::V3_4,
+            Version::V3_5,
+        ] {
             assert_eq!(Version::parse(v.as_str()), Some(v));
         }
         assert_eq!(Version::parse(""), Some(Version::Auto));

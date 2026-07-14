@@ -21,12 +21,12 @@
 use std::collections::VecDeque;
 use std::time::Duration as StdDuration;
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::time::{sleep_until, timeout, Instant as TokioInstant};
+use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
 
 use rustuya_core::device::{Config as CoreConfig, Device, Event, Input};
 use rustuya_core::json::Value;
@@ -110,7 +110,11 @@ pub(crate) async fn run(
         want_scan,
     } = acfg;
 
-    let sinks = Sinks { bcast: bcast_tx, conn: conn_tx, autherr: autherr_tx };
+    let sinks = Sinks {
+        bcast: bcast_tx,
+        conn: conn_tx,
+        autherr: autherr_tx,
+    };
     let mut fsm = Device::new(core);
     // A Send CSPRNG (ChaCha), seeded from the OS. One instance for the task's
     // lifetime is fine: its period dwarfs any device's frame count, and pinning
@@ -157,8 +161,9 @@ pub(crate) async fn run(
         }
 
         // (B) One timer at the single next deadline (D2). `None` disables it.
-        let deadline =
-            fsm.poll_timeout().map(|d| base + StdDuration::from_millis(d.as_millis()));
+        let deadline = fsm
+            .poll_timeout()
+            .map(|d| base + StdDuration::from_millis(d.as_millis()));
 
         // (C) Whichever fires first drives the FSM.
         tokio::select! {
@@ -217,7 +222,11 @@ pub(crate) async fn run(
 /// One socket read into `buf`. Split out so the `select!` precondition
 /// (`if stream.is_some()`) gates the `unwrap`.
 async fn read_some(stream: &mut Option<TcpStream>, buf: &mut [u8]) -> std::io::Result<usize> {
-    stream.as_mut().expect("guarded by `if stream.is_some()`").read(buf).await
+    stream
+        .as_mut()
+        .expect("guarded by `if stream.is_some()`")
+        .read(buf)
+        .await
 }
 
 /// Push everything the FSM produced out to the world: bytes to the socket, events

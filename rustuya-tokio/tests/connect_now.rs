@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use rustuya_core::crypto::TuyaCipher;
-use rustuya_core::{frame, CommandType};
+use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Version};
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
@@ -23,7 +23,12 @@ fn v33_response(json: &[u8]) -> Vec<u8> {
     let cipher = TuyaCipher::new(KEY).unwrap();
     let mut body = 0u32.to_be_bytes().to_vec();
     body.extend_from_slice(&cipher.ecb_encrypt(json).unwrap());
-    frame::pack_55aa(1, CommandType::DpQuery as u32, &body, frame::Integrity::Crc32)
+    frame::pack_55aa(
+        1,
+        CommandType::DpQuery as u32,
+        &body,
+        frame::Integrity::Crc32,
+    )
 }
 
 async fn wait_until_closed(sock: &mut tokio::net::TcpStream) {
@@ -79,7 +84,10 @@ async fn connect_now_revives_a_terminal_device() {
     // Explicit revival: cancel the terminal state and redial.
     dev.connect_now().await;
 
-    let s2 = dev.status().await.expect("revived via connect_now, second status");
+    let s2 = dev
+        .status()
+        .await
+        .expect("revived via connect_now, second status");
     assert_eq!(s2["dps"]["2"], 7);
 
     dev.close().await;

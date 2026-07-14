@@ -42,11 +42,16 @@ impl Mock {
     fn spawn(version: &str, port: u16, dps: &str, dev22: bool) -> Option<Mock> {
         let mut cmd = Command::new(tuyamock_bin());
         cmd.args([
-            "--version", version,
-            "--port", &port.to_string(),
-            "--local-key", KEY,
-            "--dps", dps,
-            "--gw-id", ID,
+            "--version",
+            version,
+            "--port",
+            &port.to_string(),
+            "--local-key",
+            KEY,
+            "--dps",
+            dps,
+            "--gw-id",
+            ID,
         ]);
         if dev22 {
             cmd.arg("--dev22");
@@ -80,7 +85,10 @@ macro_rules! skip_if_absent {
         match $mock {
             Some(m) => m,
             None => {
-                eprintln!("skipping {}: tuyamock not found (set RUSTUYA_TUYAMOCK)", $what);
+                eprintln!(
+                    "skipping {}: tuyamock not found (set RUSTUYA_TUYAMOCK)",
+                    $what
+                );
                 return;
             }
         }
@@ -95,15 +103,24 @@ fn connect(version: Version, dev_type: DeviceType, port: u16) -> rustuya_tokio::
         .version(version)
         .dev_type(dev_type)
         // Short backoff: the device retries until the subprocess finishes binding.
-        .backoff(Duration::from_millis(20), Duration::from_millis(200), Duration::ZERO)
+        .backoff(
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        )
         .connect()
         .unwrap()
 }
 
 async fn status_roundtrip(version: Version, wire: &str, port: u16) {
-    let mock = skip_if_absent!(Mock::spawn(wire, port, r#"{"1":true,"20":"white"}"#, false), wire);
+    let mock = skip_if_absent!(
+        Mock::spawn(wire, port, r#"{"1":true,"20":"white"}"#, false),
+        wire
+    );
     let dev = connect(version, DeviceType::Auto, mock.port);
-    dev.wait_connected(Duration::from_secs(5)).await.expect("connects to the mock");
+    dev.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("connects to the mock");
 
     let status = dev.status().await.expect("status round-trips");
     let dps = dps_of(&status);
@@ -140,9 +157,13 @@ async fn set_value_mutates_live_state_v34() {
         "set v3.4"
     );
     let dev = connect(Version::V3_4, DeviceType::Auto, mock.port);
-    dev.wait_connected(Duration::from_secs(5)).await.expect("connects");
+    dev.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("connects");
 
-    dev.set_value("1", false).await.expect("set_value round-trips");
+    dev.set_value("1", false)
+        .await
+        .expect("set_value round-trips");
     // Read it back: the mock applied the mutation to its live dps.
     let dps = dps_of(&dev.status().await.expect("status after set"));
     assert_eq!(dps["1"], false, "set_value flipped dp 1: {dps}");
@@ -159,7 +180,9 @@ async fn device22_status_v33() {
         "device22 v3.3"
     );
     let dev = connect(Version::V3_3, DeviceType::Device22, mock.port);
-    dev.wait_connected(Duration::from_secs(5)).await.expect("connects");
+    dev.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("connects");
 
     let dps = dps_of(&dev.status().await.expect("device22 status"));
     assert_eq!(dps["1"], true, "device22 returns the queried dp: {dps}");

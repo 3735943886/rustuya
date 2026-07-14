@@ -18,8 +18,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
@@ -352,7 +352,11 @@ impl Discovery {
     /// one falls back to plain backoff). A collision is almost always a
     /// misconfiguration, so it is logged.
     pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
-        let prev = self.routes.lock().unwrap().insert(id.clone(), Route { cmd_tx, port });
+        let prev = self
+            .routes
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Route { cmd_tx, port });
         if prev.is_some() {
             log::warn!("discovery: device id {id} re-registered; superseding previous route");
         }
@@ -421,7 +425,8 @@ impl Discovery {
     /// announcement wins).
     pub async fn discover_for(&self, window: StdDuration) -> Vec<DeviceInfo> {
         let mut stream = self.discovered();
-        let mut seen: std::collections::BTreeMap<String, DeviceInfo> = std::collections::BTreeMap::new();
+        let mut seen: std::collections::BTreeMap<String, DeviceInfo> =
+            std::collections::BTreeMap::new();
         let deadline = tokio::time::sleep(window);
         tokio::pin!(deadline);
         loop {
@@ -527,8 +532,9 @@ async fn run(
     settle(&mut fsm, &sinks).await;
 
     loop {
-        let deadline =
-            fsm.poll_timeout().map(|d| base + StdDuration::from_millis(d.as_millis()));
+        let deadline = fsm
+            .poll_timeout()
+            .map(|d| base + StdDuration::from_millis(d.as_millis()));
 
         tokio::select! {
             dgram = dgram_rx.recv() => match dgram {

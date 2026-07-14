@@ -17,11 +17,11 @@
 
 use alloc::vec::Vec;
 
+use crate::Result;
 use crate::crypto::TuyaCipher;
 use crate::frame;
 use crate::payload::{decode_payload, encode_payload};
 use crate::version::{Frame as WireFrame, Integrity as WireIntegrity, Version};
-use crate::Result;
 
 /// A decoded message: identity, optional device return code, and the JSON bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +71,9 @@ pub fn decode_message(
 ) -> Result<Message> {
     let cipher = TuyaCipher::new(key)?;
     let raw = match version.profile().frame {
-        WireFrame::F55AA(WireIntegrity::Crc32) => frame::unpack_55aa(data, frame::Integrity::Crc32)?,
+        WireFrame::F55AA(WireIntegrity::Crc32) => {
+            frame::unpack_55aa(data, frame::Integrity::Crc32)?
+        }
         WireFrame::F55AA(WireIntegrity::Hmac) => {
             frame::unpack_55aa(data, frame::Integrity::Hmac(key))?
         }
@@ -156,7 +158,10 @@ mod tests {
         let cmd = CommandType::Control as u32;
         for v in [Version::V3_4, Version::V3_5] {
             let wire = encode_message(v, cmd, 1, JSON, KEY, &IV).unwrap();
-            assert!(decode_message(v, &wire, b"WRONGKEY00000000", false).is_err(), "{v:?}");
+            assert!(
+                decode_message(v, &wire, b"WRONGKEY00000000", false).is_err(),
+                "{v:?}"
+            );
         }
     }
 }

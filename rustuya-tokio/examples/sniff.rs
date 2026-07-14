@@ -16,7 +16,10 @@ use rustuya_tokio::{Result, TuyaError};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(15);
+    let secs: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
     println!("sniffing ports 6666/6667/7000 for {secs}s (raw hex of each datagram)...");
 
     // One bound socket per port; each read task prints what it gets. socket2 for
@@ -75,13 +78,23 @@ fn bind_recv(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
 
 /// Lowercase hex, space-separated per byte — paste-ready for a test fixture.
 fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Printable ASCII with non-printables shown as `.` (to eyeball the JSON).
 fn to_ascii(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }

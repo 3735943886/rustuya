@@ -15,7 +15,10 @@ use rustuya_tokio::{Discovery, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+    let secs: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let disco = Discovery::new()?;
 
     println!("scanning {secs}s (passive receive + one active probe round)...");

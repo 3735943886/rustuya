@@ -69,7 +69,9 @@ async fn fleet_reconnects_every_device_from_one_announcement_burst() {
     let mut ids = Vec::with_capacity(N);
     for i in 0..N {
         // Real mock at 127.0.0.2:Pᵢ.
-        let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).await.unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(serve_hold(listener));
 
@@ -97,7 +99,10 @@ async fn fleet_reconnects_every_device_from_one_announcement_burst() {
             for (dev, id) in devices.iter().zip(&ids) {
                 if !dev.is_connected() {
                     pending += 1;
-                    sender.send_to(&announcement(id), ("127.0.0.1", DISCO_PORT)).await.unwrap();
+                    sender
+                        .send_to(&announcement(id), ("127.0.0.1", DISCO_PORT))
+                        .await
+                        .unwrap();
                 }
             }
             if pending == 0 {
@@ -109,7 +114,10 @@ async fn fleet_reconnects_every_device_from_one_announcement_burst() {
     .await;
 
     let connected = devices.iter().filter(|d| d.is_connected()).count();
-    assert!(all_up.is_ok(), "only {connected}/{N} devices reconnected before timeout");
+    assert!(
+        all_up.is_ok(),
+        "only {connected}/{N} devices reconnected before timeout"
+    );
     assert_eq!(connected, N, "every device reconnected via its keyed route");
 
     for dev in &devices {

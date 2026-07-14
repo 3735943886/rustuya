@@ -79,7 +79,10 @@ impl Handshake {
         let finish_hmac = mac.finalize().into_bytes().to_vec();
 
         let mut xor = [0u8; 16];
-        for (x, (&l, &r)) in xor.iter_mut().zip(self.local_nonce.iter().zip(remote_nonce)) {
+        for (x, (&l, &r)) in xor
+            .iter_mut()
+            .zip(self.local_nonce.iter().zip(remote_nonce))
+        {
             *x = l ^ r;
         }
 
@@ -121,13 +124,25 @@ mod tests {
     #[test]
     fn verify_accepts_good_and_rejects_bad_and_short() {
         let hs = Handshake::new(LOCAL_NONCE);
-        assert_eq!(hs.verify_response(&good_response(), LOCAL_KEY).unwrap(), REMOTE_NONCE);
+        assert_eq!(
+            hs.verify_response(&good_response(), LOCAL_KEY).unwrap(),
+            REMOTE_NONCE
+        );
 
         let mut bad = good_response();
         *bad.last_mut().unwrap() ^= 0xff;
-        assert_eq!(hs.verify_response(&bad, LOCAL_KEY), Err(CoreError::HmacMismatch));
-        assert_eq!(hs.verify_response(&good_response(), b"wrongkey00000000"), Err(CoreError::HmacMismatch));
-        assert_eq!(hs.verify_response(&[0u8; 40], LOCAL_KEY), Err(CoreError::Truncated));
+        assert_eq!(
+            hs.verify_response(&bad, LOCAL_KEY),
+            Err(CoreError::HmacMismatch)
+        );
+        assert_eq!(
+            hs.verify_response(&good_response(), b"wrongkey00000000"),
+            Err(CoreError::HmacMismatch)
+        );
+        assert_eq!(
+            hs.verify_response(&[0u8; 40], LOCAL_KEY),
+            Err(CoreError::Truncated)
+        );
     }
 
     #[test]
@@ -141,8 +156,12 @@ mod tests {
             assert_eq!(a.session_key, b.session_key, "{v:?} deterministic");
         }
         // v3.4 and v3.5 derive different keys from the same nonces.
-        let k34 = Handshake::new(LOCAL_NONCE).finish(Version::V3_4, &REMOTE_NONCE, LOCAL_KEY).unwrap();
-        let k35 = Handshake::new(LOCAL_NONCE).finish(Version::V3_5, &REMOTE_NONCE, LOCAL_KEY).unwrap();
+        let k34 = Handshake::new(LOCAL_NONCE)
+            .finish(Version::V3_4, &REMOTE_NONCE, LOCAL_KEY)
+            .unwrap();
+        let k35 = Handshake::new(LOCAL_NONCE)
+            .finish(Version::V3_5, &REMOTE_NONCE, LOCAL_KEY)
+            .unwrap();
         assert_ne!(k34.session_key, k35.session_key);
     }
 

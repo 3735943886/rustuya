@@ -10,11 +10,11 @@
 
 extern crate alloc;
 
-mod error;
 pub mod command;
 pub mod crypto;
 pub mod device;
 pub mod discovery;
+mod error;
 pub mod frame;
 pub mod json;
 pub mod message;

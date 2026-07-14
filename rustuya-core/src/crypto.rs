@@ -51,7 +51,8 @@ impl TuyaCipher {
 
         let mut enc = Encryptor::<Aes128>::new((&self.key).into());
         for chunk in buf.chunks_mut(BLOCK) {
-            let block = <&mut Block<Aes128>>::try_from(chunk).map_err(|_| CoreError::EncryptFailed)?;
+            let block =
+                <&mut Block<Aes128>>::try_from(chunk).map_err(|_| CoreError::EncryptFailed)?;
             enc.encrypt_block(block);
         }
         Ok(buf)
@@ -65,7 +66,8 @@ impl TuyaCipher {
         let mut buf = ciphertext.to_vec();
         let mut dec = Decryptor::<Aes128>::new((&self.key).into());
         for chunk in buf.chunks_mut(BLOCK) {
-            let block = <&mut Block<Aes128>>::try_from(chunk).map_err(|_| CoreError::DecryptFailed)?;
+            let block =
+                <&mut Block<Aes128>>::try_from(chunk).map_err(|_| CoreError::DecryptFailed)?;
             dec.decrypt_block(block);
         }
         strip_pkcs7(buf)
@@ -90,7 +92,13 @@ impl TuyaCipher {
     pub fn gcm_encrypt(&self, iv: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let nonce: &Nonce<U12> = iv.into();
         self.gcm
-            .encrypt(nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|_| CoreError::EncryptFailed)
     }
 
@@ -100,7 +108,13 @@ impl TuyaCipher {
     pub fn gcm_decrypt(&self, iv: &[u8; 12], ct_and_tag: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let nonce: &Nonce<U12> = iv.into();
         self.gcm
-            .decrypt(nonce, Payload { msg: ct_and_tag, aad })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct_and_tag,
+                    aad,
+                },
+            )
             .map_err(|_| CoreError::DecryptFailed)
     }
 }
@@ -133,7 +147,12 @@ mod tests {
     #[test]
     fn ecb_round_trips_including_block_boundary() {
         let c = TuyaCipher::new(KEY).unwrap();
-        for msg in [&b""[..], b"hi", b"exactly16bytes!!", b"a longer tuya dps payload"] {
+        for msg in [
+            &b""[..],
+            b"hi",
+            b"exactly16bytes!!",
+            b"a longer tuya dps payload",
+        ] {
             let ct = c.ecb_encrypt(msg).unwrap();
             assert_eq!(ct.len() % BLOCK, 0);
             assert_eq!(c.ecb_decrypt(&ct).unwrap(), msg);

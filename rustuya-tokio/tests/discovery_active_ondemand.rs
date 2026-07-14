@@ -17,14 +17,14 @@
 //! sleep-derived number.
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
-use rustuya_core::{frame, CommandType};
+use rustuya_core::{CommandType, frame};
 use rustuya_tokio::Discovery;
 
 const PROBE_PORT: u16 = 7000; // the v3.5 probe port the "device" listens on
@@ -32,7 +32,12 @@ const DISCO_PORT: u16 = 56674; // where the discovery receives announcements
 
 fn announcement(id: &str, ip: &str) -> Vec<u8> {
     let json = format!(r#"{{"gwId":"{id}","ip":"{ip}","version":"3.3"}}"#);
-    frame::pack_55aa(0, CommandType::UdpNew as u32, json.as_bytes(), frame::Integrity::Crc32)
+    frame::pack_55aa(
+        0,
+        CommandType::UdpNew as u32,
+        json.as_bytes(),
+        frame::Integrity::Crc32,
+    )
 }
 
 /// Bind 0.0.0.0:7000 (limited-broadcast reception) with SO_BROADCAST/REUSEADDR.
@@ -111,7 +116,10 @@ async fn on_demand_active_probe_fires_and_coalesces() {
 
     let n = probes2.load(Ordering::SeqCst);
     assert!(n >= 1, "at least one probe fired");
-    assert!(n <= 10, "50 finds coalesced to {n} probes (not one per call)");
+    assert!(
+        n <= 10,
+        "50 finds coalesced to {n} probes (not one per call)"
+    );
 
     disco2.close().await;
     resp2.abort();

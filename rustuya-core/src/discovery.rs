@@ -25,7 +25,10 @@ use rand_core::RngCore;
 
 use crate::command::CommandType;
 use crate::crypto::TuyaCipher;
-use crate::frame::{pack_55aa, pack_6699, peek_header, unpack_55aa, unpack_6699, Integrity, PREFIX_55AA, PREFIX_6699};
+use crate::frame::{
+    Integrity, PREFIX_55AA, PREFIX_6699, pack_55aa, pack_6699, peek_header, unpack_55aa,
+    unpack_6699,
+};
 use crate::json;
 use crate::time::{Duration, Instant};
 use crate::version::Version;
@@ -59,9 +62,18 @@ struct Probe {
 
 /// The standard Tuya discovery ports and their dialects.
 const DEFAULT_PROBES: &[Probe] = &[
-    Probe { port: 6666, dialect: Dialect::Legacy },
-    Probe { port: 6667, dialect: Dialect::Legacy },
-    Probe { port: 7000, dialect: Dialect::V35 },
+    Probe {
+        port: 6666,
+        dialect: Dialect::Legacy,
+    },
+    Probe {
+        port: 6667,
+        dialect: Dialect::Legacy,
+    },
+    Probe {
+        port: 7000,
+        dialect: Dialect::V35,
+    },
 ];
 
 /// A device that announced itself on the LAN.
@@ -309,7 +321,14 @@ fn build_v35_probe(src: Option<Ipv4Addr>, rng: &mut impl RngCore) -> Option<Vec<
     let payload = alloc::format!(r#"{{"from":"app","ip":"{ip}"}}"#).into_bytes();
     let mut iv = [0u8; 12];
     rng.fill_bytes(&mut iv);
-    pack_6699(0, CommandType::ReqDevInfo as u32, &payload, &UDP_KEY_V35, &iv).ok()
+    pack_6699(
+        0,
+        CommandType::ReqDevInfo as u32,
+        &payload,
+        &UDP_KEY_V35,
+        &iv,
+    )
+    .ok()
 }
 
 /// Decrypt + parse a discovery datagram into a [`DeviceInfo`], or `None` if it
@@ -391,9 +410,20 @@ fn parse_json(body: &[u8]) -> Option<DeviceInfo> {
         .as_str()?
         .to_string();
     let ip = obj.get("ip")?.as_str()?.parse::<IpAddr>().ok()?;
-    let version = obj.get("version").and_then(|v| v.as_str()).and_then(Version::parse);
-    let product_key = obj.get("productKey").and_then(|v| v.as_str()).map(ToString::to_string);
-    Some(DeviceInfo { id, ip, version, product_key })
+    let version = obj
+        .get("version")
+        .and_then(|v| v.as_str())
+        .and_then(Version::parse);
+    let product_key = obj
+        .get("productKey")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    Some(DeviceInfo {
+        id,
+        ip,
+        version,
+        product_key,
+    })
 }
 
 #[cfg(test)]
@@ -408,7 +438,10 @@ mod tests {
     struct SeededRng(u64);
     impl RngCore for SeededRng {
         fn next_u32(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u32
         }
         fn next_u64(&mut self) -> u64 {
@@ -431,7 +464,9 @@ mod tests {
     }
 
     fn json_bytes(id: &str, ip: &str, version: &str) -> Vec<u8> {
-        let s = alloc::format!(r#"{{"gwId":"{id}","ip":"{ip}","version":"{version}","productKey":"pk"}}"#);
+        let s = alloc::format!(
+            r#"{{"gwId":"{id}","ip":"{ip}","version":"{version}","productKey":"pk"}}"#
+        );
         s.into_bytes()
     }
 
@@ -449,7 +484,14 @@ mod tests {
 
     /// A v3.5 6699/GCM discovery packet (port 7000 dialect).
     fn packet_6699(id: &str, ip: &str) -> Vec<u8> {
-        pack_6699(0, 0x25, &json_bytes(id, ip, "3.5"), &UDP_KEY_V35, &[9u8; 12]).unwrap()
+        pack_6699(
+            0,
+            0x25,
+            &json_bytes(id, ip, "3.5"),
+            &UDP_KEY_V35,
+            &[9u8; 12],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -479,7 +521,9 @@ mod tests {
     #[test]
     fn decodes_ecb_with_leading_retcode() {
         let cipher = TuyaCipher::new(UDP_KEY_V33).unwrap();
-        let ct = cipher.ecb_encrypt(&json_bytes("rc", "192.168.0.7", "3.3")).unwrap();
+        let ct = cipher
+            .ecb_encrypt(&json_bytes("rc", "192.168.0.7", "3.3"))
+            .unwrap();
         // body = retcode(4) ++ ECB(json), exactly the on-wire shape.
         let mut body = vec![0u8, 0, 0, 0];
         body.extend_from_slice(&ct);
@@ -507,13 +551,27 @@ mod tests {
         let pkt = packet_6699("dev1", "192.168.0.42");
         let now = Instant::from_millis(0);
 
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, now, &mut rng);
+        d.handle_input(
+            Input::Datagram {
+                data: &pkt,
+                from: IP,
+            },
+            now,
+            &mut rng,
+        );
         assert!(matches!(d.poll_event(), Some(Event::Found(i)) if i.id == "dev1"));
         assert_eq!(d.cached(), 1);
 
         // Same device, unchanged: not a second Found, but a Seen liveness tick
         // (the driver routes it to wake a disconnected device — ①).
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, now + Duration::from_secs(1), &mut rng);
+        d.handle_input(
+            Input::Datagram {
+                data: &pkt,
+                from: IP,
+            },
+            now + Duration::from_secs(1),
+            &mut rng,
+        );
         assert!(matches!(d.poll_event(), Some(Event::Seen(id)) if id == "dev1"));
         assert!(d.poll_event().is_none());
     }
@@ -523,15 +581,27 @@ mod tests {
         let mut d = disco();
         let mut rng = SeededRng(1);
         let now = Instant::from_millis(0);
-        d.handle_input(Input::Datagram { data: &packet_6699("dev1", "192.168.0.10"), from: IP }, now, &mut rng);
+        d.handle_input(
+            Input::Datagram {
+                data: &packet_6699("dev1", "192.168.0.10"),
+                from: IP,
+            },
+            now,
+            &mut rng,
+        );
         let _ = d.poll_event();
         // Same id, different ip → a fresh Found.
         d.handle_input(
-            Input::Datagram { data: &packet_6699("dev1", "192.168.0.11"), from: IP },
+            Input::Datagram {
+                data: &packet_6699("dev1", "192.168.0.11"),
+                from: IP,
+            },
             now + Duration::from_secs(1),
             &mut rng,
         );
-        assert!(matches!(d.poll_event(), Some(Event::Found(i)) if i.ip == "192.168.0.11".parse::<IpAddr>().unwrap()));
+        assert!(
+            matches!(d.poll_event(), Some(Event::Found(i)) if i.ip == "192.168.0.11".parse::<IpAddr>().unwrap())
+        );
     }
 
     #[test]
@@ -539,11 +609,25 @@ mod tests {
         let mut d = disco();
         let mut rng = SeededRng(1);
         let pkt = packet_6699("dev1", "192.168.0.42");
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, Instant::from_millis(0), &mut rng);
+        d.handle_input(
+            Input::Datagram {
+                data: &pkt,
+                from: IP,
+            },
+            Instant::from_millis(0),
+            &mut rng,
+        );
         let _ = d.poll_event();
         // Past the TTL: the entry is evicted, so the same packet is "new" again.
         let later = Instant::from_millis(0) + TTL + Duration::from_secs(1);
-        d.handle_input(Input::Datagram { data: &pkt, from: IP }, later, &mut rng);
+        d.handle_input(
+            Input::Datagram {
+                data: &pkt,
+                from: IP,
+            },
+            later,
+            &mut rng,
+        );
         assert!(matches!(d.poll_event(), Some(Event::Found(_))));
     }
 
@@ -552,8 +636,22 @@ mod tests {
         let mut d = disco();
         let mut rng = SeededRng(1);
         let now = Instant::from_millis(0);
-        d.handle_input(Input::Datagram { data: &[0, 1, 2, 3], from: IP }, now, &mut rng);
-        d.handle_input(Input::Datagram { data: &[0xff; 40], from: IP }, now, &mut rng);
+        d.handle_input(
+            Input::Datagram {
+                data: &[0, 1, 2, 3],
+                from: IP,
+            },
+            now,
+            &mut rng,
+        );
+        d.handle_input(
+            Input::Datagram {
+                data: &[0xff; 40],
+                from: IP,
+            },
+            now,
+            &mut rng,
+        );
         assert!(d.poll_event().is_none());
         assert_eq!(d.cached(), 0);
     }
@@ -592,9 +690,16 @@ mod tests {
         while let Some((bytes, port, _)) = d.poll_transmit() {
             if port == 7000 {
                 let f = unpack_6699(&bytes, &UDP_KEY_V35).unwrap();
-                assert!(looks_like_json(&f.body), "v3.5 probe carries JSON: {:?}", f.body);
+                assert!(
+                    looks_like_json(&f.body),
+                    "v3.5 probe carries JSON: {:?}",
+                    f.body
+                );
             } else {
-                assert!(unpack_55aa(&bytes, Integrity::Crc32).is_ok(), "legacy probe is 55AA/CRC");
+                assert!(
+                    unpack_55aa(&bytes, Integrity::Crc32).is_ok(),
+                    "legacy probe is 55AA/CRC"
+                );
             }
         }
     }
@@ -622,7 +727,9 @@ mod tests {
                 let body = unpack_6699(&bytes, &UDP_KEY_V35).unwrap().body;
                 let ip = source.expect("v3.5 probe tagged with its source");
                 assert!(
-                    core::str::from_utf8(&body).unwrap().contains(&ip.to_string()),
+                    core::str::from_utf8(&body)
+                        .unwrap()
+                        .contains(&ip.to_string()),
                     "probe payload carries its source ip"
                 );
                 v35_sources.push(ip);
@@ -632,7 +739,10 @@ mod tests {
             }
         }
         v35_sources.sort();
-        assert_eq!(v35_sources, vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 1, 1)]);
+        assert_eq!(
+            v35_sources,
+            vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 1, 1)]
+        );
         assert_eq!(legacy, 2, "6666 + 6667 legacy probes");
     }
 

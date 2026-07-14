@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use rustuya_core::crypto::TuyaCipher;
-use rustuya_core::{frame, CommandType};
+use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Discovery};
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
@@ -20,7 +20,12 @@ const DPORT: u16 = 56670;
 /// version — the shape `discover()` resolves address + version from.
 fn announcement(id: &str, ip: &str) -> Vec<u8> {
     let json = format!(r#"{{"gwId":"{id}","ip":"{ip}","version":"3.3"}}"#);
-    frame::pack_55aa(0, CommandType::UdpNew as u32, json.as_bytes(), frame::Integrity::Crc32)
+    frame::pack_55aa(
+        0,
+        CommandType::UdpNew as u32,
+        json.as_bytes(),
+        frame::Integrity::Crc32,
+    )
 }
 
 /// A realistic v3.3 device response (retcode || ECB(json)).
@@ -29,7 +34,12 @@ fn v33_response(json: &[u8]) -> Vec<u8> {
     let ct = cipher.ecb_encrypt(json).unwrap();
     let mut body = 0u32.to_be_bytes().to_vec();
     body.extend_from_slice(&ct);
-    frame::pack_55aa(1, CommandType::DpQuery as u32, &body, frame::Integrity::Crc32)
+    frame::pack_55aa(
+        1,
+        CommandType::DpQuery as u32,
+        &body,
+        frame::Integrity::Crc32,
+    )
 }
 
 /// Hold the mock connection open until the driver closes it (deterministic edge,

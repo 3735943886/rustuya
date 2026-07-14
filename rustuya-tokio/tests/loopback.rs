@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use rustuya_core::crypto::TuyaCipher;
-use rustuya_core::{frame, CommandType};
+use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, TuyaError, Version};
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
@@ -90,7 +90,10 @@ async fn set_value_encodes_a_control_and_reads_the_ack() {
         .connect()
         .unwrap();
 
-    let resp = dev.set_value(1, false).await.expect("set_value round-trips");
+    let resp = dev
+        .set_value(1, false)
+        .await
+        .expect("set_value round-trips");
     assert_eq!(resp["dps"]["1"], false);
 
     dev.close().await;
@@ -126,7 +129,12 @@ async fn serve_v34_handshake(listener: TcpListener) {
     let cipher = TuyaCipher::new(KEY).unwrap();
     let mut body = 0u32.to_be_bytes().to_vec(); // retcode 0
     body.extend_from_slice(&cipher.ecb_encrypt(&reply).unwrap());
-    let wire = frame::pack_55aa(1, CommandType::SessKeyNegResp as u32, &body, frame::Integrity::Hmac(KEY));
+    let wire = frame::pack_55aa(
+        1,
+        CommandType::SessKeyNegResp as u32,
+        &body,
+        frame::Integrity::Hmac(KEY),
+    );
     sock.write_all(&wire).await.unwrap();
 
     // 3. Absorb the SessKeyNegFinish so the driver's write completes; the driver
@@ -207,7 +215,10 @@ async fn sub_device_request_carries_the_cid_over_the_wire() {
         let n = sock.read(&mut buf).await.unwrap();
         let req = decode_message(Version::V3_3, &buf[..n], KEY, false).unwrap();
         let env: serde_json::Value = serde_json::from_slice(&req.payload).unwrap();
-        assert_eq!(env["cid"], "subchannel01", "request envelope carries the cid");
+        assert_eq!(
+            env["cid"], "subchannel01",
+            "request envelope carries the cid"
+        );
 
         let reply = v33_response(CommandType::DpQuery, br#"{"dps":{"9":true}}"#);
         sock.write_all(&reply).await.unwrap();
@@ -230,7 +241,9 @@ async fn sub_device_request_carries_the_cid_over_the_wire() {
 
 #[tokio::test]
 async fn connect_requires_an_address() {
-    let err = Device::builder(ID, *KEY).connect().expect_err("no address → error");
+    let err = Device::builder(ID, *KEY)
+        .connect()
+        .expect_err("no address → error");
     assert!(matches!(err, TuyaError::Config(_)));
 }
 

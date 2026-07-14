@@ -43,11 +43,16 @@ impl Mock {
     fn spawn(version: &str, port: u16, extra: &[&str]) -> Option<Mock> {
         let mut cmd = Command::new(tuyamock_bin());
         cmd.args([
-            "--version", version,
-            "--port", &port.to_string(),
-            "--local-key", KEY,
-            "--dps", DPS,
-            "--gw-id", ID,
+            "--version",
+            version,
+            "--port",
+            &port.to_string(),
+            "--local-key",
+            KEY,
+            "--dps",
+            DPS,
+            "--gw-id",
+            ID,
         ]);
         cmd.args(extra);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -67,7 +72,10 @@ macro_rules! skip_if_absent {
         match $mock {
             Some(m) => m,
             None => {
-                eprintln!("skipping {}: tuyamock not found (set RUSTUYA_TUYAMOCK)", $what);
+                eprintln!(
+                    "skipping {}: tuyamock not found (set RUSTUYA_TUYAMOCK)",
+                    $what
+                );
                 return;
             }
         }
@@ -86,7 +94,10 @@ fn dps_of(v: &Value) -> Value {
 /// Polls a real connect — deterministic readiness, not a fixed sleep.
 async fn wait_ready(port: u16) {
     for _ in 0..200 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -100,18 +111,27 @@ fn builder(version: Version, port: u16) -> DeviceBuilder {
         .port(port)
         .version(version)
         // Short backoff: retry until the subprocess binds / recovers.
-        .backoff(Duration::from_millis(20), Duration::from_millis(200), Duration::ZERO)
+        .backoff(
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        )
 }
 
 #[tokio::test]
 async fn slow_device_responds_within_timeout() {
     // A 1s-per-response device must still round-trip under a 5s request timeout.
-    let mock = skip_if_absent!(Mock::spawn("3.3", 56760, &["--response-delay", "1"]), "slow device");
+    let mock = skip_if_absent!(
+        Mock::spawn("3.3", 56760, &["--response-delay", "1"]),
+        "slow device"
+    );
     let dev = builder(Version::V3_3, 56760)
         .request_timeout(Duration::from_secs(5))
         .connect()
         .unwrap();
-    dev.wait_connected(Duration::from_secs(5)).await.expect("connects");
+    dev.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("connects");
     let dps = dps_of(&dev.status().await.expect("slow status still completes"));
     assert_eq!(dps["1"], true, "slow device dps: {dps}");
     let _ = mock;
@@ -123,7 +143,10 @@ async fn heartbeat_survives_device_idle_drop() {
     // The device drops any link idle for 2s; our sub-2s heartbeat must keep it
     // open. auto_reconnect(false) makes survival unambiguous: if the keepalive
     // failed, the drop would be terminal and is_connected would go false.
-    let mock = skip_if_absent!(Mock::spawn("3.3", 56761, &["--idle-timeout", "2"]), "idle drop");
+    let mock = skip_if_absent!(
+        Mock::spawn("3.3", 56761, &["--idle-timeout", "2"]),
+        "idle drop"
+    );
     // auto_reconnect(false) makes survival unambiguous (a drop would be terminal),
     // but then the first dial must land — so wait for the mock to bind first.
     wait_ready(56761).await;
@@ -133,7 +156,9 @@ async fn heartbeat_survives_device_idle_drop() {
         .auto_reconnect(false)
         .connect()
         .unwrap();
-    dev.wait_connected(Duration::from_secs(5)).await.expect("connects");
+    dev.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("connects");
 
     // Past the device's 2s idle window: only a working keepalive holds it open.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -160,8 +185,13 @@ async fn recovers_after_device_goes_dark() {
         .request_timeout(Duration::from_secs(3))
         .connect()
         .unwrap();
-    dev.wait_connected(Duration::from_secs(5)).await.expect("connects");
-    assert_eq!(dps_of(&dev.status().await.expect("first status ok"))["1"], true);
+    dev.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("connects");
+    assert_eq!(
+        dps_of(&dev.status().await.expect("first status ok"))["1"],
+        true
+    );
 
     // The connection is now dark. Retry until a request succeeds again — that only
     // happens after idle-liveness tears the dead link down and a fresh connection
@@ -173,7 +203,10 @@ async fn recovers_after_device_goes_dark() {
             break;
         }
     }
-    assert!(recovered, "recovered via reconnect after the device went dark");
+    assert!(
+        recovered,
+        "recovered via reconnect after the device went dark"
+    );
     let _ = mock;
     dev.close().await;
 }
@@ -215,7 +248,9 @@ async fn misbehaving_seqno_does_not_break_correlation() {
             format!("seqno {mode}")
         );
         let dev = builder(Version::V3_4, port).connect().unwrap();
-        dev.wait_connected(Duration::from_secs(5)).await.expect("connects");
+        dev.wait_connected(Duration::from_secs(5))
+            .await
+            .expect("connects");
 
         assert_eq!(
             dps_of(&dev.status().await.expect("status"))["1"],

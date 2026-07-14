@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use rustuya_core::crypto::TuyaCipher;
-use rustuya_core::{frame, CommandType};
+use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Discovery, Version};
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
@@ -31,13 +31,23 @@ fn v33_response(json: &[u8]) -> Vec<u8> {
     let cipher = TuyaCipher::new(KEY).unwrap();
     let mut body = 0u32.to_be_bytes().to_vec();
     body.extend_from_slice(&cipher.ecb_encrypt(json).unwrap());
-    frame::pack_55aa(1, CommandType::DpQuery as u32, &body, frame::Integrity::Crc32)
+    frame::pack_55aa(
+        1,
+        CommandType::DpQuery as u32,
+        &body,
+        frame::Integrity::Crc32,
+    )
 }
 
 /// A plaintext 55AA discovery announcement placing `ID` at `ip`.
 fn announcement(ip: &str) -> Vec<u8> {
     let json = format!(r#"{{"gwId":"{ID}","ip":"{ip}","version":"3.3"}}"#);
-    frame::pack_55aa(0, CommandType::UdpNew as u32, json.as_bytes(), frame::Integrity::Crc32)
+    frame::pack_55aa(
+        0,
+        CommandType::UdpNew as u32,
+        json.as_bytes(),
+        frame::Integrity::Crc32,
+    )
 }
 
 /// Read until the client half-closes — a real sync edge, no wall-clock.
@@ -65,7 +75,9 @@ async fn serve_one(listener: &TcpListener, reply_json: &[u8], hold: bool) {
 #[tokio::test]
 async fn rediscovery_with_changed_ip_redials_the_new_address() {
     // conn1 at 127.0.0.1:P; conn2 at 127.0.0.2:P (same port, different loopback IP).
-    let l1 = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), 0)).await.unwrap();
+    let l1 = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), 0))
+        .await
+        .unwrap();
     let port = l1.local_addr().unwrap().port();
     let l2 = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), port))
         .await
@@ -90,7 +102,11 @@ async fn rediscovery_with_changed_ip_redials_the_new_address() {
         .port(port)
         .version(Version::V3_3)
         // 1-hour backoff: without a rewake the device stays down for the test.
-        .backoff(Duration::from_secs(3600), Duration::from_secs(3600), Duration::ZERO)
+        .backoff(
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::ZERO,
+        )
         .rediscover(&disco)
         .connect()
         .unwrap();
@@ -110,9 +126,14 @@ async fn rediscovery_with_changed_ip_redials_the_new_address() {
     .expect("device observes the conn1 drop");
 
     // Announce the device at its NEW IP. The rewake must redial 127.0.0.2:P.
-    let sender = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 1), 0)).await.unwrap();
+    let sender = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 1), 0))
+        .await
+        .unwrap();
     sender
-        .send_to(&announcement("127.0.0.2"), (Ipv4Addr::new(127, 0, 0, 1), DISCO_PORT))
+        .send_to(
+            &announcement("127.0.0.2"),
+            (Ipv4Addr::new(127, 0, 0, 1), DISCO_PORT),
+        )
         .await
         .unwrap();
 
@@ -124,7 +145,10 @@ async fn rediscovery_with_changed_ip_redials_the_new_address() {
     assert_eq!(s2["dps"]["2"], 42);
 
     // The linked discovery now records the device (exposed staleness fact).
-    assert!(disco.last_seen(ID).is_some(), "known map recorded a last-seen stamp");
+    assert!(
+        disco.last_seen(ID).is_some(),
+        "known map recorded a last-seen stamp"
+    );
 
     dev.close().await;
     disco.close().await;
