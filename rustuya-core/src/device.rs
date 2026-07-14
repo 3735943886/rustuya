@@ -79,8 +79,13 @@ pub struct Config {
     pub auto_reconnect: bool,
     /// Backoff curve used when `auto_reconnect` is set.
     pub backoff: Backoff,
-    /// If set, emit a `HeartBeat` frame every interval while connected
-    /// (keepalive). `None` disables keepalive.
+    /// If set, this is the **max silence** allowed on the outbound direction: a
+    /// `HeartBeat` keepalive is emitted once this long passes with no frame sent to
+    /// the device. It is an *inactivity bound*, not a fixed beat — any real command
+    /// (`on_send`) defers the next heartbeat a full interval, since that traffic
+    /// already resets the device's client-idle timer (0.3 tracked `last_sent`).
+    /// `None` disables keepalive. Must stay comfortably below the device's own
+    /// idle-drop (~30 s on typical firmware) or the device closes the connection.
     pub heartbeat: Option<Duration>,
     /// If set, a connection with no inbound frame for this long is declared dead
     /// and disconnected — this is what makes a *silent* peer drop surface
@@ -205,7 +210,7 @@ impl Device {
             Input::Connected => self.on_connected(now, rng),
             Input::ConnectFailed => self.on_connect_failed(now, rng),
             Input::Received(data) => self.on_received(data, now, rng),
-            Input::Send { cmd, data, cid, t } => self.on_send(cmd, data, cid, t, rng),
+            Input::Send { cmd, data, cid, t } => self.on_send(cmd, data, cid, t, now, rng),
             Input::ConnectNow => self.on_connect_now(),
             Input::Closed => self.on_closed(now, rng),
         }
@@ -426,6 +431,7 @@ impl Device {
         data: Option<Value>,
         cid: Option<&str>,
         t: u64,
+        now: Instant,
         rng: &mut impl RngCore,
     ) {
         if self.state != State::Connected {
@@ -444,7 +450,17 @@ impl Device {
         let plaintext = json::to_bytes(&value);
         let key = self.active_key().to_vec();
         match self.encode(code, &plaintext, &key, rng) {
-            Ok(bytes) => self.tx.push_back(bytes),
+            Ok(bytes) => {
+                self.tx.push_back(bytes);
+                // Outbound traffic keeps the device's client-idle timer alive just
+                // like a heartbeat would, so defer the next keepalive by a full
+                // interval (0.3 tracked `last_sent`; the heartbeat is an
+                // inactivity bound, not a fixed beat). Nothing to do if heartbeats
+                // are disabled.
+                if let Some(iv) = self.cfg.heartbeat {
+                    self.next_heartbeat = Some(now.saturating_add(iv));
+                }
+            }
             Err(e) => self.events.push_back(Event::ProtocolError(e)),
         }
     }
@@ -998,6 +1014,36 @@ mod tests {
         assert_eq!(msg.cmd, CommandType::HeartBeat as u32);
         assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(20_000)));
         assert!(dev.is_connected(), "heartbeat keeps the connection");
+    }
+
+    #[test]
+    fn sending_defers_the_heartbeat() {
+        // Outbound traffic keeps the device's client-idle timer alive, so a real
+        // command should push the next keepalive out a full interval — the
+        // heartbeat is an inactivity bound, not a fixed beat (mirrors 0.3's
+        // `last_sent` tracking).
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg_live(Some(Duration::from_secs(10)), None), &mut rng);
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(10_000)));
+
+        // A command goes out at t=6s → keepalive defers to 6+10 = 16s.
+        dev.handle_input(
+            Input::Send { cmd: CommandType::DpQuery, data: None, cid: None, t: 1 },
+            Instant::from_millis(6_000),
+            &mut rng,
+        );
+        let _ = dev.poll_transmit(); // the DpQuery frame itself
+        assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(16_000)), "send deferred the heartbeat");
+
+        // The superseded 10s deadline fires nothing.
+        dev.handle_timeout(Instant::from_millis(10_000), &mut rng);
+        assert!(dev.poll_transmit().is_none(), "no heartbeat at the deferred-away 10s deadline");
+
+        // At 16s the heartbeat finally goes out.
+        dev.handle_timeout(Instant::from_millis(16_000), &mut rng);
+        let wire = dev.poll_transmit().expect("heartbeat at the deferred deadline");
+        let msg = decode_message(Version::V3_3, &wire, &KEY, false).unwrap();
+        assert_eq!(msg.cmd, CommandType::HeartBeat as u32);
     }
 
     #[test]

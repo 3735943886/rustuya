@@ -109,6 +109,11 @@ impl DeviceBuilder {
             backoff_base: StdDuration::from_secs(1),
             backoff_max: StdDuration::from_secs(60),
             backoff_jitter: StdDuration::from_secs(1),
+            // Keepalive as a max-outbound-silence bound (deferred by any real
+            // command — see the core `Config::heartbeat`). 10 s ≈ one third of the
+            // ~30 s idle-drop typical firmware enforces, so up to three keepalives
+            // cover the window before the device would close us; tune via
+            // `heartbeat()`.
             heartbeat: Some(StdDuration::from_secs(10)),
             idle_timeout: Some(StdDuration::from_secs(30)),
             handshake_timeout: Some(StdDuration::from_secs(5)),
