@@ -470,6 +470,19 @@ impl Device {
         self.fire(cmd, data, None).await
     }
 
+    /// Ask a **gateway** to report its sub-devices' online status (the Tuya
+    /// `subdev_online_stat_query`). Fire-and-forget like every other command: the
+    /// gateway's reply — the sub-device list — arrives on [`listener`](Self::listener)
+    /// as a `LanExtStream` frame, not as a return value. Address each reported channel
+    /// id with [`sub`](Self::sub).
+    pub async fn sub_discover(&self) -> Result<()> {
+        self.send(
+            CommandType::LanExtStream,
+            Some(serde_json::json!({ "reqType": "subdev_online_stat_query", "cids": [] })),
+        )
+        .await
+    }
+
     /// Address a gateway **sub-device** by its channel id (`cid`). The returned
     /// handle routes its `query`/`set_*`/`send` through this device but stamps
     /// the sub-device into the command envelope.

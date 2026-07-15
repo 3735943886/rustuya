@@ -252,6 +252,42 @@ async fn sub_device_request_carries_the_cid_over_the_wire() {
 }
 
 #[tokio::test]
+async fn sub_discover_sends_the_gateway_query_envelope() {
+    use rustuya_core::message::decode_message;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // The gateway side: decode the fired command and assert the LanExtStream
+    // envelope went out correctly — `reqType` hoisted to the top, the rest nested
+    // under `data` (proves the fire-and-forget sub_discover builds the right frame).
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap();
+        let req = decode_message(Version::V3_3, &buf[..n], KEY, false).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&req.payload).unwrap();
+        assert_eq!(env["reqType"], "subdev_online_stat_query");
+        assert_eq!(env["data"]["cids"], serde_json::json!([]));
+        wait_until_closed(&mut sock).await;
+    });
+
+    let dev = Device::builder(ID, *KEY)
+        .address("127.0.0.1")
+        .port(port)
+        .version(Version::V3_3)
+        .connect()
+        .unwrap();
+    dev.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("connects");
+    dev.sub_discover().await.expect("sub_discover fires");
+
+    dev.close().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn connect_requires_an_address() {
     let err = Device::builder(ID, *KEY)
         .connect()

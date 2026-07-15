@@ -10,6 +10,10 @@ The `0.4` sans-io line (branch `0.4-sansio`); unreleased.
 
 ### Added
 
+- **`Device::sub_discover()`** — ask a gateway to report its sub-devices' online
+  status (`subdev_online_stat_query`). Fire-and-forget like every command; the
+  sub-device list arrives on `listener()` as a `LanExtStream` frame. Restores 0.3's
+  gateway sub-device enumeration, minus the response-correlation machinery.
 - **`Device::watch_status()`** — a `watch` of the device's current status frame (last
   non-empty frame), kept as *state* separate from the event stream. A consumer that
   only wants the latest value reads it without ever lagging behind a lossy bus.
