@@ -33,7 +33,7 @@ stops at the local protocol layer those build on.
 ## Quick start (tokio)
 
 ```rust
-use rustuya_tokio::{Device, Version};
+use rustuya_tokio::{Device, Event, Version};
 
 #[tokio::main]
 async fn main() -> rustuya_tokio::Result<()> {
@@ -42,22 +42,29 @@ async fn main() -> rustuya_tokio::Result<()> {
         .version(Version::V3_4)
         .connect()?;
 
-    let state = dev.status().await?;   // query data points
-    println!("{state}");
-    dev.set_value(1, true).await?;     // flip DP 1
-
-    // A lossless stream of device pushes (state changes) and responses.
+    // The event stream of device pushes (state changes) and query replies.
+    // Subscribe *before* firing so the reply can't race your subscription.
     let mut events = dev.listener();
-    let push = events.recv().await?;
-    println!("push: {push:?}");
+
+    dev.query().await?;                // fire a status query (fire-and-forget)
+    dev.set_value(1, true).await?;     // flip DP 1 (fire-and-forget)
+
+    // Frames arrive here; a slow-consumer gap is Event::Lagged, never a silent drop.
+    if let Some(Event::Frame(reply)) = events.recv().await {
+        println!("{reply:?}");
+    }
     Ok(())
 }
 ```
 
 The connection is managed for you: a dropped link reconnects with jittered backoff,
 a keepalive heartbeat holds it open, and idle-liveness surfaces a silently-dead
-peer promptly. Requests are correlated FIFO — the Tuya LAN protocol carries no
-request/response token — so for asynchronous device pushes prefer `listener()`.
+peer promptly. Commands are **fire-and-forget** — the Tuya LAN protocol carries no
+request/response token, so a device's status frames and unsolicited pushes are
+indistinguishable and arrive asynchronously. Read them by audience: `listener()` for
+the full event stream (a slow-consumer gap is an observable `Event::Lagged`, not a
+silent drop), `watch_status()` if you only want the current value and never want to
+lag, or a `MultiListener` to fan many devices onto one id-tagged loop.
 
 ## Discovery
 
@@ -101,8 +108,9 @@ changed IP self-corrects.
 Runnable against a real device (or the `tuyamock` emulator), in `rustuya-tokio`:
 
 ```bash
-cargo run --example control -- <id> <key>          # read status / set a DP
-cargo run --example monitor -- <id> <key>          # watch state + reconnect
+cargo run --example control -- <id> <key>          # query / set a DP
+cargo run --example monitor -- <id> <key>          # watch one device + reconnect
+cargo run --example fleet   -- <id:key> <id:key>   # watch many on one MultiListener
 cargo run --example scan                            # list devices on the LAN
 cargo run --example find    -- <id>                 # resolve one device by probe
 cargo run --example sniff                           # raw discovery hex dump

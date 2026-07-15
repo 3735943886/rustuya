@@ -19,6 +19,8 @@ use rustuya_core::crypto::TuyaCipher;
 use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Discovery, Version};
 
+mod common;
+
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "rediscover0000000001ab";
 const DISCO_PORT: u16 = 56670;
@@ -103,7 +105,7 @@ async fn rediscovery_cancels_backoff_and_reconnects() {
         .unwrap();
 
     // conn1 up and usable.
-    let s1 = dev.status().await.expect("first status round-trips");
+    let s1 = common::query_dps(&dev).await;
     assert_eq!(s1["dps"]["1"], true);
 
     // The mock dropped conn1: wait until the device actually observes the drop and
@@ -125,11 +127,8 @@ async fn rediscovery_cancels_backoff_and_reconnects() {
         .await
         .unwrap();
 
-    // The redial reconnects to the mock; a fresh status proves conn2 is live.
-    let s2 = dev
-        .status()
-        .await
-        .expect("reconnected via rediscovery, second status round-trips");
+    // The redial reconnects to the mock; a fresh query proves conn2 is live.
+    let s2 = common::query_dps(&dev).await;
     assert_eq!(s2["dps"]["2"], 99);
 
     dev.close().await;

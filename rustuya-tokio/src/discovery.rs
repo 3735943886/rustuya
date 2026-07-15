@@ -147,6 +147,9 @@ impl Default for DiscoveryBuilder {
             broadcast_burst: Some(1),
             active: true,
             local_ips: Vec::new(), // auto-detect one at build
+            // Found-device broadcast ring depth. Preallocated, but only *once* per
+            // `Discovery` (shared app-wide, not per device), so a round default is
+            // fine; tunable via `capacity()`.
             capacity: 256,
         }
     }
@@ -193,6 +196,18 @@ impl DiscoveryBuilder {
     pub fn probe_cadence(mut self, interval: StdDuration, burst: Option<u32>) -> Self {
         self.broadcast_interval = interval;
         self.broadcast_burst = burst;
+        self
+    }
+
+    /// Depth of the found-device broadcast bus (default 256) — how far a consumer of
+    /// [`found`](Discovery::found) / [`scan`](Discovery::scan) may fall behind before
+    /// it loses the oldest sightings (a `Lagged` skip). A `tokio::broadcast` ring
+    /// preallocated once per `Discovery` (shared app-wide, not per device), so the
+    /// cost is one-time; raise it if you enumerate very large fleets through a slow
+    /// consumer.
+    #[must_use]
+    pub fn capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
         self
     }
 
@@ -257,6 +272,8 @@ impl DiscoveryBuilder {
         };
 
         let (found_tx, _) = broadcast::channel(self.capacity);
+        // Depth 8: a small backlog of control ops (subscribe/scan/close) — these are
+        // rare and the actor services them promptly, so a shallow queue suffices.
         let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
         // Depth 1: a single pending "please probe" is all the coalescing needs —
         // extra requests while one is queued are redundant (try_send drops them).
@@ -501,14 +518,20 @@ async fn run(
     let mut rng = StdRng::from_os_rng();
     let base = TokioInstant::now();
 
-    // One reader task per socket → a single datagram channel.
+    // One reader task per socket → a single datagram channel. Depth 256 bounds the
+    // inbound-announce backlog before a reader backpressures (a whole fleet
+    // announcing at once); the actor drains it promptly, so it rarely fills.
     let (dgram_tx, mut dgram_rx) = mpsc::channel::<(Vec<u8>, std::net::IpAddr)>(256);
     let mut readers: Vec<JoinHandle<()>> = Vec::new();
     for sock in recv_socks {
         let sock = Arc::new(sock);
         let tx = dgram_tx.clone();
         readers.push(tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
+            // UDP has no reassembly: one datagram, one recv, and `recv_from`
+            // silently truncates anything past the buffer. Announce datagrams run a
+            // few hundred bytes; 8 KiB is generous headroom so an oversized one is
+            // never clipped into a decode failure — i.e. a silently-missed device.
+            let mut buf = vec![0u8; 8192];
             loop {
                 match sock.recv_from(&mut buf).await {
                     Ok((n, from)) => {

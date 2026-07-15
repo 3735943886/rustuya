@@ -152,8 +152,11 @@ timer / command, call the matching `handle_*`; drain `poll_transmit()` and
   (`rustuya-tokio`, from scratch; the legacy root crate is dropped). Loop:
   `wants_connect → dial`, `select!{cmd, socket, one poll_timeout timer}`, drain
   `poll_transmit`/`poll_event`. Injects only I/O (Send `StdRng`, `tokio::Instant`
-  clock, TCP). Surface: `DeviceBuilder → Device` (`status`/`set_dps`/`set_value`/
-  `request`), sub-devices `Device::sub(cid)`, `listener()` (a `Stream`),
+  clock, TCP). Surface: `DeviceBuilder → Device` (`query`/`set_dps`/`set_value`/
+  `send` — all fire-and-forget), sub-devices `Device::sub(cid)`. Replies read off
+  `listener()` (a `Stream<Item = Event>`, lag surfaced as `Event::Lagged`),
+  `watch_status()` (current-value latch, never lags), or `MultiListener` (id-tagged
+  fan-in over many devices),
   `is_connected`/`wait_connected`/`close`, `connect_now()`. Addressless connect
   via `DeviceBuilder::discover(&Discovery, timeout)` (resolves IP **and**
   version). Live rewake and `connect_now` are one `Input::ConnectNow` (cancel

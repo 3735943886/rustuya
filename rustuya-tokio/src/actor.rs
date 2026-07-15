@@ -12,20 +12,19 @@
 //! 3. **`select!`** over {a queued command, socket-readable, that timer} and feed
 //!    the matching `handle_*`.
 //! 4. **Settle**: drain [`poll_transmit`](Device::poll_transmit) to the socket and
-//!    [`poll_event`](Device::poll_event) to the waiters / listener bus.
+//!    [`poll_event`](Device::poll_event) to the listener bus.
 //!
 //! No protocol decisions live here. The clock and the RNG are the only things the
 //! driver injects — a `StdRng` (Send, OS-seeded) so every IV/nonce the core emits
 //! stays unique, and a monotonic `tokio::time::Instant` base for `now`.
 
-use std::collections::VecDeque;
 use std::time::Duration as StdDuration;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
 
 use rustuya_core::device::{Config as CoreConfig, Device, Event, Input};
@@ -34,17 +33,15 @@ use rustuya_core::message::Message;
 use rustuya_core::time::Instant as CoreInstant;
 use rustuya_core::{CommandType, CoreError};
 
-use crate::error::{Result, TuyaError};
-
 /// A command handed from a [`Device`](crate::Device) handle to its actor task.
 pub(crate) enum Cmd {
-    /// Send a protocol command and complete `resp` with the next matching response.
-    /// `cid` addresses a gateway sub-device; `None` addresses the device itself.
-    Request {
+    /// Fire a protocol command at the device. `cid` addresses a gateway sub-device;
+    /// `None` addresses the device itself. Fire-and-forget: the reply (if any) is
+    /// fanned out to the listener bus, not correlated back to the caller.
+    Fire {
         cmd: CommandType,
         data: Option<Value>,
         cid: Option<String>,
-        resp: oneshot::Sender<Result<Message>>,
     },
     /// (Re)connect now: cancel any backoff wait and revive a terminal device.
     /// Fed by an explicit `connect_now()` or by the discovery rewake forwarder —
@@ -52,7 +49,7 @@ pub(crate) enum Cmd {
     /// dial target (`Some` from the rewake forwarder when the device re-announces a
     /// possibly-changed IP); `None` (explicit `connect_now`) keeps the current one.
     ConnectNow { addr: Option<String> },
-    /// Graceful shutdown: fail any in-flight waiters and exit the task.
+    /// Graceful shutdown: exit the task.
     Close,
 }
 
@@ -84,8 +81,12 @@ fn unix_secs() -> u64 {
 /// The channels the actor publishes out on, grouped so `settle`/`dispatch_events`
 /// take one value instead of a growing argument list.
 struct Sinks {
-    /// The lossless push/response bus feeding every [`Listener`](crate::Listener).
+    /// The push/response bus feeding every [`Listener`](crate::Listener).
     bcast: broadcast::Sender<Message>,
+    /// Latch of the device's current status frame (last non-empty frame), feeding
+    /// [`watch_status`](crate::Device::watch_status). State, not an event: a slow
+    /// consumer that only wants the latest value reads this instead of the lossy bus.
+    status: watch::Sender<Option<Message>>,
     /// Connection-up state feeding `is_connected` / `wait_connected`.
     conn: watch::Sender<bool>,
     /// The last authentication failure (wrong key / version), or `None` while the
@@ -100,6 +101,7 @@ pub(crate) async fn run(
     acfg: ActorConfig,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     bcast_tx: broadcast::Sender<Message>,
+    status_tx: watch::Sender<Option<Message>>,
     conn_tx: watch::Sender<bool>,
     autherr_tx: watch::Sender<Option<CoreError>>,
 ) {
@@ -112,6 +114,7 @@ pub(crate) async fn run(
 
     let sinks = Sinks {
         bcast: bcast_tx,
+        status: status_tx,
         conn: conn_tx,
         autherr: autherr_tx,
     };
@@ -123,7 +126,9 @@ pub(crate) async fn run(
     let base = TokioInstant::now();
 
     let mut stream: Option<TcpStream> = None;
-    let mut waiters: VecDeque<oneshot::Sender<Result<Message>>> = VecDeque::new();
+    // TCP read chunk. Any size is correct — the core's RxBuffer reassembles frames
+    // across reads — so this is purely a syscall-count/throughput knob, not a frame
+    // bound. 8 KiB comfortably holds a typical status frame in one read.
     let mut rbuf = vec![0u8; 8192];
 
     loop {
@@ -156,7 +161,7 @@ pub(crate) async fn run(
                     }
                 }
             }
-            settle(&mut fsm, &mut stream, &mut waiters, &sinks, base, &mut rng).await;
+            settle(&mut fsm, &mut stream, &sinks, base, &mut rng).await;
             continue;
         }
 
@@ -168,19 +173,17 @@ pub(crate) async fn run(
         // (C) Whichever fires first drives the FSM.
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
-                Some(Cmd::Request { cmd, data, cid, resp }) => {
+                Some(Cmd::Fire { cmd, data, cid }) => {
+                    // Fire-and-forget: only emit if the socket is up. The handle
+                    // already waited for `connected`, so a drop here is just a
+                    // connect/drop race — the frame is dropped and the caller reads
+                    // state from the listener bus.
                     if fsm.is_connected() {
                         let t = unix_secs();
-                        waiters.push_back(resp);
                         // `cid` is owned here for the duration of this call, so the
-                        // core can borrow it — no per-request allocation in the FSM.
+                        // core can borrow it — no per-command allocation in the FSM.
                         let input = Input::Send { cmd, data, cid: cid.as_deref(), t };
                         fsm.handle_input(input, now_since(base), &mut rng);
-                    } else {
-                        // Fail fast rather than queue into a socket that isn't up:
-                        // the handle already waited for `connected` before sending,
-                        // so this only trips on a connect/drop race.
-                        let _ = resp.send(Err(TuyaError::Core(CoreError::NotConnected)));
                     }
                 }
                 // (Re)connect now: cancel backoff / revive a terminal device. A
@@ -195,9 +198,6 @@ pub(crate) async fn run(
                 }
                 // All senders dropped, or an explicit Close: shut the task down.
                 Some(Cmd::Close) | None => {
-                    for w in waiters.drain(..) {
-                        let _ = w.send(Err(TuyaError::Closed));
-                    }
                     let _ = sinks.conn.send(false);
                     return;
                 }
@@ -215,7 +215,7 @@ pub(crate) async fn run(
             }
         }
 
-        settle(&mut fsm, &mut stream, &mut waiters, &sinks, base, &mut rng).await;
+        settle(&mut fsm, &mut stream, &sinks, base, &mut rng).await;
     }
 }
 
@@ -230,13 +230,12 @@ async fn read_some(stream: &mut Option<TcpStream>, buf: &mut [u8]) -> std::io::R
 }
 
 /// Push everything the FSM produced out to the world: bytes to the socket, events
-/// to the waiters and the listener bus. Re-runs once if a write fails (feeding the
-/// core `Closed`, which enqueues `Disconnected` for us to dispatch), so the loop
-/// runs at most twice and always leaves the FSM's queues empty.
+/// to the listener bus. Re-runs once if a write fails (feeding the core `Closed`,
+/// which enqueues `Disconnected` for us to dispatch), so the loop runs at most twice
+/// and always leaves the FSM's queues empty.
 async fn settle(
     fsm: &mut Device,
     stream: &mut Option<TcpStream>,
-    waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>,
     sinks: &Sinks,
     base: TokioInstant,
     rng: &mut StdRng,
@@ -252,7 +251,7 @@ async fn settle(
         }
         // Events out. If the core tore the connection down, drop the socket so the
         // next dial gets a fresh one.
-        if dispatch_events(fsm, waiters, sinks) {
+        if dispatch_events(fsm, sinks) {
             *stream = None;
         }
         return;
@@ -271,13 +270,9 @@ async fn flush_tx(fsm: &mut Device, stream: &mut Option<TcpStream>) -> std::io::
     Ok(())
 }
 
-/// Drain `poll_event`, routing each to the response waiters and the listener bus.
+/// Drain `poll_event`, fanning each response out to the listener bus.
 /// Returns `true` if a `Disconnected` was seen (the connection was torn down).
-fn dispatch_events(
-    fsm: &mut Device,
-    waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>,
-    sinks: &Sinks,
-) -> bool {
+fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
     let mut tore_down = false;
     while let Some(ev) = fsm.poll_event() {
         match ev {
@@ -287,35 +282,31 @@ fn dispatch_events(
                 let _ = sinks.autherr.send(None);
             }
             Event::Response(msg) => {
-                // Every response also feeds the listener bus (lossless attach is
-                // the listener's concern; here we only fan out).
-                let _ = sinks.bcast.send(msg.clone());
-                deliver_to_waiter(waiters, msg);
+                // Latch the last non-empty frame as the current status (a `watch`,
+                // last-value-wins) so a consumer can read "current DPS" without
+                // keeping up with the lossy bus; skip bare acks so an empty payload
+                // doesn't clobber it. Then fan the frame out to the listener bus.
+                if !msg.payload.is_empty() {
+                    let _ = sinks.status.send(Some(msg.clone()));
+                }
+                let _ = sinks.bcast.send(msg);
             }
             Event::Disconnected => {
                 tore_down = true;
                 let _ = sinks.conn.send(false);
-                for w in waiters.drain(..) {
-                    let _ = w.send(Err(TuyaError::Disconnected));
-                }
             }
             Event::ProtocolError(e) => {
                 if e.is_auth_failure() {
                     // A CRC/HMAC/GCM failure means the payload didn't authenticate
                     // — almost always a wrong local key or protocol version. Surface
                     // it (0.3's ERR_KEY_OR_VER): publish it so `wait_connected`
-                    // reports the reason instead of a bare timeout, warn-log it, and
-                    // fail the oldest in-flight request with the real cause (this
-                    // `ProtocolError` precedes the vaguer `Disconnected`).
+                    // reports the reason instead of a bare timeout (this
+                    // `ProtocolError` precedes the vaguer `Disconnected`), and
+                    // warn-log it.
                     log::warn!(
                         "authentication failed ({e}): likely a wrong local key or protocol version"
                     );
-                    let _ = sinks.autherr.send(Some(e.clone()));
-                    while let Some(w) = waiters.pop_front() {
-                        if w.send(Err(TuyaError::Core(e.clone()))).is_ok() {
-                            break;
-                        }
-                    }
+                    let _ = sinks.autherr.send(Some(e));
                 } else {
                     log::debug!("protocol error: {e}");
                 }
@@ -323,21 +314,4 @@ fn dispatch_events(
         }
     }
     tore_down
-}
-
-/// Complete the oldest still-live waiter with `msg`. Waiters whose receiver has
-/// gone (a timed-out `request`) are popped and skipped, so a stale slot can't
-/// swallow a live response. With no waiter the message was an unsolicited push —
-/// it already went to the listener bus.
-///
-/// This is the documented fire-and-forget correlation (see [`crate::Device`]):
-/// the Tuya LAN protocol carries no request/response token, so responses match
-/// pending requests in FIFO order, not by identity.
-fn deliver_to_waiter(waiters: &mut VecDeque<oneshot::Sender<Result<Message>>>, msg: Message) {
-    while let Some(w) = waiters.pop_front() {
-        match w.send(Ok(msg.clone())) {
-            Ok(()) => return,   // delivered to a live caller
-            Err(_) => continue, // receiver gone — try the next
-        }
-    }
 }

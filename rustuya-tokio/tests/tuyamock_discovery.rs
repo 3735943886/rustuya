@@ -22,6 +22,8 @@ use std::time::Duration;
 
 use rustuya_tokio::{DeviceType, Discovery, Value, Version};
 
+mod common;
+
 const KEY: &str = "thisisarealkey00";
 
 fn tuyamock_bin() -> String {
@@ -207,22 +209,14 @@ async fn discovery_connect_setvalue_matrix() {
             .await
             .unwrap_or_else(|e| panic!("{label}: connect failed: {e:?}"));
 
-        // 3. status + set_value round-trip against the live device.
-        let dps = dps_of(
-            &dev.status()
-                .await
-                .unwrap_or_else(|e| panic!("{label}: status: {e:?}")),
-        );
+        // 3. query + set_value round-trip against the live device.
+        let dps = dps_of(&common::query_dps(&dev).await);
         assert_eq!(dps["1"], true, "{label}: initial dp1 = {dps}");
 
         dev.set_value("1", false)
             .await
             .unwrap_or_else(|e| panic!("{label}: set_value: {e:?}"));
-        let dps = dps_of(
-            &dev.status()
-                .await
-                .unwrap_or_else(|e| panic!("{label}: status2: {e:?}")),
-        );
+        let dps = dps_of(&common::query_dps(&dev).await);
         assert_eq!(dps["1"], false, "{label}: dp1 after set_value = {dps}");
 
         dev.close().await;

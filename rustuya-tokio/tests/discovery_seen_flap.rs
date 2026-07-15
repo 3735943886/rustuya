@@ -21,6 +21,8 @@ use rustuya_core::crypto::TuyaCipher;
 use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Discovery, Version};
 
+mod common;
+
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "seenflap0000000000001a";
 const DISCO_PORT: u16 = 56672;
@@ -100,7 +102,7 @@ async fn same_ip_reannouncement_wakes_from_backoff_via_seen() {
     let sender = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
 
     // conn1 up.
-    let s1 = dev.status().await.expect("first status");
+    let s1 = common::query_dps(&dev).await;
     assert_eq!(s1["dps"]["1"], true);
 
     // Populate the discovery cache with a first sighting, so the *reviving*
@@ -141,10 +143,8 @@ async fn same_ip_reannouncement_wakes_from_backoff_via_seen() {
         }
     });
 
-    let s2 = dev
-        .status()
-        .await
-        .expect("woken from backoff by a same-IP Seen");
+    // Woken from backoff by a same-IP Seen; a fresh query proves conn2 is live.
+    let s2 = common::query_dps(&dev).await;
     assert_eq!(s2["dps"]["9"], 9);
 
     revive.abort();

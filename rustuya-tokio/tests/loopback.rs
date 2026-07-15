@@ -1,10 +1,12 @@
 //! End-to-end driver test against a hand-rolled v3.3 "device" on loopback TCP.
 //!
 //! This exercises the *whole* driver path over real tokio sockets — dial, the
-//! legacy (no-handshake) connect, `status()` encoding a `DpQuery`, the mock
-//! device's framed reply, RX reassembly + decode in the core, and FIFO response
-//! correlation back to the caller. It is the from-scratch stand-in for the
+//! legacy (no-handshake) connect, `query()` encoding a `DpQuery`, the mock
+//! device's framed reply, RX reassembly + decode in the core, and the reply
+//! fanning out to the `listener()` bus. It is the from-scratch stand-in for the
 //! `tuyamock` E2E gate until that mock is wired in (M1.7).
+
+mod common;
 
 use std::time::Duration;
 
@@ -13,7 +15,7 @@ use tokio::net::TcpListener;
 
 use rustuya_core::crypto::TuyaCipher;
 use rustuya_core::{CommandType, frame};
-use rustuya_tokio::{Device, TuyaError, Version};
+use rustuya_tokio::{Device, Event, TuyaError, Version};
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "01234567890123456789ab";
@@ -68,7 +70,7 @@ async fn status_roundtrips_against_a_v33_device() {
         .connect()
         .unwrap();
 
-    let state = dev.status().await.expect("status round-trips");
+    let state = common::query_dps(&dev).await;
     assert_eq!(state["dps"]["1"], true);
     assert_eq!(state["dps"]["2"], 42);
 
@@ -90,10 +92,12 @@ async fn set_value_encodes_a_control_and_reads_the_ack() {
         .connect()
         .unwrap();
 
-    let resp = dev
-        .set_value(1, false)
+    // Fire the Control, then read the device's echoed-state "ack" off the listener.
+    let mut events = dev.listener();
+    dev.set_value(1, false).await.expect("set_value fires");
+    let resp = common::recv_dps(&mut events, Duration::from_secs(2))
         .await
-        .expect("set_value round-trips");
+        .expect("the ack fanned out to the listener");
     assert_eq!(resp["dps"]["1"], false);
 
     dev.close().await;
@@ -184,14 +188,18 @@ async fn listener_stream_yields_events_via_next() {
 
     // Subscribe before any traffic so the bus retains the event for this stream.
     let mut events = dev.listener();
-    dev.status().await.expect("status triggers a reply");
+    dev.query().await.expect("query triggers a reply");
 
-    // The reply also fans out to the listener bus; the README `.next()` idiom
-    // (Stream impl) delivers it.
-    let msg = tokio::time::timeout(Duration::from_secs(2), events.next())
+    // The reply also fans out to the listener bus; the `.next()` idiom (Stream impl)
+    // delivers it as an Event.
+    let ev = tokio::time::timeout(Duration::from_secs(2), events.next())
         .await
         .expect("an event within 2s")
         .expect("stream still open");
+    let msg = match ev {
+        Event::Frame(m) => m,
+        Event::Lagged(n) => panic!("unexpected lag: {n}"),
+    };
     let v: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap();
     assert_eq!(v["dps"]["5"], "on");
 
@@ -232,7 +240,11 @@ async fn sub_device_request_carries_the_cid_over_the_wire() {
         .connect()
         .unwrap();
 
-    let state = dev.sub("subchannel01").status().await.expect("sub status");
+    let mut events = dev.listener();
+    dev.sub("subchannel01").query().await.expect("sub query fires");
+    let state = common::recv_dps(&mut events, Duration::from_secs(2))
+        .await
+        .expect("sub-device reply on the listener");
     assert_eq!(state["dps"]["9"], true);
 
     dev.close().await;
@@ -257,18 +269,18 @@ async fn connect_rejects_a_bad_key_length() {
 }
 
 #[tokio::test]
-async fn request_on_an_unreachable_device_times_out() {
+async fn query_on_an_unreachable_device_times_out() {
     // Port 1 (nothing listening): the dial fails, the FSM backs off, and the
-    // request never sees `connected`, so it times out rather than hanging.
+    // fire never sees `connected`, so it times out rather than hanging.
     let dev = Device::builder(ID, *KEY)
         .address("127.0.0.1")
         .port(1)
         .version(Version::V3_3)
-        .request_timeout(Duration::from_millis(300))
+        .send_timeout(Duration::from_millis(300))
         .connect()
         .unwrap();
 
-    let err = dev.status().await.expect_err("no device → error");
+    let err = dev.query().await.expect_err("no device → error");
     assert!(matches!(err, TuyaError::Timeout), "got {err:?}");
     dev.close().await;
 }

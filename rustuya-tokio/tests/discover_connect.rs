@@ -11,6 +11,8 @@ use rustuya_core::crypto::TuyaCipher;
 use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Discovery};
 
+mod common;
+
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "discoverdevice000001";
 /// Discovery UDP port for this test (high, unlikely to collide).
@@ -89,7 +91,7 @@ async fn discovers_then_connects_addressless() {
         .await
         .expect("discovery resolves and connects");
 
-    let state = dev.status().await.expect("status round-trips");
+    let state = common::query_dps(&dev).await;
     assert_eq!(state["dps"]["1"], true);
 
     dev.close().await;

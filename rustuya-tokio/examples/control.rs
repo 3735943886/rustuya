@@ -21,7 +21,24 @@ mod common;
 use std::time::Duration;
 
 use common::{connect_resolved, init_logging, parse_scalar, take_ip, take_version};
-use rustuya_tokio::Result;
+use rustuya_tokio::{Event, Listener, Result};
+
+/// Fire-and-forget commands don't return a reply; the device's frames arrive on
+/// [`Device::listener`]. Print the next non-empty frame (the reply to what we just
+/// fired), skipping bare heartbeat acks, bounded so a silent device doesn't hang.
+async fn next_reply(events: &mut Listener) -> String {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(Event::Frame(msg))) if !msg.payload.is_empty() => {
+                return String::from_utf8_lossy(&msg.payload).into_owned();
+            }
+            Ok(Some(Event::Frame(_))) => continue, // a bare ack — keep waiting
+            Ok(Some(Event::Lagged(n))) => return format!("(lagged — missed {n} frames)"),
+            Ok(None) => return "(device closed)".into(),
+            Err(_) => return "(no reply within 5s)".into(),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,17 +60,21 @@ async fn main() -> Result<()> {
         .map(|(dp, v)| (dp.clone(), v.clone()));
 
     let dev = connect_resolved(id, key, ip, version).await?;
-    // `status()` waits internally, but wait explicitly so a handshake failure
-    // surfaces here as a clear error rather than mid-query.
+    // `query()` waits for the connection internally, but wait explicitly so a
+    // handshake failure surfaces here as a clear error rather than mid-query.
     dev.wait_connected(Duration::from_secs(10)).await?;
-    println!("connected. status: {}", dev.status().await?);
+
+    // Subscribe before firing so the reply can't race the subscription; replies
+    // arrive on the listener bus, not as a return value.
+    let mut events = dev.listener();
+    dev.query().await?;
+    println!("connected. status: {}", next_reply(&mut events).await);
 
     if let Some((dp, raw)) = set {
         let value = parse_scalar(&raw);
         println!("setting DP {dp} = {value}");
-        let resp = dev.set_value(&dp, value).await?;
-        println!("set response: {resp}");
-        println!("status after: {}", dev.status().await?);
+        dev.set_value(&dp, value).await?;
+        println!("state after: {}", next_reply(&mut events).await);
     }
 
     dev.close().await;

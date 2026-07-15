@@ -10,13 +10,16 @@
 //!     (`--outages`),
 //!   * a device that **stalls in the handshake** (`--go-dark-after 0` on v3.4) is
 //!     timed out and recovered,
-//!   * **misbehaving response seqnos** (`--seqno-mode`) don't break correlation —
-//!     the FIFO fire-and-forget model has no seqno dependency to corrupt.
+//!   * **misbehaving response seqnos** (`--seqno-mode`) are a non-issue — the
+//!     fire-and-forget model reads replies off the listener bus and has no seqno
+//!     dependency to corrupt.
 //!
 //! **Opt-in.** Spawns the `tuyamock` executable (`RUSTUYA_TUYAMOCK` or `PATH`);
 //! skips with a notice if absent. Each test uses its own TCP port so they run
 //! concurrently. Timing waits here are genuine temporal assertions (does the link
 //! survive past the device's idle window?), not sleeps papering over a race.
+
+mod common;
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -126,13 +129,20 @@ async fn slow_device_responds_within_timeout() {
         "slow device"
     );
     let dev = builder(Version::V3_3, 56760)
-        .request_timeout(Duration::from_secs(5))
+        .send_timeout(Duration::from_secs(5))
         .connect()
         .unwrap();
     dev.wait_connected(Duration::from_secs(5))
         .await
         .expect("connects");
-    let dps = dps_of(&dev.status().await.expect("slow status still completes"));
+    // Subscribe, fire, and wait out the 1s device delay for the reply on the bus.
+    let mut ev = dev.listener();
+    dev.query().await.expect("query fires");
+    let dps = dps_of(
+        &common::recv_dps(&mut ev, Duration::from_secs(5))
+            .await
+            .expect("slow status still completes"),
+    );
     assert_eq!(dps["1"], true, "slow device dps: {dps}");
     let _ = mock;
     dev.close().await;
@@ -182,23 +192,26 @@ async fn recovers_after_device_goes_dark() {
     let dev = builder(Version::V3_3, 56762)
         .idle_timeout(Some(Duration::from_millis(800))) // detect the silent device fast
         .heartbeat(None)
-        .request_timeout(Duration::from_secs(3))
+        .send_timeout(Duration::from_secs(3))
         .connect()
         .unwrap();
     dev.wait_connected(Duration::from_secs(5))
         .await
         .expect("connects");
-    assert_eq!(
-        dps_of(&dev.status().await.expect("first status ok"))["1"],
-        true
-    );
+    assert_eq!(dps_of(&common::query_dps(&dev).await)["1"], true);
 
-    // The connection is now dark. Retry until a request succeeds again — that only
-    // happens after idle-liveness tears the dead link down and a fresh connection
-    // (outage cleared) serves the request.
+    // The connection is now dark. Retry until a query actually gets a reply again —
+    // proving recovery, not just that the fire queued. A reply only comes back after
+    // idle-liveness tears the dead link down and a fresh connection (outage cleared)
+    // serves it; a bare `query().is_ok()` would falsely pass while still dark.
+    let mut ev = dev.listener();
     let mut recovered = false;
     for _ in 0..15 {
-        if dev.status().await.is_ok() {
+        if dev.query().await.is_ok()
+            && common::recv_dps(&mut ev, Duration::from_millis(500))
+                .await
+                .is_some()
+        {
             recovered = true;
             break;
         }
@@ -221,13 +234,19 @@ async fn recovers_after_handshake_stall() {
     );
     let dev = builder(Version::V3_4, 56763)
         .handshake_timeout(Some(Duration::from_millis(800)))
-        .request_timeout(Duration::from_secs(4))
+        .send_timeout(Duration::from_secs(4))
         .connect()
         .unwrap();
 
+    // Recovery = a query that actually gets a reply back (see the go-dark test).
+    let mut ev = dev.listener();
     let mut recovered = false;
     for _ in 0..15 {
-        if dev.status().await.is_ok() {
+        if dev.query().await.is_ok()
+            && common::recv_dps(&mut ev, Duration::from_millis(500))
+                .await
+                .is_some()
+        {
             recovered = true;
             break;
         }
@@ -238,9 +257,10 @@ async fn recovers_after_handshake_stall() {
 }
 
 #[tokio::test]
-async fn misbehaving_seqno_does_not_break_correlation() {
-    // The Tuya LAN protocol has no request/response token, so the driver matches
-    // FIFO; a device that stamps its response seqno wrongly must not corrupt that.
+async fn misbehaving_seqno_does_not_break_anything() {
+    // The Tuya LAN protocol has no request/response token; the fire-and-forget
+    // model reads replies off the listener bus and never inspects response seqnos,
+    // so a device that stamps them wrongly must not perturb anything.
     for (i, mode) in ["zero", "global", "echo"].iter().enumerate() {
         let port = 56770 + i as u16;
         let mock = skip_if_absent!(
@@ -253,13 +273,13 @@ async fn misbehaving_seqno_does_not_break_correlation() {
             .expect("connects");
 
         assert_eq!(
-            dps_of(&dev.status().await.expect("status"))["1"],
+            dps_of(&common::query_dps(&dev).await)["1"],
             true,
             "seqno-mode {mode}: initial status"
         );
         dev.set_value("1", false).await.expect("set_value");
         assert_eq!(
-            dps_of(&dev.status().await.expect("status after set"))["1"],
+            dps_of(&common::query_dps(&dev).await)["1"],
             false,
             "seqno-mode {mode}: after set_value"
         );

@@ -14,6 +14,8 @@
 //! `auto_reconnect` + a short backoff, so its own dial-retry loop connects as
 //! soon as the mock finishes binding — `wait_connected` is the sync edge.
 
+mod common;
+
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -122,7 +124,7 @@ async fn status_roundtrip(version: Version, wire: &str, port: u16) {
         .await
         .expect("connects to the mock");
 
-    let status = dev.status().await.expect("status round-trips");
+    let status = common::query_dps(&dev).await;
     let dps = dps_of(&status);
     assert_eq!(dps["1"], true, "v{wire} dps.1: {status}");
     assert_eq!(dps["20"], "white", "v{wire} dps.20: {status}");
@@ -161,11 +163,9 @@ async fn set_value_mutates_live_state_v34() {
         .await
         .expect("connects");
 
-    dev.set_value("1", false)
-        .await
-        .expect("set_value round-trips");
+    dev.set_value("1", false).await.expect("set_value fires");
     // Read it back: the mock applied the mutation to its live dps.
-    let dps = dps_of(&dev.status().await.expect("status after set"));
+    let dps = dps_of(&common::query_dps(&dev).await);
     assert_eq!(dps["1"], false, "set_value flipped dp 1: {dps}");
 
     dev.close().await;
@@ -184,7 +184,7 @@ async fn device22_status_v33() {
         .await
         .expect("connects");
 
-    let dps = dps_of(&dev.status().await.expect("device22 status"));
+    let dps = dps_of(&common::query_dps(&dev).await);
     assert_eq!(dps["1"], true, "device22 returns the queried dp: {dps}");
 
     dev.close().await;

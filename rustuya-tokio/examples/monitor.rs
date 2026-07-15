@@ -17,7 +17,7 @@ mod common;
 use std::time::Duration;
 
 use common::{connect_resolved, init_logging, take_ip, take_version};
-use rustuya_tokio::{Result, TuyaError};
+use rustuya_tokio::{Event, Result, TuyaError};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
                     last = now;
                 }
             }
-            msg = listener.next() => match msg {
-                Some(m) => {
+            ev = listener.next() => match ev {
+                Some(Event::Frame(m)) => {
                     // Label by command so a heartbeat reply isn't mistaken for a
                     // device push. Unsolicited STATUS (0x08) only arrives when the
                     // device's state actually changes.
@@ -83,6 +83,8 @@ async fn main() -> Result<()> {
                         String::from_utf8_lossy(&m.payload)
                     );
                 }
+                // A slow consumer would surface here instead of silently dropping.
+                Some(Event::Lagged(n)) => println!("[lagged] missed {n} frames"),
                 None => {
                     println!("device stopped.");
                     break;

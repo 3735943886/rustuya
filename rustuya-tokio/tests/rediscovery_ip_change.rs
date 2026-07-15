@@ -22,6 +22,8 @@ use rustuya_core::crypto::TuyaCipher;
 use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Discovery, Version};
 
+mod common;
+
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "ipchange000000000001ab";
 const DISCO_PORT: u16 = 56671;
@@ -112,7 +114,7 @@ async fn rediscovery_with_changed_ip_redials_the_new_address() {
         .unwrap();
 
     // conn1 up at 127.0.0.1.
-    let s1 = dev.status().await.expect("first status round-trips");
+    let s1 = common::query_dps(&dev).await;
     assert_eq!(s1["dps"]["1"], true);
 
     // Wait until the device observes the conn1 drop and enters backoff (spin on the
@@ -138,10 +140,7 @@ async fn rediscovery_with_changed_ip_redials_the_new_address() {
         .unwrap();
 
     // conn2 round-trips only if the redial went to the new address.
-    let s2 = dev
-        .status()
-        .await
-        .expect("reconnected at the new IP, second status round-trips");
+    let s2 = common::query_dps(&dev).await;
     assert_eq!(s2["dps"]["2"], 42);
 
     // The linked discovery now records the device (exposed staleness fact).

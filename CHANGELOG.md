@@ -4,6 +4,52 @@ All notable changes to this project are documented in this file, curated by
 hand. This file is the single source of truth: the GitHub Release notes for
 each tag are the matching `## [version]` section extracted from here.
 
+## [Unreleased]
+
+The `0.4` sans-io line (branch `0.4-sansio`); unreleased.
+
+### Added
+
+- **`Device::watch_status()`** — a `watch` of the device's current status frame (last
+  non-empty frame), kept as *state* separate from the event stream. A consumer that
+  only wants the latest value reads it without ever lagging behind a lossy bus.
+- **`MultiListener`** — fan-in over several devices' listeners: `add`/`remove` the
+  devices you care about and receive their events on one stream, each tagged with its
+  device id (`(String, Event)`). Buffer-free (each device's own bus buffers), so a
+  busy device can't evict a quiet one's frames. The sans-io analogue of 0.3's
+  `unified_listener`, with dynamic membership and per-device loss visibility.
+- **`DeviceBuilder::command_capacity()` / `listener_capacity()`** and
+  **`DiscoveryBuilder::capacity()`** — expose the channel depths that were previously
+  hardcoded (device 64 / 128, discovery found-bus 256). The listener/found buses are
+  `broadcast` rings preallocated per device / per `Discovery`, so their defaults are
+  kept modest for fleet scale; all are now documented and tunable.
+
+### Changed
+
+- **The tokio driver's command API is now uniformly fire-and-forget.** Every
+  command method returns `Result<()>` and completes once the frame is queued —
+  it no longer waits for, or returns, a reply. The Tuya LAN protocol carries no
+  request/response token, so a device's status frames and its unsolicited
+  pushes are indistinguishable; matching a reply back to a specific call was
+  always a FIFO guess that an unrelated push could satisfy by mistake. Replies
+  now arrive only on `Device::listener()` — subscribe *before* you fire.
+  - `Device::status() -> Result<Value>` → **`query() -> Result<()>`**
+  - `request()` / `request_message()` → **`send(cmd, data) -> Result<()>`**
+  - `set_dps()` / `set_value()` now return `Result<()>`
+  - `DeviceBuilder::request_timeout()` → **`send_timeout()`** — it now bounds
+    only the wait for the connection to come up before a fire, not a response
+    round-trip.
+  - the same renames apply to `SubDevice`.
+- **Removed the response-correlation machinery** from the driver (per-request
+  `oneshot` waiters and their FIFO delivery). The listener broadcast bus is now
+  the single path for every inbound frame.
+- **`Listener` now yields `Event`, not `Message`** — `recv()` returns
+  `Option<Event>` and the `Stream` item is `Event` (`Frame(Message)` | `Lagged(u64)`).
+  A slow-consumer bus gap is delivered as `Event::Lagged(n)` rather than silently
+  skipped, so state-tracking consumers can observe loss. This replaces 0.3's tangle of
+  five different lag policies (silent-skip, synthetic in-band error event, typed error,
+  drop-and-count bridge, swallow-in-Python) with one observable value.
+
 ## [0.3.0] — 2026-07-02
 
 Stable release of the 0.3.0 line — the culmination of the `0.3.0-rc.1`

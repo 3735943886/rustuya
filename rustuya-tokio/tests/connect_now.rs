@@ -16,6 +16,8 @@ use rustuya_core::crypto::TuyaCipher;
 use rustuya_core::{CommandType, frame};
 use rustuya_tokio::{Device, Version};
 
+mod common;
+
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "01234567890123456789ab";
 
@@ -69,7 +71,7 @@ async fn connect_now_revives_a_terminal_device() {
         .connect()
         .unwrap();
 
-    let s1 = dev.status().await.expect("first status");
+    let s1 = common::query_dps(&dev).await;
     assert_eq!(s1["dps"]["1"], true);
 
     // The mock dropped conn1: the device goes terminal and stays down.
@@ -84,10 +86,7 @@ async fn connect_now_revives_a_terminal_device() {
     // Explicit revival: cancel the terminal state and redial.
     dev.connect_now().await;
 
-    let s2 = dev
-        .status()
-        .await
-        .expect("revived via connect_now, second status");
+    let s2 = common::query_dps(&dev).await;
     assert_eq!(s2["dps"]["2"], 7);
 
     dev.close().await;
