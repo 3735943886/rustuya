@@ -179,21 +179,6 @@ timer / command, call the matching `handle_*`; drain `poll_transmit()` and
   decoded with `has_retcode=false` (the loopback mock, built on the library's own
   encoder, was self-consistent and blind to it). Fixed; both mocks made faithful.
 
-## M1.5-blocking — Blocking (`std`, no-tokio) driver  [optional, not started]
-
-> A second driver over the same core using `std::net::TcpStream` +
-> `set_read_timeout` + `thread::sleep` — no tokio. The std-side rehearsal for the
-> ESP32 driver (M3): same core, blocking loop.
-
-- [ ] **B.1** One `std::thread` per device runs read → `handle_input` →
-  drain-transmit → arm-`thread::sleep`, so persist keepalive + `listener()` work
-  with no tokio runtime.
-- [ ] **B.2** `blocking` feature; a pure-sync consumer compiles with tokio / mio
-  / socket2 absent from the dependency tree.
-- [ ] **B.3** Removes the `block_on`-from-within-a-runtime footgun (no runtime to
-  borrow).
-- [ ] **B.4** Docs: small-scale only — one thread per device, not for fleet.
-
 ## M2 — Discovery FSM into the core
 
 - [x] **M2.1** Discovery FSM (`discovery::{Discovery, Input, Event, DeviceInfo}`);
@@ -227,8 +212,12 @@ mock-gated.
 
 ## M3 — ESP32 driver (`rustuya-embassy`)  [0.5+]
 
-> Only after M0–M2 are solid. Where the Embassy-vs-esp-idf choice is made,
-> validated on real hardware. The blocking driver is its std-side rehearsal.
+> **Gating principle:** every additional layer over the core (embassy, a
+> blocking-std driver, Python bindings, …) waits until the core is proven
+> complete through the tokio driver in real use — the core/driver seam must
+> stop moving first. One driver validating the core beats three drivers
+> chasing it. Where the Embassy-vs-esp-idf choice is made, validated on real
+> hardware.
 
 - [ ] **M3.1** Decide runtime: bare-metal Embassy (`esp-hal` +
   `embassy-net`/smoltcp) vs esp-idf `std`. Record rationale.
