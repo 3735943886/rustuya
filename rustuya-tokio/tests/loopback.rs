@@ -241,7 +241,10 @@ async fn sub_device_request_carries_the_cid_over_the_wire() {
         .unwrap();
 
     let mut events = dev.listener();
-    dev.sub("subchannel01").query().await.expect("sub query fires");
+    dev.sub("subchannel01")
+        .query()
+        .await
+        .expect("sub query fires");
     let state = common::recv_dps(&mut events, Duration::from_secs(2))
         .await
         .expect("sub-device reply on the listener");

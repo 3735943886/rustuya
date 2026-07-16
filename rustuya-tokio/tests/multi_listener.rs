@@ -112,7 +112,10 @@ async fn watch_status_latches_current_frame() {
         .expect("connects");
 
     let mut st = dev.watch_status();
-    assert!(st.borrow().is_none(), "no status latched until the first frame");
+    assert!(
+        st.borrow().is_none(),
+        "no status latched until the first frame"
+    );
 
     dev.query().await.expect("query");
 
