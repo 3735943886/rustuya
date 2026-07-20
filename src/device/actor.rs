@@ -626,14 +626,12 @@ impl Device {
                     return None;
                 }
                 cmd_opt = rx.recv() => {
-                    if let Some(cmd) = cmd_opt {
-                        if let DeviceCommand::ConnectNow = cmd { return Some(()) }
-                        debug!("Rejecting command during backoff for device {}", self.inner.id);
-                        cmd.respond(Err(TuyaError::Offline));
-                        self.broadcast_error(ERR_OFFLINE, None);
-                    } else {
-                        return None;
-                    }
+                    // `?` is the sender-dropped exit: no handles left, so stop the actor.
+                    let cmd = cmd_opt?;
+                    if let DeviceCommand::ConnectNow = cmd { return Some(()) }
+                    debug!("Rejecting command during backoff for device {}", self.inner.id);
+                    cmd.respond(Err(TuyaError::Offline));
+                    self.broadcast_error(ERR_OFFLINE, None);
                 }
             }
         }
