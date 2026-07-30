@@ -24,8 +24,10 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, broadcast, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
+
+use crate::ConnectLimiter;
 
 use rustuya_core::device::{Config as CoreConfig, Device, Event, Input};
 use rustuya_core::json::Value;
@@ -62,6 +64,10 @@ pub(crate) struct ActorConfig {
     /// active-only device (or one that moved IP) gets re-elicited. `None` when no
     /// discovery is linked. Coalesced at the discovery end (single-flight).
     pub want_scan: Option<mpsc::Sender<()>>,
+    /// Fleet-wide cap on simultaneous connection establishment, or `None` for no
+    /// cap (the default). A permit is taken before each dial and released the
+    /// moment the FSM leaves `is_establishing()`.
+    pub connect_limiter: Option<ConnectLimiter>,
 }
 
 /// Convert the driver's monotonic clock into the core's injected `now`.
@@ -110,6 +116,7 @@ pub(crate) async fn run(
         mut addr,
         connect_timeout,
         want_scan,
+        connect_limiter,
     } = acfg;
 
     let sinks = Sinks {
@@ -130,12 +137,27 @@ pub(crate) async fn run(
     // across reads — so this is purely a syscall-count/throughput knob, not a frame
     // bound. 8 KiB comfortably holds a typical status frame in one read.
     let mut rbuf = vec![0u8; 8192];
+    // Establishment permit, when a fleet-wide `ConnectLimiter` is shared in.
+    // Taken just before a dial and dropped the moment the FSM stops
+    // establishing — see `ConnectLimiter` for why holding it any longer would
+    // deadlock a fleet larger than the cap.
+    let mut permit: Option<OwnedSemaphorePermit> = None;
 
     loop {
         // (A) Dial when the core asks. The result — success or failure — is just
         //     another input; the core decides what happens next (handshake, or a
         //     backoff timer).
         if fsm.wants_connect() {
+            if let Some(limiter) = &connect_limiter {
+                match await_permit(limiter, &mut cmd_rx, &mut addr).await {
+                    Some(p) => permit = Some(p),
+                    // Closed while queued for a slot: never dial, just stop.
+                    None => {
+                        let _ = sinks.conn.send(false);
+                        return;
+                    }
+                }
+            }
             match timeout(connect_timeout, TcpStream::connect(&addr)).await {
                 Ok(Ok(s)) => {
                     let _ = s.set_nodelay(true);
@@ -162,6 +184,11 @@ pub(crate) async fn run(
                 }
             }
             settle(&mut fsm, &mut stream, &sinks, base, &mut rng).await;
+            // A failed dial (or a v3.1–v3.3 connect, which needs no handshake)
+            // already resolved the attempt — give the slot back now.
+            if !fsm.is_establishing() {
+                drop(permit.take());
+            }
             continue;
         }
 
@@ -216,6 +243,48 @@ pub(crate) async fn run(
         }
 
         settle(&mut fsm, &mut stream, &sinks, base, &mut rng).await;
+        // The handshake finished, timed out, or the link dropped: in every case
+        // the establishment window is over and the slot belongs to the next
+        // device in line.
+        if !fsm.is_establishing() {
+            drop(permit.take());
+        }
+    }
+}
+
+/// Queue for an establishment permit while staying responsive on the command
+/// channel. Returns `None` if the device was closed while waiting — a shutdown
+/// must not sit behind a fleet's worth of handshakes.
+///
+/// A command arriving mid-wait drops and re-creates the acquire future, which
+/// costs this device its place in the semaphore's FIFO queue. That is fine here:
+/// the only commands that arrive while a device is down are a rewake and a
+/// `Fire` the main loop would drop anyway, both rare next to the dial itself.
+async fn await_permit(
+    limiter: &ConnectLimiter,
+    cmd_rx: &mut mpsc::Receiver<Cmd>,
+    addr: &mut String,
+) -> Option<OwnedSemaphorePermit> {
+    loop {
+        tokio::select! {
+            p = limiter.acquire() => return Some(p),
+            cmd = cmd_rx.recv() => match cmd {
+                // Shutdown, or every handle dropped: abandon the slot request.
+                Some(Cmd::Close) | None => return None,
+                // A rewake may carry a freshly-discovered address. Adopt it so
+                // the dial we're queued for targets the *current* IP rather than
+                // the stale one. The `ConnectNow` itself is a no-op — the FSM is
+                // already in `Connecting`, which is why we're here.
+                Some(Cmd::ConnectNow { addr: new_addr }) => {
+                    if let Some(a) = new_addr {
+                        *addr = a;
+                    }
+                }
+                // Dropped exactly as the main loop drops a `Fire` while down:
+                // the caller reads device state off the listener bus.
+                Some(Cmd::Fire { .. }) => {}
+            },
+        }
     }
 }
 
