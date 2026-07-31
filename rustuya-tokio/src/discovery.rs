@@ -52,7 +52,14 @@ type Known = Arc<Mutex<BTreeMap<String, (DeviceInfo, StdInstant)>>>;
 /// A registered device's reconnect route: where to deliver a targeted wake, plus
 /// the TCP port to rebuild `ip:port` from an announced IP.
 struct Route {
-    cmd_tx: mpsc::Sender<Cmd>,
+    /// **Weak** on purpose. A strong `Sender` here would keep the actor's
+    /// `Receiver` open for as long as the route exists, so dropping every
+    /// `Device` handle would never stop the driver task — and since the entry is
+    /// only pruned when the channel closes, nothing would ever remove it either.
+    /// The device would go on reconnecting forever, invisible to its owner. A
+    /// `WeakSender` doesn't hold the channel open, so the actor exits when its
+    /// last real handle goes and the next wake prunes the dead route.
+    cmd_tx: mpsc::WeakSender<Cmd>,
     port: u16,
 }
 
@@ -369,11 +376,14 @@ impl Discovery {
     /// one falls back to plain backoff). A collision is almost always a
     /// misconfiguration, so it is logged.
     pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
-        let prev = self
-            .routes
-            .lock()
-            .unwrap()
-            .insert(id.clone(), Route { cmd_tx, port });
+        let prev = self.routes.lock().unwrap().insert(
+            id.clone(),
+            Route {
+                // Downgraded so the registry never keeps a device alive — see `Route`.
+                cmd_tx: cmd_tx.downgrade(),
+                port,
+            },
+        );
         if prev.is_some() {
             log::warn!("discovery: device id {id} re-registered; superseding previous route");
         }
@@ -640,7 +650,13 @@ fn route_wake(routes: &Routes, id: &str, ip: Option<&str>) {
     let mut map = routes.lock().unwrap();
     let Some(route) = map.get(id) else { return };
     let addr = ip.map(|ip| format!("{ip}:{}", route.port));
-    match route.cmd_tx.try_send(Cmd::ConnectNow { addr }) {
+    // A weak sender that won't upgrade means every real handle is gone: the
+    // device was dropped by its owner and its actor has stopped. Prune.
+    let Some(cmd_tx) = route.cmd_tx.upgrade() else {
+        map.remove(id);
+        return;
+    };
+    match cmd_tx.try_send(Cmd::ConnectNow { addr }) {
         Ok(()) | Err(TrySendError::Full(_)) => {}
         Err(TrySendError::Closed(_)) => {
             map.remove(id);
