@@ -256,18 +256,22 @@ pub(crate) async fn run(
 /// channel. Returns `None` if the device was closed while waiting — a shutdown
 /// must not sit behind a fleet's worth of handshakes.
 ///
-/// A command arriving mid-wait drops and re-creates the acquire future, which
-/// costs this device its place in the semaphore's FIFO queue. That is fine here:
-/// the only commands that arrive while a device is down are a rewake and a
-/// `Fire` the main loop would drop anyway, both rare next to the dial itself.
+/// The acquire future is pinned across the whole wait rather than re-created per
+/// loop turn: tokio's semaphore queue is FIFO, so a future dropped and remade
+/// goes to the back of it. Re-creating it would starve exactly the devices this
+/// cap exists for — a down device linked to discovery is rewoken every time it
+/// announces, so under a saturated cap it would surrender its place on every
+/// announcement and could queue indefinitely while others pass it.
 async fn await_permit(
     limiter: &ConnectLimiter,
     cmd_rx: &mut mpsc::Receiver<Cmd>,
     addr: &mut String,
 ) -> Option<OwnedSemaphorePermit> {
+    let acquire = limiter.acquire();
+    tokio::pin!(acquire);
     loop {
         tokio::select! {
-            p = limiter.acquire() => return Some(p),
+            p = &mut acquire => return Some(p),
             cmd = cmd_rx.recv() => match cmd {
                 // Shutdown, or every handle dropped: abandon the slot request.
                 Some(Cmd::Close) | None => return None,
@@ -383,4 +387,129 @@ fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
         }
     }
     tore_down
+}
+
+#[cfg(test)]
+mod permit_tests {
+    use super::*;
+
+    /// A device queued for a permit keeps its place across the commands that
+    /// arrive while it waits.
+    ///
+    /// This is the fairness the pinned acquire future buys. Re-creating that
+    /// future per command would send the device to the back of the semaphore's
+    /// FIFO queue, and the devices that get commands while down are exactly the
+    /// ones registered with discovery — rewoken on every announcement — so under
+    /// a saturated cap they could queue indefinitely while others pass them.
+    ///
+    /// Ordering is established by scheduler turns on a single-threaded runtime,
+    /// not by wall clock: each spawned waiter runs until it parks in `acquire`,
+    /// so the queue order is exactly the spawn order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_waiting_device_keeps_its_queue_place_across_commands() {
+        let limiter = ConnectLimiter::new(1);
+        // Saturate the cap: both waiters below must queue.
+        let held = limiter.acquire().await;
+
+        let (won_tx, mut won_rx) = mpsc::channel::<&'static str>(2);
+        let mut senders = Vec::new();
+        for name in ["first", "second"] {
+            let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
+            senders.push(cmd_tx);
+            let limiter = limiter.clone();
+            let won_tx = won_tx.clone();
+            tokio::spawn(async move {
+                let mut addr = String::from("192.168.1.5:6668");
+                if await_permit(&limiter, &mut cmd_rx, &mut addr)
+                    .await
+                    .is_some()
+                {
+                    let _ = won_tx.send(name).await;
+                    // Hold the permit so the loser cannot also report a win.
+                    std::future::pending::<()>().await;
+                }
+            });
+            // Let the waiter reach its `acquire` before the next one is spawned,
+            // so "first" really is first in the queue.
+            tokio::task::yield_now().await;
+        }
+
+        // Rewakes for the device at the head of the queue — an announcement storm
+        // is exactly the command traffic a down device sees.
+        for _ in 0..8 {
+            senders[0]
+                .send(Cmd::ConnectNow { addr: None })
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        drop(held);
+        assert_eq!(
+            won_rx.recv().await,
+            Some("first"),
+            "the device already at the head of the queue must get the freed permit; \
+             it was overtaken, so its place was surrendered on every command"
+        );
+    }
+
+    /// A rewake that arrives mid-wait still updates the dial target, so the dial
+    /// the device was queued for lands on the freshly-announced IP.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rewake_mid_wait_updates_the_address() {
+        let limiter = ConnectLimiter::new(1);
+        let held = limiter.acquire().await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
+
+        let waiter = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move {
+                let mut addr = String::from("192.168.1.5:6668");
+                let got = await_permit(&limiter, &mut cmd_rx, &mut addr).await;
+                (got.is_some(), addr)
+            })
+        };
+        tokio::task::yield_now().await;
+
+        cmd_tx
+            .send(Cmd::ConnectNow {
+                addr: Some("192.168.1.9:6668".to_string()),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        drop(held);
+
+        let (got_permit, addr) = waiter.await.unwrap();
+        assert!(got_permit, "the waiter should have been granted the permit");
+        assert_eq!(addr, "192.168.1.9:6668", "the new address was not adopted");
+    }
+
+    /// A close must not sit behind a fleet's worth of handshakes: it is answered
+    /// while the device is still queued, without ever taking a permit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_close_while_queued_abandons_the_slot_request() {
+        let limiter = ConnectLimiter::new(1);
+        let held = limiter.acquire().await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
+
+        let waiter = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move {
+                let mut addr = String::from("192.168.1.5:6668");
+                await_permit(&limiter, &mut cmd_rx, &mut addr)
+                    .await
+                    .is_some()
+            })
+        };
+        tokio::task::yield_now().await;
+
+        cmd_tx.send(Cmd::Close).await.unwrap();
+        assert!(
+            !waiter.await.unwrap(),
+            "a queued device must abandon its slot request on Close"
+        );
+        drop(held);
+        assert_eq!(limiter.available(), 1, "no permit should have been taken");
+    }
 }
