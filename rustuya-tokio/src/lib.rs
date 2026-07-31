@@ -92,6 +92,16 @@ fn core_dur(d: StdDuration) -> CoreDuration {
 /// connection's lifetime. Holding it longer would deadlock any fleet larger than
 /// `limit`, with the surplus devices never able to connect.
 ///
+/// That window is bounded by
+/// [`connect_timeout`](DeviceBuilder::connect_timeout) plus
+/// [`handshake_timeout`](DeviceBuilder::handshake_timeout), and **that bound is
+/// what keeps the cap live**. Turning the handshake timeout off
+/// (`handshake_timeout(None)`) removes the second half of it: a v3.4/v3.5 device
+/// that completes its TCP connect and then never answers stays `Handshaking`
+/// forever and never gives its permit back. Enough such devices and the cap is
+/// exhausted permanently — every remaining device queues behind a slot that will
+/// never free. Sharing a limiter across a fleet means keeping that timeout on.
+///
 /// ```no_run
 /// # fn ex() -> rustuya_tokio::Result<()> {
 /// use rustuya_tokio::{ConnectLimiter, Device};
@@ -354,6 +364,24 @@ impl DeviceBuilder {
             .as_slice()
             .try_into()
             .map_err(|_| TuyaError::Config("local key must be 16 bytes"))?;
+
+        // The cap's liveness rests on the establishment window being bounded, and
+        // `handshake_timeout` is the only thing that bounds its second half. With
+        // the timeout off, one device that completes a TCP connect and then never
+        // answers holds its permit for the process's lifetime; enough of them and
+        // the whole fleet stops connecting. Not an error — a device with no
+        // handshake (v3.1–v3.3) is unaffected — but never what someone sharing a
+        // limiter meant.
+        if self.connect_limiter.is_some()
+            && self.handshake_timeout.is_none()
+            && self.version.profile().session_key
+        {
+            log::warn!(
+                "device {}: connect_limiter shares a cap with handshake_timeout(None); \
+                 a device that stalls mid-handshake will hold its permit forever",
+                self.id
+            );
+        }
 
         let core = CoreConfig {
             version: self.version,
