@@ -11,6 +11,10 @@
 //! `watch_connected()` is the probe: its sender lives inside the driver task, so
 //! a receiver kept after the `Device` is dropped reports `Err` exactly when that
 //! task has ended.
+//!
+//! The other half — that the dead route is then *removed* rather than piling up
+//! per departed device — is a unit test in `discovery.rs`, since the registry is
+//! not publicly enumerable and from out here the prune is unobservable.
 
 use std::time::Duration;
 
@@ -62,31 +66,4 @@ async fn dropping_a_discovery_linked_device_stops_its_actor() {
         "the driver task outlived its last Device handle: the discovery route is \
          holding a strong sender and the actor can never observe its channel close"
     );
-}
-
-/// The dead route is then cleaned up, rather than accumulating an entry per
-/// departed device for the process's lifetime.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_departed_device_leaves_no_route_behind() {
-    let disco = Discovery::new().expect("bind discovery");
-    let dev = Device::builder("route0000000000000001", KEY.to_vec())
-        .address("127.0.0.1")
-        .port(1)
-        .version(Version::V3_3)
-        .rediscover(&disco)
-        .connect()
-        .expect("connect");
-    let watch = dev.watch_connected();
-    drop(dev);
-    assert!(
-        until(Duration::from_secs(10), || watch.has_changed().is_err()).await,
-        "actor should have stopped"
-    );
-
-    // Nothing publicly enumerates the registry, so drive the prune the way the
-    // discovery loop does — a wake for that id — and assert it is idempotent and
-    // does not resurrect anything. The observable contract is simply that this
-    // cannot panic or block on a dead route.
-    disco.request_scan();
-    disco.close().await;
 }

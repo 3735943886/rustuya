@@ -663,3 +663,56 @@ fn route_wake(routes: &Routes, id: &str, ip: Option<&str>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry must not accumulate an entry per departed device: once the
+    /// owner drops its `Device`, the weak route stops upgrading and the first
+    /// wake that reaches it prunes it.
+    ///
+    /// A unit test because nothing public enumerates the registry — from the
+    /// outside the prune is unobservable, so an integration test could only
+    /// assert that waking a dead route does not panic, which is not the claim.
+    #[test]
+    fn a_wake_prunes_the_route_of_a_departed_device() {
+        let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
+        routes.lock().unwrap().insert(
+            "dev".to_string(),
+            Route {
+                cmd_tx: cmd_tx.downgrade(),
+                port: 6668,
+            },
+        );
+
+        // While the device is alive the wake is delivered — carrying the announced
+        // IP rejoined to the registered port — and the route stays.
+        route_wake(&routes, "dev", Some("192.168.1.5"));
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Ok(Cmd::ConnectNow { addr: Some(a) }) if a == "192.168.1.5:6668"
+            ),
+            "a live route should have been woken at the announced address"
+        );
+        assert_eq!(
+            routes.lock().unwrap().len(),
+            1,
+            "a live route must survive its wake"
+        );
+
+        // The owner releases the device: no strong sender left to upgrade to.
+        drop(cmd_tx);
+        route_wake(&routes, "dev", None);
+        assert!(
+            routes.lock().unwrap().is_empty(),
+            "the route of a departed device must be pruned by the wake that finds it dead"
+        );
+
+        // And waking an id that is no longer registered is a no-op, not a panic —
+        // every later announcement for that device takes this path.
+        route_wake(&routes, "dev", Some("192.168.1.5"));
+    }
+}
