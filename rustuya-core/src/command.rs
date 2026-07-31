@@ -60,6 +60,56 @@ impl CommandType {
     pub fn code(self) -> u32 {
         self as u32
     }
+
+    /// Every variant, in wire-code order.
+    ///
+    /// The enum discriminants are the wire codes, so this is the *only* list
+    /// [`from_code`](Self::from_code) needs — there is no second code→variant
+    /// table to drift out of step. **A new variant must be added here too**, or
+    /// it will encode fine and fail to decode.
+    pub const ALL: [Self; 30] = [
+        Self::ApConfig,
+        Self::Active,
+        Self::SessKeyNegStart,
+        Self::SessKeyNegResp,
+        Self::SessKeyNegFinish,
+        Self::Unbind,
+        Self::Control,
+        Self::Status,
+        Self::HeartBeat,
+        Self::DpQuery,
+        Self::QueryWifi,
+        Self::TokenBind,
+        Self::ControlNew,
+        Self::EnableWifi,
+        Self::WifiInfo,
+        Self::DpQueryNew,
+        Self::SceneExecute,
+        Self::UpdateDps,
+        Self::UdpNew,
+        Self::ApConfigNew,
+        Self::LanExportAppConfig,
+        Self::LanPublishAppConfig,
+        Self::ReqDevInfo,
+        Self::LanExtStream,
+        Self::LanGwActive,
+        Self::LanSubDevRequest,
+        Self::LanDeleteSubDev,
+        Self::LanReportSubDev,
+        Self::LanScene,
+        Self::LanPublishCloudConfig,
+    ];
+
+    /// The inverse of [`code`](Self::code): a wire code back to its variant, or
+    /// `None` if it isn't one this crate knows.
+    ///
+    /// For callers that take a command code as *input* — a control protocol
+    /// letting an operator send an arbitrary command, say — so an unknown code
+    /// is rejected by name rather than transmuted into a bogus variant.
+    #[must_use]
+    pub fn from_code(code: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.code() == code)
+    }
 }
 
 /// Builds the request envelope for `command`, applying the device22 dialect when
@@ -228,6 +278,32 @@ mod tests {
 
     const ID: &str = "01234567890123456789ab";
     const T: u64 = 1_700_000_000;
+
+    /// `ALL` is the single source for `from_code`, so it must hold every variant
+    /// exactly once, with no duplicate wire codes to shadow one another.
+    #[test]
+    fn all_variants_round_trip_through_their_code() {
+        for cmd in CommandType::ALL {
+            assert_eq!(
+                CommandType::from_code(cmd.code()),
+                Some(cmd),
+                "{cmd:?} does not round-trip"
+            );
+        }
+        for (i, a) in CommandType::ALL.iter().enumerate() {
+            for b in &CommandType::ALL[i + 1..] {
+                assert_ne!(a.code(), b.code(), "{a:?} and {b:?} share a wire code");
+            }
+        }
+    }
+
+    /// An unassigned code is rejected, not silently turned into a variant.
+    #[test]
+    fn unknown_codes_are_rejected() {
+        for code in [0x00, 0x15, 0x24, 0x41, 0xf9, 0x1_0000] {
+            assert_eq!(CommandType::from_code(code), None, "code {code:#x}");
+        }
+    }
 
     #[test]
     fn legacy_control_drops_gwid_status_strips() {
