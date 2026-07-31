@@ -300,6 +300,21 @@ impl Device {
         self.state == State::Connected
     }
 
+    /// Whether the device is in the **establishment window** — a dial is in
+    /// flight (`Connecting`) or the session-key handshake has not finished
+    /// (`Handshaking`).
+    ///
+    /// This is the expensive phase (a TCP round trip plus, on v3.4/v3.5, a
+    /// crypto handshake); once past it a connection is nearly free (an idle
+    /// socket plus a keepalive). A driver bounding a connect storm holds its
+    /// permit exactly while this is `true` — never for the connection's
+    /// lifetime, or a fleet larger than the permit count would deadlock with the
+    /// surplus devices never able to connect.
+    #[must_use]
+    pub fn is_establishing(&self) -> bool {
+        matches!(self.state, State::Connecting | State::Handshaking)
+    }
+
     // -- transitions ---------------------------------------------------------
 
     fn on_connected(&mut self, now: Instant, rng: &mut impl RngCore) {

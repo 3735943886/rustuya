@@ -52,7 +52,14 @@ type Known = Arc<Mutex<BTreeMap<String, (DeviceInfo, StdInstant)>>>;
 /// A registered device's reconnect route: where to deliver a targeted wake, plus
 /// the TCP port to rebuild `ip:port` from an announced IP.
 struct Route {
-    cmd_tx: mpsc::Sender<Cmd>,
+    /// **Weak** on purpose. A strong `Sender` here would keep the actor's
+    /// `Receiver` open for as long as the route exists, so dropping every
+    /// `Device` handle would never stop the driver task — and since the entry is
+    /// only pruned when the channel closes, nothing would ever remove it either.
+    /// The device would go on reconnecting forever, invisible to its owner. A
+    /// `WeakSender` doesn't hold the channel open, so the actor exits when its
+    /// last real handle goes and the next wake prunes the dead route.
+    cmd_tx: mpsc::WeakSender<Cmd>,
     port: u16,
 }
 
@@ -369,11 +376,14 @@ impl Discovery {
     /// one falls back to plain backoff). A collision is almost always a
     /// misconfiguration, so it is logged.
     pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
-        let prev = self
-            .routes
-            .lock()
-            .unwrap()
-            .insert(id.clone(), Route { cmd_tx, port });
+        let prev = self.routes.lock().unwrap().insert(
+            id.clone(),
+            Route {
+                // Downgraded so the registry never keeps a device alive — see `Route`.
+                cmd_tx: cmd_tx.downgrade(),
+                port,
+            },
+        );
         if prev.is_some() {
             log::warn!("discovery: device id {id} re-registered; superseding previous route");
         }
@@ -640,10 +650,69 @@ fn route_wake(routes: &Routes, id: &str, ip: Option<&str>) {
     let mut map = routes.lock().unwrap();
     let Some(route) = map.get(id) else { return };
     let addr = ip.map(|ip| format!("{ip}:{}", route.port));
-    match route.cmd_tx.try_send(Cmd::ConnectNow { addr }) {
+    // A weak sender that won't upgrade means every real handle is gone: the
+    // device was dropped by its owner and its actor has stopped. Prune.
+    let Some(cmd_tx) = route.cmd_tx.upgrade() else {
+        map.remove(id);
+        return;
+    };
+    match cmd_tx.try_send(Cmd::ConnectNow { addr }) {
         Ok(()) | Err(TrySendError::Full(_)) => {}
         Err(TrySendError::Closed(_)) => {
             map.remove(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry must not accumulate an entry per departed device: once the
+    /// owner drops its `Device`, the weak route stops upgrading and the first
+    /// wake that reaches it prunes it.
+    ///
+    /// A unit test because nothing public enumerates the registry — from the
+    /// outside the prune is unobservable, so an integration test could only
+    /// assert that waking a dead route does not panic, which is not the claim.
+    #[test]
+    fn a_wake_prunes_the_route_of_a_departed_device() {
+        let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
+        routes.lock().unwrap().insert(
+            "dev".to_string(),
+            Route {
+                cmd_tx: cmd_tx.downgrade(),
+                port: 6668,
+            },
+        );
+
+        // While the device is alive the wake is delivered — carrying the announced
+        // IP rejoined to the registered port — and the route stays.
+        route_wake(&routes, "dev", Some("192.168.1.5"));
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Ok(Cmd::ConnectNow { addr: Some(a) }) if a == "192.168.1.5:6668"
+            ),
+            "a live route should have been woken at the announced address"
+        );
+        assert_eq!(
+            routes.lock().unwrap().len(),
+            1,
+            "a live route must survive its wake"
+        );
+
+        // The owner releases the device: no strong sender left to upgrade to.
+        drop(cmd_tx);
+        route_wake(&routes, "dev", None);
+        assert!(
+            routes.lock().unwrap().is_empty(),
+            "the route of a departed device must be pruned by the wake that finds it dead"
+        );
+
+        // And waking an id that is no longer registered is a no-op, not a panic —
+        // every later announcement for that device takes this path.
+        route_wake(&routes, "dev", Some("192.168.1.5"));
     }
 }

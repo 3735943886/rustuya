@@ -64,7 +64,26 @@ request/response token, so a device's status frames and unsolicited pushes are
 indistinguishable and arrive asynchronously. Read them by audience: `listener()` for
 the full event stream (a slow-consumer gap is an observable `Event::Lagged`, not a
 silent drop), `watch_status()` if you only want the current value and never want to
-lag, or a `MultiListener` to fan many devices onto one id-tagged loop.
+lag, or a `MultiListener` to fan many devices onto one id-tagged loop. Connection
+state itself is separate from the frame stream: `is_connected()` for right now,
+`wait_connected()` to await it coming up, `watch_connected()` to react to every
+transition, and `watch_error()` for *why* a device won't come up (a wrong local key
+or version).
+
+## Fleet
+
+Nothing is process-global — a fleet is many devices sharing a few explicit objects.
+One `Discovery` (below) serves them all, and a shared `ConnectLimiter` bounds the
+connect storm when a large fleet starts, or reconnects at once after a network blip:
+
+```rust
+let limiter = rustuya_tokio::ConnectLimiter::new(128);
+let dev = Device::builder(id, key).address(ip).connect_limiter(&limiter).connect()?;
+```
+
+The permit covers only the expensive part — the dial plus the v3.4/v3.5 handshake —
+and is handed back the moment the device is up, never held for the connection's
+lifetime. There is no cap unless you set one.
 
 ## Discovery
 

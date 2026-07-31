@@ -47,9 +47,10 @@ mod actor;
 mod discovery;
 mod error;
 
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt as _, StreamMap};
@@ -68,6 +69,93 @@ pub use rustuya_core::{CommandType, CoreError, DeviceType, Version};
 /// Milliseconds → core `Duration` (the core has no `std::time`).
 fn core_dur(d: StdDuration) -> CoreDuration {
     CoreDuration::from_millis(d.as_millis() as u64)
+}
+
+/// A shared cap on how many devices may be **establishing** a connection at the
+/// same instant — a connect-storm guard for fleet-scale drivers.
+///
+/// When a large fleet comes online, or reconnects en masse after a network blip,
+/// every device actor would otherwise begin its (round-trip- and CPU-heavy)
+/// dial + v3.4/v3.5 handshake at once. Backoff jitter spreads the *start* of
+/// each attempt but, because connections are persistent, does not bound the peak
+/// number of concurrent in-flight handshakes. This does.
+///
+/// Create one and hand it to every device via
+/// [`connect_limiter`](DeviceBuilder::connect_limiter) — the same shared-object
+/// pattern as [`Discovery`]. There is **no cap by default** and no process
+/// global (DESIGN Q1): a device with no limiter dials freely, which is the right
+/// default for the one- and few-device cases.
+///
+/// A permit is held only across
+/// [`is_establishing`](rustuya_core::device::Device::is_establishing) — released
+/// the instant the handshake finishes or the attempt fails, never for the
+/// connection's lifetime. Holding it longer would deadlock any fleet larger than
+/// `limit`, with the surplus devices never able to connect.
+///
+/// That window is bounded by
+/// [`connect_timeout`](DeviceBuilder::connect_timeout) plus
+/// [`handshake_timeout`](DeviceBuilder::handshake_timeout), and **that bound is
+/// what keeps the cap live**. Turning the handshake timeout off
+/// (`handshake_timeout(None)`) removes the second half of it: a v3.4/v3.5 device
+/// that completes its TCP connect and then never answers stays `Handshaking`
+/// forever and never gives its permit back. Enough such devices and the cap is
+/// exhausted permanently — every remaining device queues behind a slot that will
+/// never free. Sharing a limiter across a fleet means keeping that timeout on.
+///
+/// ```no_run
+/// # fn ex() -> rustuya_tokio::Result<()> {
+/// use rustuya_tokio::{ConnectLimiter, Device};
+///
+/// let limiter = ConnectLimiter::new(128);
+/// for (id, key, ip) in [("device_id_22chars0000", "0123456789abcdef", "192.168.1.50")] {
+///     Device::builder(id, key)
+///         .address(ip)
+///         .connect_limiter(&limiter)
+///         .connect()?;
+/// }
+/// # Ok(()) }
+/// ```
+#[derive(Clone, Debug)]
+pub struct ConnectLimiter {
+    sem: Arc<Semaphore>,
+    limit: usize,
+}
+
+impl ConnectLimiter {
+    /// A limiter allowing `limit` simultaneous connection establishments.
+    /// `limit` is clamped to at least 1 — a cap of zero would never let any
+    /// device connect.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        let limit = limit.max(1);
+        Self {
+            sem: Arc::new(Semaphore::new(limit)),
+            limit,
+        }
+    }
+
+    /// The configured cap.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Permits not currently held — i.e. how many more devices could start
+    /// establishing right now. `limit() - available()` is the number of dials
+    /// and handshakes in flight, which is what a fleet operator wants to graph.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    /// Wait for an establishment permit. Never errors: the semaphore is owned by
+    /// this handle (and its clones) and is never closed.
+    pub(crate) async fn acquire(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.sem)
+            .acquire_owned()
+            .await
+            .expect("connect semaphore is never closed")
+    }
 }
 
 /// Builder for a [`Device`]. Every knob has a sane default; only `address` is
@@ -91,6 +179,7 @@ pub struct DeviceBuilder {
     command_capacity: usize,
     listener_capacity: usize,
     rediscover: Option<Discovery>,
+    connect_limiter: Option<ConnectLimiter>,
 }
 
 impl DeviceBuilder {
@@ -128,6 +217,7 @@ impl DeviceBuilder {
             command_capacity: 64,
             listener_capacity: 128,
             rediscover: None,
+            connect_limiter: None,
         }
     }
 
@@ -254,6 +344,15 @@ impl DeviceBuilder {
         self
     }
 
+    /// Share a [`ConnectLimiter`] so this device's dial + handshake counts
+    /// against a fleet-wide establishment cap (the connect-storm guard). Without
+    /// one the device dials freely — there is no cap by default.
+    #[must_use]
+    pub fn connect_limiter(mut self, limiter: &ConnectLimiter) -> Self {
+        self.connect_limiter = Some(limiter.clone());
+        self
+    }
+
     /// Spawn the device actor and return a handle. Fails if `address` is unset or
     /// the local key is not 16 bytes.
     pub fn connect(self) -> Result<Device> {
@@ -265,6 +364,24 @@ impl DeviceBuilder {
             .as_slice()
             .try_into()
             .map_err(|_| TuyaError::Config("local key must be 16 bytes"))?;
+
+        // The cap's liveness rests on the establishment window being bounded, and
+        // `handshake_timeout` is the only thing that bounds its second half. With
+        // the timeout off, one device that completes a TCP connect and then never
+        // answers holds its permit for the process's lifetime; enough of them and
+        // the whole fleet stops connecting. Not an error — a device with no
+        // handshake (v3.1–v3.3) is unaffected — but never what someone sharing a
+        // limiter meant.
+        if self.connect_limiter.is_some()
+            && self.handshake_timeout.is_none()
+            && self.version.profile().session_key
+        {
+            log::warn!(
+                "device {}: connect_limiter shares a cap with handshake_timeout(None); \
+                 a device that stalls mid-handshake will hold its permit forever",
+                self.id
+            );
+        }
 
         let core = CoreConfig {
             version: self.version,
@@ -309,6 +426,7 @@ impl DeviceBuilder {
             addr: format!("{address}:{}", self.port),
             connect_timeout: self.connect_timeout,
             want_scan,
+            connect_limiter: self.connect_limiter,
         };
 
         let bcast_for_actor = bcast_tx.clone();
@@ -405,6 +523,38 @@ impl Device {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         *self.conn_rx.borrow()
+    }
+
+    /// A [`watch`](tokio::sync::watch) of the connection state — `true` once the
+    /// link is up and past any handshake, `false` while it is down.
+    ///
+    /// [`is_connected`](Self::is_connected) answers "right now" and
+    /// [`wait_connected`](Self::wait_connected) answers "tell me when it's up";
+    /// this is for a consumer that must react to **every transition in both
+    /// directions** (publishing an online/offline event, say) without polling.
+    /// Await [`changed`](watch::Receiver::changed) and read
+    /// [`borrow`](watch::Receiver::borrow). Like any `watch` it is
+    /// last-value-wins: a connect/disconnect pair faster than the consumer wakes
+    /// collapses to no observed change, so treat it as *state*, not a count.
+    #[must_use]
+    pub fn watch_connected(&self) -> watch::Receiver<bool> {
+        self.conn_rx.clone()
+    }
+
+    /// A [`watch`](tokio::sync::watch) of the last **authentication** failure —
+    /// a payload that didn't authenticate, which in practice means a wrong local
+    /// key or protocol version. `None` while the connection is healthy (a
+    /// successful connect clears it).
+    ///
+    /// This is the diagnostic [`wait_connected`](Self::wait_connected) reports
+    /// instead of a bare [`Timeout`](TuyaError::Timeout); exposed separately so a
+    /// supervisor can surface *why* a device won't come up without having to
+    /// call `wait_connected` on it. Only auth failures land here — routine
+    /// transport errors are not failures worth escalating and stay in the
+    /// driver's `debug` log.
+    #[must_use]
+    pub fn watch_error(&self) -> watch::Receiver<Option<CoreError>> {
+        self.autherr_rx.clone()
     }
 
     /// Wait until the connection is up, or `dur` elapses.

@@ -157,7 +157,11 @@ timer / command, call the matching `handle_*`; drain `poll_transmit()` and
   `listener()` (a `Stream<Item = Event>`, lag surfaced as `Event::Lagged`),
   `watch_status()` (current-value latch, never lags), or `MultiListener` (id-tagged
   fan-in over many devices),
-  `is_connected`/`wait_connected`/`close`, `connect_now()`. Addressless connect
+  `is_connected`/`wait_connected`/`watch_connected`/`watch_error`/`close`,
+  `connect_now()`, and a shared `ConnectLimiter` capping simultaneous
+  establishment (the 0.3 `set_connect_concurrency` global, re-cast as an injected
+  object per DESIGN Q1; the permit spans `Device::is_establishing()` only).
+  Addressless connect
   via `DeviceBuilder::discover(&Discovery, timeout)` (resolves IP **and**
   version). Live rewake and `connect_now` are one `Input::ConnectNow` (cancel
   backoff / revive terminal `Closed`); the rewake carries a changed IP so a DHCP
