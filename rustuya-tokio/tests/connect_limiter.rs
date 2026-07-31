@@ -88,21 +88,23 @@ async fn cap_bounds_devices_in_the_establishment_window() {
         })
         .collect();
 
+    // Wait for the steady state — every slot taken, and every slot-holder
+    // through to the mock. Both conditions are positive and pollable, so there
+    // is no "sleep and hope nothing else happened" step here.
     assert!(
-        until(Duration::from_secs(5), || accepted.load(Ordering::SeqCst)
-            >= LIMIT)
+        until(Duration::from_secs(5), || limiter.available() == 0
+            && accepted.load(Ordering::SeqCst) == LIMIT)
         .await,
-        "the first {LIMIT} devices should have been let through to dial"
+        "expected exactly {LIMIT} devices dialled with all slots held; \
+         {} dialled, {} slot(s) free",
+        accepted.load(Ordering::SeqCst),
+        limiter.available()
     );
 
-    // Give the other 20 every chance to leak past the cap before ruling it out.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        accepted.load(Ordering::SeqCst),
-        LIMIT,
-        "no device may dial while all {LIMIT} establishment slots are held"
-    );
-    assert_eq!(limiter.available(), 0, "every slot should be in use");
+    // From here the cap is an *invariant*, not a race to observe: a device
+    // cannot dial without a permit, no permit is free, and none can be freed
+    // because every holder is parked mid-handshake forever. So the count above
+    // is the final one, and no amount of extra waiting could raise it.
     assert_eq!(limiter.limit(), LIMIT);
 }
 
