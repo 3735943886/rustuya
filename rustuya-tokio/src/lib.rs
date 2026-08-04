@@ -533,9 +533,15 @@ impl Device {
     /// this is for a consumer that must react to **every transition in both
     /// directions** (publishing an online/offline event, say) without polling.
     /// Await [`changed`](watch::Receiver::changed) and read
-    /// [`borrow`](watch::Receiver::borrow). Like any `watch` it is
-    /// last-value-wins: a connect/disconnect pair faster than the consumer wakes
-    /// collapses to no observed change, so treat it as *state*, not a count.
+    /// [`borrow`](watch::Receiver::borrow).
+    ///
+    /// A transition, and only a transition, wakes you: a device that is
+    /// unreachable or misconfigured tears its link down once per backoff round,
+    /// and those repeats are not published — otherwise a supervisor would emit a
+    /// fresh OFFLINE per device per retry for as long as the fleet was down.
+    /// Like any `watch` it is also last-value-wins, so a connect/disconnect pair
+    /// faster than the consumer wakes collapses to no observed change. Treat it
+    /// as *state*, never as a count.
     #[must_use]
     pub fn watch_connected(&self) -> watch::Receiver<bool> {
         self.conn_rx.clone()
@@ -552,6 +558,11 @@ impl Device {
     /// call `wait_connected` on it. Only auth failures land here — routine
     /// transport errors are not failures worth escalating and stay in the
     /// driver's `debug` log.
+    ///
+    /// Like [`watch_connected`](Self::watch_connected) it publishes changes, not
+    /// occurrences: the same failure repeating on every retry is written once,
+    /// so "offline with no error" stays the supervisor's signal for *cannot
+    /// reach it* while "offline with an error" stays *rejected us*.
     #[must_use]
     pub fn watch_error(&self) -> watch::Receiver<Option<CoreError>> {
         self.autherr_rx.clone()

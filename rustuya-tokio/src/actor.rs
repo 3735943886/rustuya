@@ -153,7 +153,7 @@ pub(crate) async fn run(
                     Some(p) => permit = Some(p),
                     // Closed while queued for a slot: never dial, just stop.
                     None => {
-                        let _ = sinks.conn.send(false);
+                        publish_state(&sinks.conn, false);
                         return;
                     }
                 }
@@ -225,7 +225,7 @@ pub(crate) async fn run(
                 }
                 // All senders dropped, or an explicit Close: shut the task down.
                 Some(Cmd::Close) | None => {
-                    let _ = sinks.conn.send(false);
+                    publish_state(&sinks.conn, false);
                     return;
                 }
             },
@@ -343,6 +343,30 @@ async fn flush_tx(fsm: &mut Device, stream: &mut Option<TcpStream>) -> std::io::
     Ok(())
 }
 
+/// Publish a value on a state `watch`, waking consumers **only on an actual
+/// change**.
+///
+/// [`watch::Sender::send`] notifies on every call, even when the value it writes
+/// is the one already there. These channels carry *state* — is the link up, why
+/// won't it come up — and their consumers are documented as reacting to
+/// transitions. A device that accepts TCP but fails its handshake tears down
+/// once per retry, so the plain form republishes the same `false` on every
+/// backoff round, forever: a supervisor publishing an online/offline event would
+/// emit a fresh OFFLINE per device per retry for as long as the fleet is down.
+///
+/// The sender is only gone when the actor itself is, which consumers see as a
+/// `changed()` error — so suppressing a no-op write loses nothing.
+fn publish_state<T: PartialEq>(tx: &watch::Sender<T>, value: T) {
+    tx.send_if_modified(|current| {
+        if *current == value {
+            false
+        } else {
+            *current = value;
+            true
+        }
+    });
+}
+
 /// Drain `poll_event`, fanning each response out to the listener bus.
 /// Returns `true` if a `Disconnected` was seen (the connection was torn down).
 fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
@@ -350,9 +374,9 @@ fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
     while let Some(ev) = fsm.poll_event() {
         match ev {
             Event::Ready => {
-                let _ = sinks.conn.send(true);
+                publish_state(&sinks.conn, true);
                 // A healthy connection clears any stale auth-failure diagnostic.
-                let _ = sinks.autherr.send(None);
+                publish_state(&sinks.autherr, None);
             }
             Event::Response(msg) => {
                 // Latch the last non-empty frame as the current status (a `watch`,
@@ -366,7 +390,7 @@ fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
             }
             Event::Disconnected => {
                 tore_down = true;
-                let _ = sinks.conn.send(false);
+                publish_state(&sinks.conn, false);
             }
             Event::ProtocolError(e) => {
                 if e.is_auth_failure() {
@@ -379,7 +403,7 @@ fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
                     log::warn!(
                         "authentication failed ({e}): likely a wrong local key or protocol version"
                     );
-                    let _ = sinks.autherr.send(Some(e));
+                    publish_state(&sinks.autherr, Some(e));
                 } else {
                     log::debug!("protocol error: {e}");
                 }
