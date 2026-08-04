@@ -392,12 +392,17 @@ async fn flush_tx(
     stream: &mut Option<TcpStream>,
 ) -> std::io::Result<()> {
     while let Some(bytes) = fsm.poll_transmit() {
-        // Pairs with the `rx` line in `dispatch_events`: together they give a
-        // full wire transcript at `debug`, which is what a device that hangs up
-        // on a particular frame (a keepalive it dislikes, say) needs to be
-        // diagnosed. The frame is on the wire, so it is shown raw — decoding it
-        // here would hide exactly the malformation being hunted.
-        log::debug!("{id}: tx {} bytes: {:?}", bytes.len(), DebugBytes(&bytes));
+        // Pairs with the `rx` line in `dispatch_events`: together they are a full
+        // wire transcript, which is what a device that hangs up on a particular
+        // frame (a keepalive it dislikes, say) needs to be diagnosed. The frame
+        // is shown raw — decoding it here would hide exactly the malformation
+        // being hunted.
+        //
+        // `trace`, not `debug`: this is one line per frame per device, so at
+        // fleet scale it is a firehose, and `debug` is where an operator expects
+        // connection lifecycle. Reach for it deliberately, per crate
+        // (`RUST_LOG=rustuya_tokio=trace`).
+        log::trace!("{id}: tx {} bytes: {:?}", bytes.len(), DebugBytes(&bytes));
         // No socket to write to (torn down mid-drain) → drop the bytes; the core
         // re-establishes state on the next connect.
         if let Some(s) = stream.as_mut() {
@@ -449,7 +454,9 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
                 // split was wrong and everything after it is misaligned. The
                 // payload goes out as an escaped string — a *garbled* payload is
                 // exactly the case worth seeing, so it must not be assumed UTF-8.
-                log::debug!(
+                //
+                // `trace` for the same reason as the `tx` line in `flush_tx`.
+                log::trace!(
                     "{id}: rx cmd=0x{:02x} seqno={} retcode={:?} len={} payload={:?}",
                     msg.cmd,
                     msg.seqno,
