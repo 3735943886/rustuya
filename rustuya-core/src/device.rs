@@ -1077,6 +1077,65 @@ mod tests {
         assert!(dev.poll_event().is_none());
     }
 
+    /// A discovery wake resolves `Auto`. Without this the core never learns a
+    /// version at all (it does not probe), so an unresolved v3.4 device runs the
+    /// v3.3 dialect forever — connecting, because v3.3 has no handshake to fail,
+    /// and then being hung up on at the first frame.
+    #[test]
+    fn a_discovery_wake_resolves_an_auto_version() {
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg_with(Version::Auto, true, zero_backoff()));
+        dev.handle_input(Input::ConnectFailed, T0, &mut rng); // → Backoff
+
+        dev.handle_input(
+            Input::ConnectNow {
+                version: Some(Version::V3_4),
+            },
+            T0,
+            &mut rng,
+        );
+        assert_eq!(dev.cfg.version, Version::V3_4, "announcement not adopted");
+        assert!(dev.wants_connect(), "and the wake still redials");
+    }
+
+    /// An operator who wrote a version gets it. `Auto` is the one value meaning
+    /// "I don't know", so it is the only one a device's own claim may overwrite —
+    /// otherwise a misreporting device would silently override the config that
+    /// was put there to work around it.
+    #[test]
+    fn a_configured_version_outranks_the_announced_one() {
+        let mut rng = SeededRng(1);
+        let mut dev = Device::new(cfg_with(Version::V3_3, true, zero_backoff()));
+        dev.handle_input(Input::ConnectFailed, T0, &mut rng);
+
+        dev.handle_input(
+            Input::ConnectNow {
+                version: Some(Version::V3_5),
+            },
+            T0,
+            &mut rng,
+        );
+        assert_eq!(dev.cfg.version, Version::V3_3);
+    }
+
+    /// The version selects the framing, the cipher, and whether a session key
+    /// exists, so adopting one mid-session would invalidate the key in use. A
+    /// live link keeps what demonstrably works; the next dial can differ.
+    #[test]
+    fn an_announced_version_is_not_adopted_under_a_live_connection() {
+        let mut rng = SeededRng(1);
+        let mut dev = connected(cfg(Version::Auto), &mut rng);
+        dev.handle_input(
+            Input::ConnectNow {
+                version: Some(Version::V3_4),
+            },
+            T0,
+            &mut rng,
+        );
+        assert_eq!(dev.cfg.version, Version::Auto);
+        assert!(dev.is_connected());
+    }
+
     // -- heartbeat / idle liveness (P4/P5) -----------------------------------
 
     fn cfg_live(heartbeat: Option<Duration>, idle_timeout: Option<Duration>) -> Config {

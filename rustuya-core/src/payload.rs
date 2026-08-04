@@ -200,6 +200,30 @@ mod tests {
         assert_eq!(back, plain, "{version:?} cmd={cmd:#x}");
     }
 
+    /// A device configured `Auto` must read what a **real v3.3 device** sends —
+    /// which is the only thing that matters, since `Auto` exists precisely for a
+    /// device whose version nobody wrote down.
+    ///
+    /// A same-version round-trip cannot catch this: it encodes and decodes with
+    /// the same (wrong) header bytes and passes happily. So this encodes as
+    /// v3.3 and decodes as `Auto`, the asymmetry that is the actual wire.
+    #[test]
+    fn auto_reads_a_real_v33_devices_headered_push() {
+        let cipher = TuyaCipher::new(KEY).unwrap();
+        let plain = br#"{"dps":{"1":true},"t":1785806850}"#;
+        let body = encode_payload(Version::V3_3, HDR_CMD, plain, &cipher).unwrap();
+        assert_eq!(&body[..3], b"3.3", "a v3.3 device heads its payload '3.3'");
+
+        let back = decode_payload(Version::Auto, &body, &cipher).unwrap();
+        assert_eq!(
+            back,
+            plain,
+            "an Auto-configured device could not decode a v3.3 payload; it came \
+             back as {} bytes of undecrypted body",
+            back.len()
+        );
+    }
+
     #[test]
     fn roundtrips_every_version_with_and_without_header() {
         for v in [

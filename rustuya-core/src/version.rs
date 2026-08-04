@@ -241,6 +241,16 @@ mod tests {
         assert_eq!(&Version::V3_4.header(), b"3.4\0\0\0\0\0\0\0\0\0\0\0\0");
     }
 
+    /// `Auto` runs v3.3's profile, so it must stamp v3.3's header. Built from
+    /// `as_str()` it stamped `"aut"`, which is on no device's wire in either
+    /// direction: the device's own headered pushes stopped matching, and every
+    /// headered command went out mislabelled.
+    #[test]
+    fn auto_stamps_the_v33_header_not_its_own_name() {
+        assert_eq!(&Version::Auto.header(), b"3.3\0\0\0\0\0\0\0\0\0\0\0\0");
+        assert_eq!(Version::Auto.header(), Version::V3_3.header());
+    }
+
     #[test]
     fn profiles_capture_the_version_matrix() {
         // v3.3: 55AA + CRC, ECB, header outside ciphertext, no session key.
