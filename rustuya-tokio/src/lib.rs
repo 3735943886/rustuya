@@ -703,7 +703,13 @@ impl Device {
     pub async fn connect_now(&self) {
         // No address: keep the current dial target (only the rewake forwarder,
         // which has a freshly-announced IP, supplies one).
-        let _ = self.cmd_tx.send(Cmd::ConnectNow { addr: None }).await;
+        let _ = self
+            .cmd_tx
+            .send(Cmd::ConnectNow {
+                addr: None,
+                version: None,
+            })
+            .await;
     }
 
     /// Gracefully stop the driver task. Idempotent; further requests error with

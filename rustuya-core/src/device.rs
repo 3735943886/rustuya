@@ -126,7 +126,15 @@ pub enum Input<'a> {
     /// The backoff *attempt* counter is left intact, so repeated wakes (a flapping
     /// device, or `connect_now` spam) can't defeat the escalation; a successful
     /// connection resets it.
-    ConnectNow,
+    ///
+    /// `version` carries what the device *announced* about itself, when the wake
+    /// came from discovery. This is how [`Version::Auto`] is resolved: the core
+    /// never probes (P7), so a device configured without a version would
+    /// otherwise speak v3.3 forever — fine for a v3.3 device, fatal for a v3.4
+    /// one, which accepts the TCP connection and then hangs up on the first
+    /// frame that skipped its session handshake. An explicit `connect_now()`
+    /// passes `None` and changes nothing.
+    ConnectNow { version: Option<Version> },
     /// The connection was closed / dropped.
     Closed,
 }
@@ -211,7 +219,7 @@ impl Device {
             Input::ConnectFailed => self.on_connect_failed(now, rng),
             Input::Received(data) => self.on_received(data, now, rng),
             Input::Send { cmd, data, cid, t } => self.on_send(cmd, data, cid, t, now, rng),
-            Input::ConnectNow => self.on_connect_now(),
+            Input::ConnectNow { version } => self.on_connect_now(version),
             Input::Closed => self.on_closed(now, rng),
         }
     }
@@ -356,7 +364,23 @@ impl Device {
         }
     }
 
-    fn on_connect_now(&mut self) {
+    fn on_connect_now(&mut self, announced: Option<Version>) {
+        // Adopt an announced version, but only while the link is down: it selects
+        // the framing, the cipher and whether a session is negotiated, so
+        // swapping it under a live connection would invalidate the session key
+        // mid-stream. A device that announces a *different* version than the one
+        // currently working is answered on the next dial, not this instant.
+        //
+        // Configuration still wins — `Auto` is the one value that means "I don't
+        // know", so it is the only one discovery may overwrite. An operator who
+        // wrote `3.3` gets v3.3 even if the device's own announcement disagrees.
+        if let Some(v) = announced
+            && self.cfg.version == Version::Auto
+            && v != Version::Auto
+            && !matches!(self.state, State::Connected | State::Handshaking)
+        {
+            self.cfg.version = v;
+        }
         // Cancel a backoff wait and revive a terminal `Closed`; the driver then
         // dials (`wants_connect`). The backoff *attempt* counter is left intact —
         // a flapping device or repeated `connect_now` can't reset the escalation;
@@ -1005,7 +1029,7 @@ mod tests {
         assert!(!dev.wants_connect());
 
         // Woken (LAN sighting or explicit connect_now) → skip the 30 s wait.
-        dev.handle_input(Input::ConnectNow, T0, &mut rng);
+        dev.handle_input(Input::ConnectNow { version: None }, T0, &mut rng);
         assert!(dev.wants_connect());
         assert_eq!(dev.poll_timeout(), None);
     }
@@ -1021,7 +1045,7 @@ mod tests {
         assert!(!dev.wants_connect(), "terminal Closed");
         assert_eq!(dev.poll_timeout(), None);
 
-        dev.handle_input(Input::ConnectNow, T0, &mut rng);
+        dev.handle_input(Input::ConnectNow { version: None }, T0, &mut rng);
         assert!(dev.wants_connect(), "revived → wants to dial");
     }
 
@@ -1039,7 +1063,7 @@ mod tests {
         let _ = drain_events(&mut dev);
         dev.handle_input(Input::Closed, T0, &mut rng); // attempt 0 → 2 s
         assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(2)));
-        dev.handle_input(Input::ConnectNow, T0, &mut rng); // → Connecting, counter intact
+        dev.handle_input(Input::ConnectNow { version: None }, T0, &mut rng); // → Connecting, counter intact
         dev.handle_input(Input::ConnectFailed, T0, &mut rng); // attempt 1 → 4 s, not reset to 2 s
         assert_eq!(dev.poll_timeout(), Some(T0 + Duration::from_secs(4)));
     }
@@ -1048,7 +1072,7 @@ mod tests {
     fn connect_now_is_noop_when_connected() {
         let mut rng = SeededRng(1);
         let mut dev = connected(cfg(Version::V3_3), &mut rng);
-        dev.handle_input(Input::ConnectNow, T0, &mut rng);
+        dev.handle_input(Input::ConnectNow { version: None }, T0, &mut rng);
         assert!(dev.is_connected());
         assert!(dev.poll_event().is_none());
     }

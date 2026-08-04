@@ -26,6 +26,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
+use rustuya_core::Version;
 use rustuya_core::discovery::{Config as CoreConfig, Discovery as DiscoveryFsm, Event, Input};
 use rustuya_core::time::Instant as CoreInstant;
 
@@ -632,8 +633,14 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
                     .lock()
                     .unwrap()
                     .insert(info.id.clone(), (info.clone(), StdInstant::now()));
-                // Changed/new: wake the registered device at its announced address.
-                route_wake(&sinks.routes, &info.id, Some(&info.ip.to_string()));
+                // Changed/new: wake the registered device at its announced
+                // address, and tell it what the announcement said it speaks.
+                route_wake(
+                    &sinks.routes,
+                    &info.id,
+                    Some(&info.ip.to_string()),
+                    info.version,
+                );
                 let _ = sinks.found_tx.send(info);
             }
             // Same-IP re-announcement. Wake with the address discovery already
@@ -647,13 +654,17 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
             // device keeps announcing, because every announcement refreshes the
             // cache entry and so the TTL never expires.
             Event::Seen(id) => {
-                let ip = sinks
+                let announced = sinks
                     .known
                     .lock()
                     .unwrap()
                     .get(&id)
-                    .map(|(info, _)| info.ip.to_string());
-                route_wake(&sinks.routes, &id, ip.as_deref());
+                    .map(|(info, _)| (info.ip.to_string(), info.version));
+                let (ip, version) = match announced {
+                    Some((ip, version)) => (Some(ip), version),
+                    None => (None, None),
+                };
+                route_wake(&sinks.routes, &id, ip.as_deref(), version);
             }
         }
     }
@@ -661,9 +672,15 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
 
 /// Wake the device registered under `id`, if any: a non-blocking `try_send` of
 /// `ConnectNow`, carrying `ip` (joined to the registered port) when the address
-/// may have changed. A closed channel means the actor is gone → prune the route;
-/// a full channel means it's busy → drop this wake (another announcement follows).
-fn route_wake(routes: &Routes, id: &str, ip: Option<&str>) {
+/// may have changed, and `version` when the announcement declared one. A closed
+/// channel means the actor is gone → prune the route; a full channel means it's
+/// busy → drop this wake (another announcement follows).
+///
+/// The version matters as much as the address for a device configured
+/// `Version::Auto`: the core never probes, so an unresolved device speaks v3.3
+/// at everything, and a v3.4 device accepts that TCP connection before hanging up
+/// on the first frame that skipped its handshake.
+fn route_wake(routes: &Routes, id: &str, ip: Option<&str>, version: Option<Version>) {
     use tokio::sync::mpsc::error::TrySendError;
     let mut map = routes.lock().unwrap();
     let Some(route) = map.get(id) else { return };
@@ -674,7 +691,7 @@ fn route_wake(routes: &Routes, id: &str, ip: Option<&str>) {
         map.remove(id);
         return;
     };
-    match cmd_tx.try_send(Cmd::ConnectNow { addr }) {
+    match cmd_tx.try_send(Cmd::ConnectNow { addr, version }) {
         Ok(()) | Err(TrySendError::Full(_)) => {}
         Err(TrySendError::Closed(_)) => {
             map.remove(id);
@@ -707,11 +724,11 @@ mod tests {
 
         // While the device is alive the wake is delivered — carrying the announced
         // IP rejoined to the registered port — and the route stays.
-        route_wake(&routes, "dev", Some("192.168.1.5"));
+        route_wake(&routes, "dev", Some("192.168.1.5"), None);
         assert!(
             matches!(
                 cmd_rx.try_recv(),
-                Ok(Cmd::ConnectNow { addr: Some(a) }) if a == "192.168.1.5:6668"
+                Ok(Cmd::ConnectNow { addr: Some(a), .. }) if a == "192.168.1.5:6668"
             ),
             "a live route should have been woken at the announced address"
         );
@@ -723,7 +740,7 @@ mod tests {
 
         // The owner releases the device: no strong sender left to upgrade to.
         drop(cmd_tx);
-        route_wake(&routes, "dev", None);
+        route_wake(&routes, "dev", None, None);
         assert!(
             routes.lock().unwrap().is_empty(),
             "the route of a departed device must be pruned by the wake that finds it dead"
@@ -731,6 +748,6 @@ mod tests {
 
         // And waking an id that is no longer registered is a no-op, not a panic —
         // every later announcement for that device takes this path.
-        route_wake(&routes, "dev", Some("192.168.1.5"));
+        route_wake(&routes, "dev", Some("192.168.1.5"), None);
     }
 }

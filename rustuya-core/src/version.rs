@@ -53,10 +53,22 @@ impl Version {
     /// The 15-byte version header some versions prepend to the payload
     /// (`"3.x"` + 12 zero bytes). Only meaningful where
     /// [`Profile::header`] is not [`HeaderPos::None`].
+    ///
+    /// [`Auto`](Self::Auto) stamps **v3.3's** header, because that is the
+    /// profile it runs (see [`profile`](Self::profile)). Deriving the bytes from
+    /// `as_str()` instead made it `"aut"`, which no device sends and none
+    /// accepts: an `Auto` device's own pushes stopped being recognised as
+    /// headered, so the header was never stripped, the remaining bytes were not
+    /// a whole number of AES blocks, and the payload came back to the caller as
+    /// raw ciphertext.
     #[must_use]
     pub fn header(self) -> [u8; 15] {
         let mut h = [0u8; 15];
-        h[..3].copy_from_slice(&self.as_str().as_bytes()[..3]);
+        let wire = match self {
+            Version::Auto => Version::V3_3,
+            v => v,
+        };
+        h[..3].copy_from_slice(&wire.as_str().as_bytes()[..3]);
         h
     }
 

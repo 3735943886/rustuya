@@ -81,7 +81,13 @@ pub(crate) enum Cmd {
     /// both are the core's `Input::ConnectNow`. `addr` carries a freshly-discovered
     /// dial target (`Some` from the rewake forwarder when the device re-announces a
     /// possibly-changed IP); `None` (explicit `connect_now`) keeps the current one.
-    ConnectNow { addr: Option<String> },
+    ConnectNow {
+        addr: Option<String>,
+        /// What the device announced about itself, when discovery raised this
+        /// wake. Resolves a `Version::Auto` config — see the core's
+        /// `Input::ConnectNow`. `None` from an explicit `connect_now()`.
+        version: Option<rustuya_core::Version>,
+    },
     /// Graceful shutdown: exit the task.
     Close,
 }
@@ -251,11 +257,11 @@ pub(crate) async fn run(
                 // rewake may carry a freshly-discovered address — adopt it so an
                 // IP change (DHCP renewal, etc.) redials the *new* target rather
                 // than the stale one fixed at spawn.
-                Some(Cmd::ConnectNow { addr: new_addr }) => {
+                Some(Cmd::ConnectNow { addr: new_addr, version }) => {
                     if let Some(a) = new_addr {
                         addr = a;
                     }
-                    fsm.handle_input(Input::ConnectNow, now_since(base), &mut rng);
+                    fsm.handle_input(Input::ConnectNow { version }, now_since(base), &mut rng);
                 }
                 // All senders dropped, or an explicit Close: shut the task down.
                 Some(Cmd::Close) | None => {
@@ -320,10 +326,16 @@ async fn await_permit(
                 // the dial we're queued for targets the *current* IP rather than
                 // the stale one. The `ConnectNow` itself is a no-op — the FSM is
                 // already in `Connecting`, which is why we're here.
-                Some(Cmd::ConnectNow { addr: new_addr }) => {
+                Some(Cmd::ConnectNow { addr: new_addr, .. }) => {
                     if let Some(a) = new_addr {
                         *addr = a;
                     }
+                    // The announced version is dropped here: the FSM isn't
+                    // reachable from this arm, and it would refuse the wake
+                    // anyway (we are queued *because* it is already in
+                    // `Connecting`). A device announces repeatedly, so the next
+                    // one carries it again — at worst one dial goes out on the
+                    // configured version.
                 }
                 // Dropped exactly as the main loop drops a `Fire` while down:
                 // the caller reads device state off the listener bus.
@@ -529,7 +541,10 @@ mod permit_tests {
         // is exactly the command traffic a down device sees.
         for _ in 0..8 {
             senders[0]
-                .send(Cmd::ConnectNow { addr: None })
+                .send(Cmd::ConnectNow {
+                    addr: None,
+                    version: None,
+                })
                 .await
                 .unwrap();
             tokio::task::yield_now().await;
@@ -565,6 +580,7 @@ mod permit_tests {
         cmd_tx
             .send(Cmd::ConnectNow {
                 addr: Some("192.168.1.9:6668".to_string()),
+                version: None,
             })
             .await
             .unwrap();
