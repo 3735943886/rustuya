@@ -35,6 +35,37 @@ use rustuya_core::message::Message;
 use rustuya_core::time::Instant as CoreInstant;
 use rustuya_core::{CommandType, CoreError};
 
+/// Formats arbitrary bytes for a log line: printable ASCII as-is, everything
+/// else as `\xNN`. Bytes off a device are only *hoped* to be UTF-8 — when they
+/// are not, that is precisely what needs reading — so `String::from_utf8_lossy`
+/// is the wrong tool: it replaces every bad byte with the same U+FFFD and erases
+/// the evidence. Truncated so one malformed frame cannot flood a log.
+struct DebugBytes<'a>(&'a [u8]);
+
+impl core::fmt::Debug for DebugBytes<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write as _;
+        /// Enough to show a JSON envelope's shape, a version header, or the
+        /// leading block of a misdecrypted payload.
+        const MAX: usize = 160;
+        let shown = &self.0[..self.0.len().min(MAX)];
+        f.write_char('"')?;
+        for &b in shown {
+            match b {
+                b'"' => f.write_str("\\\"")?,
+                b'\\' => f.write_str("\\\\")?,
+                0x20..=0x7e => f.write_char(char::from(b))?,
+                _ => write!(f, "\\x{b:02x}")?,
+            }
+        }
+        f.write_char('"')?;
+        if self.0.len() > MAX {
+            write!(f, "…(+{} bytes)", self.0.len() - MAX)?;
+        }
+        Ok(())
+    }
+}
+
 /// A command handed from a [`Device`](crate::Device) handle to its actor task.
 pub(crate) enum Cmd {
     /// Fire a protocol command at the device. `cid` addresses a gateway sub-device;
@@ -125,6 +156,9 @@ pub(crate) async fn run(
         conn: conn_tx,
         autherr: autherr_tx,
     };
+    // Every log line this task emits is prefixed with it: one bridge drives a
+    // whole fleet through identical code, so an unattributed line is unreadable.
+    let id = core.device_id.clone();
     let mut fsm = Device::new(core);
     // A Send CSPRNG (ChaCha), seeded from the OS. One instance for the task's
     // lifetime is fine: its period dwarfs any device's frame count, and pinning
@@ -165,7 +199,7 @@ pub(crate) async fn run(
                     fsm.handle_input(Input::Connected, now_since(base), &mut rng);
                 }
                 Ok(Err(e)) => {
-                    log::debug!("connect {addr} failed: {e}");
+                    log::debug!("{id}: connect {addr} failed: {e}");
                     stream = None;
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
                     // Ask discovery to re-elicit: the address may be stale, or this
@@ -175,7 +209,7 @@ pub(crate) async fn run(
                     }
                 }
                 Err(_) => {
-                    log::debug!("connect {addr} timed out");
+                    log::debug!("{id}: connect {addr} timed out");
                     stream = None;
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
                     if let Some(w) = &want_scan {
@@ -183,7 +217,7 @@ pub(crate) async fn run(
                     }
                 }
             }
-            settle(&mut fsm, &mut stream, &sinks, base, &mut rng).await;
+            settle(&id, &mut fsm, &mut stream, &sinks, base, &mut rng).await;
             // A failed dial (or a v3.1–v3.3 connect, which needs no handshake)
             // already resolved the attempt — give the slot back now.
             if !fsm.is_establishing() {
@@ -230,10 +264,17 @@ pub(crate) async fn run(
                 }
             },
             r = read_some(&mut stream, &mut rbuf), if stream.is_some() => match r {
-                Ok(0) => fsm.handle_input(Input::Closed, now_since(base), &mut rng), // peer EOF
+                Ok(0) => {
+                    // Peer EOF. Worth a line of its own: "the device hung up on
+                    // us" and "we timed out on a silent link" produce the same
+                    // offline state but have opposite causes, and without this
+                    // the first one is completely silent.
+                    log::debug!("{id}: peer closed the connection");
+                    fsm.handle_input(Input::Closed, now_since(base), &mut rng);
+                }
                 Ok(n) => fsm.handle_input(Input::Received(&rbuf[..n]), now_since(base), &mut rng),
                 Err(e) => {
-                    log::debug!("read error: {e}");
+                    log::debug!("{id}: read error: {e}");
                     fsm.handle_input(Input::Closed, now_since(base), &mut rng);
                 }
             },
@@ -242,7 +283,7 @@ pub(crate) async fn run(
             }
         }
 
-        settle(&mut fsm, &mut stream, &sinks, base, &mut rng).await;
+        settle(&id, &mut fsm, &mut stream, &sinks, base, &mut rng).await;
         // The handshake finished, timed out, or the link dropped: in every case
         // the establishment window is over and the slot belongs to the next
         // device in line.
@@ -307,6 +348,7 @@ async fn read_some(stream: &mut Option<TcpStream>, buf: &mut [u8]) -> std::io::R
 /// which enqueues `Disconnected` for us to dispatch), so the loop runs at most twice
 /// and always leaves the FSM's queues empty.
 async fn settle(
+    id: &str,
     fsm: &mut Device,
     stream: &mut Option<TcpStream>,
     sinks: &Sinks,
@@ -315,8 +357,8 @@ async fn settle(
 ) {
     loop {
         // Bytes out. A write failure is just another `Closed` input to the core.
-        if let Err(e) = flush_tx(fsm, stream).await {
-            log::debug!("write error: {e}");
+        if let Err(e) = flush_tx(id, fsm, stream).await {
+            log::debug!("{id}: write error: {e}");
             *stream = None;
             fsm.handle_input(Input::Closed, now_since(base), rng);
             // The Closed produced a Disconnected event; dispatch it next turn.
@@ -324,7 +366,7 @@ async fn settle(
         }
         // Events out. If the core tore the connection down, drop the socket so the
         // next dial gets a fresh one.
-        if dispatch_events(fsm, sinks) {
+        if dispatch_events(id, fsm, sinks) {
             *stream = None;
         }
         return;
@@ -332,8 +374,18 @@ async fn settle(
 }
 
 /// Drain `poll_transmit` to the socket. Errors surface for the `Closed` re-feed.
-async fn flush_tx(fsm: &mut Device, stream: &mut Option<TcpStream>) -> std::io::Result<()> {
+async fn flush_tx(
+    id: &str,
+    fsm: &mut Device,
+    stream: &mut Option<TcpStream>,
+) -> std::io::Result<()> {
     while let Some(bytes) = fsm.poll_transmit() {
+        // Pairs with the `rx` line in `dispatch_events`: together they give a
+        // full wire transcript at `debug`, which is what a device that hangs up
+        // on a particular frame (a keepalive it dislikes, say) needs to be
+        // diagnosed. The frame is on the wire, so it is shown raw — decoding it
+        // here would hide exactly the malformation being hunted.
+        log::debug!("{id}: tx {} bytes: {:?}", bytes.len(), DebugBytes(&bytes));
         // No socket to write to (torn down mid-drain) → drop the bytes; the core
         // re-establishes state on the next connect.
         if let Some(s) = stream.as_mut() {
@@ -369,7 +421,7 @@ fn publish_state<T: PartialEq>(tx: &watch::Sender<T>, value: T) {
 
 /// Drain `poll_event`, fanning each response out to the listener bus.
 /// Returns `true` if a `Disconnected` was seen (the connection was torn down).
-fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
+fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
     let mut tore_down = false;
     while let Some(ev) = fsm.poll_event() {
         match ev {
@@ -379,6 +431,20 @@ fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
                 publish_state(&sinks.autherr, None);
             }
             Event::Response(msg) => {
+                // One line per decoded frame, for diagnosing a device whose
+                // payloads come out wrong. The retcode is the tell: the decoder
+                // splits it off by protocol rule, so a nonsense value means the
+                // split was wrong and everything after it is misaligned. The
+                // payload goes out as an escaped string — a *garbled* payload is
+                // exactly the case worth seeing, so it must not be assumed UTF-8.
+                log::debug!(
+                    "{id}: rx cmd=0x{:02x} seqno={} retcode={:?} len={} payload={:?}",
+                    msg.cmd,
+                    msg.seqno,
+                    msg.retcode,
+                    msg.payload.len(),
+                    DebugBytes(&msg.payload),
+                );
                 // Latch the last non-empty frame as the current status (a `watch`,
                 // last-value-wins) so a consumer can read "current DPS" without
                 // keeping up with the lossy bus; skip bare acks so an empty payload
@@ -401,11 +467,12 @@ fn dispatch_events(fsm: &mut Device, sinks: &Sinks) -> bool {
                     // `ProtocolError` precedes the vaguer `Disconnected`), and
                     // warn-log it.
                     log::warn!(
-                        "authentication failed ({e}): likely a wrong local key or protocol version"
+                        "{id}: authentication failed ({e}): likely a wrong local key or \
+                         protocol version"
                     );
                     publish_state(&sinks.autherr, Some(e));
                 } else {
-                    log::debug!("protocol error: {e}");
+                    log::debug!("{id}: protocol error: {e}");
                 }
             }
         }
