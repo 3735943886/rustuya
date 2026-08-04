@@ -610,8 +610,9 @@ async fn run(
 /// Push out probes (each from the socket bound to its tagged source) and process
 /// events. `Found` updates the `known` map, fans out to the announcement bus, and
 /// wakes a registered device at its **new** address; `Seen` is a same-IP liveness
-/// tick that wakes a registered device at its current address (①). Both wakes are
-/// O(1) targeted `try_send`s — never blocking, never a broadcast fan-out.
+/// tick that wakes a registered device at the address discovery already holds for
+/// it (①). Both wakes are O(1) targeted `try_send`s — never blocking, never a
+/// broadcast fan-out.
 async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
     while let Some((bytes, port, source)) = fsm.poll_transmit() {
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, port));
@@ -635,8 +636,25 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
                 route_wake(&sinks.routes, &info.id, Some(&info.ip.to_string()));
                 let _ = sinks.found_tx.send(info);
             }
-            // Same-IP re-announcement: wake to redial the *current* address.
-            Event::Seen(id) => route_wake(&sinks.routes, &id, None),
+            // Same-IP re-announcement. Wake with the address discovery already
+            // holds rather than a bare "redial whatever you have": `Seen` means
+            // the announcement *matched* the cache, so the cached address is by
+            // definition the device's current one — passing it can never be
+            // wrong, and it is the only thing that can relocate a device
+            // registered *after* the cache entry was made. Such a device may be
+            // parked on a placeholder address with no way off it: `Found` (the
+            // only other carrier of an address) will not fire again while the
+            // device keeps announcing, because every announcement refreshes the
+            // cache entry and so the TTL never expires.
+            Event::Seen(id) => {
+                let ip = sinks
+                    .known
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .map(|(info, _)| info.ip.to_string());
+                route_wake(&sinks.routes, &id, ip.as_deref());
+            }
         }
     }
 }
