@@ -16,10 +16,11 @@ use crate::protocol::{
 };
 use crate::scanner::get as get_scanner;
 use log::{debug, error, info, trace, warn};
+use portable_atomic::AtomicU64;
 use rand::Rng;
 use serde_json::Value;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -39,6 +40,10 @@ use super::{
 /// 0–5s initial-connect jitter is only applied when multiple devices are being
 /// constructed in quick succession (the thundering-herd case it exists for).
 /// A single-device caller pays no jitter.
+// `portable_atomic::AtomicU64` (rather than `std`'s) so targets without
+// native 64-bit atomics — e.g. `armv5te-unknown-linux-musleabi` — fall back
+// to a lock-based emulation instead of failing to compile. It compiles to
+// the native instruction everywhere else.
 static LAST_DEVICE_CONSTRUCT_MS: AtomicU64 = AtomicU64::new(0);
 
 /// If another device was constructed within this window, the new device gets
