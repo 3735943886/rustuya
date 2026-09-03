@@ -654,8 +654,8 @@ impl DeviceEventReceiver {
         loop {
             match receive_event(py, &self.inner, timeout_ms)? {
                 Some(Ok(msg)) => return Ok(Some(message_to_dict(py, &self.id, &msg)?)),
-                Some(Err(e)) => {
-                    log::warn!("Listener error for device {}: {}", self.id, e);
+                Some(Err(_e)) => {
+                    log::warn!("Listener error while receiving device event (details redacted)");
                     if timeout_ms.is_some() {
                         // With a timeout the caller expects at most one
                         // recv attempt; propagating an error as None would
