@@ -28,6 +28,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Facade crate for the sans-I/O rustuya Tuya local-protocol library: re-exports driver crates behind features"
 repository.workspace = true
+readme.workspace = true
 
 [features]
 default = []

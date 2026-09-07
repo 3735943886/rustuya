@@ -14,6 +14,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Tokio driver for the sans-I/O rustuya-core Tuya protocol FSM"
 repository.workspace = true
+readme.workspace = true
 
 [lib]
 name = "rustuya_tokio"

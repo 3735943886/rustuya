@@ -10,6 +10,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Sans-I/O no_std core for the Tuya local protocol (protocol, crypto, state machines)"
 repository.workspace = true
+readme.workspace = true
 
 [lib]
 name = "rustuya_core"
