@@ -8,18 +8,18 @@
 # root workspace (alongside rustuya-core).
 [package]
 name = "rustuya-tokio"
-version = "0.4.0-dev"
-edition = "2024"
-rust-version = "1.88"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Tokio driver for the sans-I/O rustuya-core Tuya protocol FSM"
-repository = "https://github.com/3735943886/rustuya"
+repository.workspace = true
 
 [lib]
 name = "rustuya_tokio"
 
 [dependencies]
-rustuya-core = { path = "../rustuya-core" }
+rustuya-core = { workspace = true }
 tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 # BroadcastStream, so `listener()` is a `Stream` (README `.next().await` idiom).
 tokio-stream = { version = "0.1", features = ["sync"] }

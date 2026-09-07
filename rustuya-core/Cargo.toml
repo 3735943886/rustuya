@@ -4,12 +4,12 @@
 # with `now` and the RNG injected by the driver. A member of the root workspace.
 [package]
 name = "rustuya-core"
-version = "0.4.0-dev"
-edition = "2024"
-rust-version = "1.88"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Sans-I/O no_std core for the Tuya local protocol (protocol, crypto, state machines)"
-repository = "https://github.com/3735943886/rustuya"
+repository.workspace = true
 
 [lib]
 name = "rustuya_core"

@@ -6,7 +6,9 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
-The `0.4` sans-io line (branch `0.4-sansio`); unreleased.
+## [0.4.0-beta.1]
+
+The `0.4` sans-io line (branch `0.4-sansio`) — first pre-release.
 
 ### Added
 

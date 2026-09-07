@@ -27,16 +27,23 @@ stops at the local protocol layer those build on.
 
 | crate | what it is |
 |-------|------------|
+| [`rustuya`](rustuya) | facade — re-exports a driver crate behind a feature flag (`rustuya::tokio::*` today). The discoverable entry point; depend on this unless you specifically want to avoid the extra indirection. |
 | [`rustuya-core`](rustuya-core) | `no_std + alloc` protocol core — framing, crypto (v3.1–v3.5), and the connection + discovery state machines. No sockets, no timers, no clock: the driver injects `now` and an RNG. |
-| [`rustuya-tokio`](rustuya-tokio) | the `std` + tokio driver — TCP, UDP discovery, one timer per device, the OS RNG. |
+| [`rustuya-tokio`](rustuya-tokio) | the `std` + tokio driver — TCP, UDP discovery, one timer per device, the OS RNG. Depend on this directly instead of the facade if you want one fewer crate in the tree. |
 
 ## Quick start (tokio)
 
+```toml
+[dependencies]
+rustuya = { version = "0.4", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+```
+
 ```rust
-use rustuya_tokio::{Device, Event, Version};
+use rustuya::tokio::{Device, Event, Version};
 
 #[tokio::main]
-async fn main() -> rustuya_tokio::Result<()> {
+async fn main() -> rustuya::tokio::Result<()> {
     let dev = Device::builder("device_id_22chars0000", "0123456789abcdef")
         .address("192.168.1.50")
         .version(Version::V3_4)
@@ -77,7 +84,7 @@ One `Discovery` (below) serves them all, and a shared `ConnectLimiter` bounds th
 connect storm when a large fleet starts, or reconnects at once after a network blip:
 
 ```rust
-let limiter = rustuya_tokio::ConnectLimiter::new(128);
+let limiter = rustuya::tokio::ConnectLimiter::new(128);
 let dev = Device::builder(id, key).address(ip).connect_limiter(&limiter).connect()?;
 ```
 
@@ -91,7 +98,7 @@ Devices announce themselves over UDP; some only answer active probes. A shared
 `Discovery` handles both, and doubles as the reconnect fast-path.
 
 ```rust
-use rustuya_tokio::Discovery;
+use rustuya::tokio::Discovery;
 
 let disco = Discovery::new()?;
 
@@ -101,7 +108,7 @@ for info in disco.scan(std::time::Duration::from_secs(5)).await {
 }
 
 // Or resolve + connect without hand-typing an address (fills in ip and version):
-let dev = rustuya_tokio::Device::builder("device_id_22chars0000", "0123456789abcdef")
+let dev = rustuya::tokio::Device::builder("device_id_22chars0000", "0123456789abcdef")
     .discover(&disco, std::time::Duration::from_secs(10))
     .await?;
 ```

@@ -58,6 +58,14 @@ rustuya-core     no_std + alloc   protocol · crypto · Device FSM · Discovery 
 rustuya-tokio    std + tokio      thin driver: tokio TCP/UDP, one timer, RNG/clock
                                   injection over the FSMs
 rustuya-embassy  no_std           thin driver: embassy-net + embassy-time  (Phase 3)
+rustuya          facade           re-exports a driver crate behind a feature flag
+                                  (`tokio` today; `embassy`/`sync` add the same way
+                                  once those driver crates exist) under namespaced
+                                  modules (`rustuya::tokio::*`, ...) — keeps the
+                                  well-known crate name useful without merging a
+                                  driver into rustuya-core (which would reopen
+                                  Cargo's feature-unification hazard for no_std
+                                  builds). Publishes last, after its drivers.
 ```
 
 - **Core deps:** RustCrypto (`aes`/`aes-gcm`/`cipher`/`ecb`/`hmac`/`sha2`/`md-5`,

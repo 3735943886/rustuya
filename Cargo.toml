@@ -1,12 +1,30 @@
 # rustuya — a sans-I/O Tuya local-protocol library in pure Rust.
 #
-# Virtual workspace over the two 0.4 crates:
+# Virtual workspace over the 0.4 crates:
 #   * rustuya-core  — no_std + alloc core (protocol, crypto, Device/Discovery
 #                     state machines); driver injects `now` + RNG + sockets.
 #   * rustuya-tokio — the std + tokio driver over that core.
+#   * rustuya       — facade crate; re-exports a chosen driver behind a
+#                     feature flag (`rustuya::tokio::*`, ...) under the
+#                     well-known crate name. See rustuya/Cargo.toml.
 #
 # The 0.3 line (the monolithic `rustuya` crate + its Python bindings) lives on
 # `master` and the v0.3.x tags; 0.4 is a pure-Rust redesign — see MILESTONES.md.
 [workspace]
 resolver = "2"
-members = ["rustuya-core", "rustuya-tokio"]
+members = ["rustuya-core", "rustuya-tokio", "rustuya"]
+
+# Shared fields (workspace inheritance) — every member's `version` and its
+# internal path-deps' version requirements come from here, so a release bump
+# is one edit, not three. Members opt in with `field.workspace = true` /
+# `dep = { workspace = true, ... }`.
+[workspace.package]
+version = "0.4.0-beta.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/3735943886/rustuya"
+
+[workspace.dependencies]
+rustuya-core = { path = "rustuya-core", version = "0.4.0-beta.1" }
+rustuya-tokio = { path = "rustuya-tokio", version = "0.4.0-beta.1" }

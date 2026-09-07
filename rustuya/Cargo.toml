@@ -1,0 +1,37 @@
+# rustuya — the facade crate.
+#
+# Re-exports whichever driver crate(s) a consumer opts into, so the
+# well-known `rustuya` name stays the discoverable entry point without
+# merging a driver (tokio, embassy, ...) into `rustuya-core` itself. That
+# would reopen Cargo's feature-unification hazard: an optional `tokio`
+# feature living *inside* `rustuya-core` risks getting enabled by an
+# unrelated crate elsewhere in the build graph and leaking tokio into a
+# `no_std`/ESP32 build. A separate facade sidesteps this because an embedded
+# consumer depends on `rustuya-core` directly and never pulls this crate in
+# at all.
+#
+# Re-exports are namespaced per driver (`rustuya::tokio::*`, and later
+# `rustuya::embassy::*` / `rustuya::sync::*`), not flattened with a bare
+# `pub use driver::*` at the crate root — drivers expose similarly-named
+# types (`Device`, `Discovery`, ...), and Cargo features are additive, so
+# more than one driver feature can end up enabled in the same build graph.
+# Namespacing avoids the resulting symbol collision outright.
+#
+# Only `tokio` is wired today. `embassy`/`sync` are future driver slots
+# (see docs/MILESTONES.md "Target crate layout") — add them the same way
+# once those driver crates exist; this crate does not otherwise change.
+[package]
+name = "rustuya"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Facade crate for the sans-I/O rustuya Tuya local-protocol library: re-exports driver crates behind features"
+repository.workspace = true
+
+[features]
+default = []
+tokio = ["dep:rustuya-tokio"]
+
+[dependencies]
+rustuya-tokio = { workspace = true, optional = true }

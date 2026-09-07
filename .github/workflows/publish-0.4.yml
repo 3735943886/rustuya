@@ -1,0 +1,130 @@
+name: Publish 0.4
+
+# Release pipeline for the 0.4 sans-io line: rustuya-core, rustuya-tokio, and
+# the rustuya facade. Lives only on `0.4-sansio` — a `v0.4.*` tag pointing at
+# a commit on this branch's history runs the workflow file as it exists on
+# that commit, so this never collides with master's `publish.yml` (0.3.x +
+# Python), which lives on a disjoint history.
+#
+# Trusted Publishing (rust-lang/crates-io-auth-action) needs each of the 3
+# crate names registered as a pending publisher on crates.io before the first
+# tag push — that's a one-time crates.io-side setup, not something this file
+# can do.
+
+on:
+  push:
+    tags:
+      - 'v0.4.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify tag matches the workspace version
+        # All 3 members inherit `version.workspace = true` from
+        # `[workspace.package]` in the root Cargo.toml (single source of
+        # truth), so one check here covers all of them.
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          VER="$(grep -E '^version\s*=\s*"' Cargo.toml | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')"
+          if [ "$TAG" != "$VER" ]; then
+            echo "Version mismatch: tag v$TAG != workspace.package.version $VER"
+            exit 1
+          fi
+
+  publish:
+    needs: [verify-version]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # One OIDC-derived token for the whole job; each `cargo publish` below is
+      # checked crate-by-crate against crates.io's trusted-publisher config for
+      # this repo/workflow/environment. Revoked automatically when the job ends.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Read the workspace version
+        # All 3 members inherit this via `version.workspace = true`.
+        run: |
+          VER="$(grep -E '^version\s*=\s*"' Cargo.toml | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      # `|| echo` makes each publish idempotent: a version's first release is
+      # always published manually (crates.io Trusted Publishing can only be
+      # configured for a crate that already exists), so this workflow's first
+      # run against that same tag will find it already there. Real failures
+      # (bad credentials, a yanked/rejected package) still fail loudly, since
+      # `cargo publish` distinguishes "already uploaded" from other errors.
+      - name: Publish rustuya-core
+        run: cargo publish -p rustuya-core --locked || echo "Already published"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      # rustuya-tokio path-depends on rustuya-core with a version requirement,
+      # not just a path — cargo publish resolves that against the *published*
+      # index, so it has to actually be visible there first. Poll instead of a
+      # fixed sleep: this is external propagation latency, not app-side races.
+      - name: Wait for rustuya-core on the sparse index
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf "https://index.crates.io/ru/st/rustuya-core" | grep -q "\"vers\":\"$VER\""; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "rustuya-core $VER did not appear on the sparse index in time"
+          exit 1
+
+      - name: Publish rustuya-tokio
+        run: cargo publish -p rustuya-tokio --locked || echo "Already published"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Wait for rustuya-tokio on the sparse index
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf "https://index.crates.io/ru/st/rustuya-tokio" | grep -q "\"vers\":\"$VER\""; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "rustuya-tokio $VER did not appear on the sparse index in time"
+          exit 1
+
+      - name: Publish rustuya (facade)
+        run: cargo publish -p rustuya --locked || echo "Already published"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release:
+    needs: [publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Extract this release's section from CHANGELOG.md
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VER" '
+            $0 ~ ("^## \\[" ver "\\]") {f=1; print; next}
+            f && /^## \[/ {exit}
+            f {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "No section for $VER in CHANGELOG.md; using full file."
+            cp CHANGELOG.md RELEASE_NOTES.md
+          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: RELEASE_NOTES.md
+          # SemVer pre-releases all contain a `-` (e.g. 0.4.0-beta.1, 0.4.0-rc.1).
+          prerelease: ${{ contains(github.ref_name, '-') }}
