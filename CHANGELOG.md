@@ -6,6 +6,16 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.0-beta.2]
+
+### Fixed
+
+- **crates.io pages showed no README.** Each of the 3 crates' `Cargo.toml`
+  lacked a `readme` field, and no crate directory carried its own copy (only
+  the repo root does). `[workspace.package]` now declares `readme =
+  "README.md"`, inherited by all 3 via `readme.workspace = true`, so the
+  packaged tarball carries it from this version on.
+
 ## [0.4.0-beta.1]
 
 The `0.4` sans-io line (branch `0.4-sansio`) — first pre-release.

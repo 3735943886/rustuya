@@ -19,7 +19,7 @@ members = ["rustuya-core", "rustuya-tokio", "rustuya"]
 # is one edit, not three. Members opt in with `field.workspace = true` /
 # `dep = { workspace = true, ... }`.
 [workspace.package]
-version = "0.4.0-beta.1"
+version = "0.4.0-beta.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -27,5 +27,5 @@ repository = "https://github.com/3735943886/rustuya"
 readme = "README.md"
 
 [workspace.dependencies]
-rustuya-core = { path = "rustuya-core", version = "0.4.0-beta.1" }
-rustuya-tokio = { path = "rustuya-tokio", version = "0.4.0-beta.1" }
+rustuya-core = { path = "rustuya-core", version = "0.4.0-beta.2" }
+rustuya-tokio = { path = "rustuya-tokio", version = "0.4.0-beta.2" }
