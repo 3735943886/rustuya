@@ -16,7 +16,9 @@
 //!
 //! **Opt-in.** Spawns the `tuyamock` executable (`RUSTUYA_TUYAMOCK` or `PATH`);
 //! skips with a notice if absent. Each test uses its own TCP port so they run
-//! concurrently. Timing waits here are genuine temporal assertions (does the link
+//! concurrently. Ports sit **below** Linux's ephemeral range (32768-60999): inside
+//! it, any outgoing connection can be handed the mock's port first, and the mock
+//! then dies on `Address already in use` before the device ever sees it. Timing waits here are genuine temporal assertions (does the link
 //! survive past the device's idle window?), not sleeps papering over a race.
 
 mod common;
@@ -40,6 +42,9 @@ fn tuyamock_bin() -> String {
 /// A spawned tuyamock subprocess, killed on drop. `extra` carries the fault flags.
 struct Mock {
     child: Child,
+    /// The mock's stderr, kept so a failure can say *why* the mock is unreachable
+    /// (a port already taken, a bad flag) instead of a bare connect timeout.
+    log: std::path::PathBuf,
 }
 
 impl Mock {
@@ -58,8 +63,27 @@ impl Mock {
             ID,
         ]);
         cmd.args(extra);
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        cmd.spawn().ok().map(|child| Mock { child })
+        let log = std::env::temp_dir().join(format!(
+            "rustuya-tuyamock-{}-{port}.log",
+            std::process::id()
+        ));
+        let stderr = std::fs::File::create(&log)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        cmd.stdout(Stdio::null()).stderr(stderr);
+        cmd.spawn().ok().map(|child| Mock { child, log })
+    }
+
+    /// Whether the mock is still running, and what it printed to stderr — for a
+    /// failure message.
+    fn diagnose(&mut self) -> String {
+        let state = match self.child.try_wait() {
+            Ok(None) => "still running".to_string(),
+            Ok(Some(status)) => format!("exited early ({status})"),
+            Err(e) => format!("state unknown ({e})"),
+        };
+        let stderr = std::fs::read_to_string(&self.log).unwrap_or_default();
+        format!("mock {state}; stderr: {:?}", stderr.trim())
     }
 }
 
@@ -67,6 +91,7 @@ impl Drop for Mock {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.log);
     }
 }
 
@@ -125,10 +150,10 @@ fn builder(version: Version, port: u16) -> DeviceBuilder {
 async fn slow_device_responds_within_timeout() {
     // A 1s-per-response device must still round-trip under a 5s request timeout.
     let mock = skip_if_absent!(
-        Mock::spawn("3.3", 56760, &["--response-delay", "1"]),
+        Mock::spawn("3.3", 26760, &["--response-delay", "1"]),
         "slow device"
     );
-    let dev = builder(Version::V3_3, 56760)
+    let dev = builder(Version::V3_3, 26760)
         .send_timeout(Duration::from_secs(5))
         .connect()
         .unwrap();
@@ -154,13 +179,13 @@ async fn heartbeat_survives_device_idle_drop() {
     // open. auto_reconnect(false) makes survival unambiguous: if the keepalive
     // failed, the drop would be terminal and is_connected would go false.
     let mock = skip_if_absent!(
-        Mock::spawn("3.3", 56761, &["--idle-timeout", "2"]),
+        Mock::spawn("3.3", 26761, &["--idle-timeout", "2"]),
         "idle drop"
     );
     // auto_reconnect(false) makes survival unambiguous (a drop would be terminal),
     // but then the first dial must land — so wait for the mock to bind first.
-    wait_ready(56761).await;
-    let dev = builder(Version::V3_3, 56761)
+    wait_ready(26761).await;
+    let dev = builder(Version::V3_3, 26761)
         .heartbeat(Some(Duration::from_millis(500)))
         .idle_timeout(None)
         .auto_reconnect(false)
@@ -186,10 +211,10 @@ async fn recovers_after_device_goes_dark() {
     // must detect the silence and auto-reconnect must recover once the outage
     // clears — the P5 silent-drop path end to end.
     let mock = skip_if_absent!(
-        Mock::spawn("3.3", 56762, &["--go-dark-after", "1", "--outages", "1"]),
+        Mock::spawn("3.3", 26762, &["--go-dark-after", "1", "--outages", "1"]),
         "go dark"
     );
-    let dev = builder(Version::V3_3, 56762)
+    let dev = builder(Version::V3_3, 26762)
         .idle_timeout(Some(Duration::from_millis(800))) // detect the silent device fast
         .heartbeat(None)
         .send_timeout(Duration::from_secs(3))
@@ -229,10 +254,10 @@ async fn recovers_after_handshake_stall() {
     // v3.4 device that goes dark from connect (before the handshake completes) for
     // one outage: our handshake timeout must fire and auto-reconnect must recover.
     let mock = skip_if_absent!(
-        Mock::spawn("3.4", 56763, &["--go-dark-after", "0", "--outages", "1"]),
+        Mock::spawn("3.4", 26763, &["--go-dark-after", "0", "--outages", "1"]),
         "handshake stall"
     );
-    let dev = builder(Version::V3_4, 56763)
+    let dev = builder(Version::V3_4, 26763)
         .handshake_timeout(Some(Duration::from_millis(800)))
         .send_timeout(Duration::from_secs(4))
         .connect()
@@ -262,15 +287,15 @@ async fn misbehaving_seqno_does_not_break_anything() {
     // model reads replies off the listener bus and never inspects response seqnos,
     // so a device that stamps them wrongly must not perturb anything.
     for (i, mode) in ["zero", "global", "echo"].iter().enumerate() {
-        let port = 56770 + i as u16;
-        let mock = skip_if_absent!(
+        let port = 26770 + i as u16;
+        let mut mock = skip_if_absent!(
             Mock::spawn("3.4", port, &["--seqno-mode", mode]),
             format!("seqno {mode}")
         );
         let dev = builder(Version::V3_4, port).connect().unwrap();
-        dev.wait_connected(Duration::from_secs(5))
-            .await
-            .expect("connects");
+        if let Err(e) = dev.wait_connected(Duration::from_secs(5)).await {
+            panic!("seqno-mode {mode}: connects: {e}; {}", mock.diagnose());
+        }
 
         assert_eq!(
             dps_of(&common::query_dps(&dev).await)["1"],

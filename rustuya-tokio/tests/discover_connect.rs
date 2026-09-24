@@ -16,7 +16,7 @@ mod common;
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "discoverdevice000001";
 /// Discovery UDP port for this test (high, unlikely to collide).
-const DPORT: u16 = 56670;
+const DPORT: u16 = 26670;
 
 /// A plaintext 55AA announcement carrying the device's id, self-reported ip, and
 /// version — the shape `discover()` resolves address + version from.

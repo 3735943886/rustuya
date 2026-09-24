@@ -13,7 +13,7 @@ use rustuya_tokio::Discovery;
 
 /// A fixed high port, unlikely to collide with the real 6666/6667/7000 or with
 /// other tests. `SO_REUSEADDR`/`REUSEPORT` also lets it share if needed.
-const PORT: u16 = 56666;
+const PORT: u16 = 26666;
 
 /// A plaintext 55AA discovery datagram (`{gwId, ip, version}` JSON, CRC-framed).
 fn plaintext_announcement(id: &str, ip: &str, version: &str) -> Vec<u8> {

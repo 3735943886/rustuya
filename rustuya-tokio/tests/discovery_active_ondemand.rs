@@ -28,7 +28,7 @@ use rustuya_core::{CommandType, frame};
 use rustuya_tokio::Discovery;
 
 const PROBE_PORT: u16 = 7000; // the v3.5 probe port the "device" listens on
-const DISCO_PORT: u16 = 56674; // where the discovery receives announcements
+const DISCO_PORT: u16 = 26674; // where the discovery receives announcements
 
 fn announcement(id: &str, ip: &str) -> Vec<u8> {
     let json = format!(r#"{{"gwId":"{id}","ip":"{ip}","version":"3.3"}}"#);

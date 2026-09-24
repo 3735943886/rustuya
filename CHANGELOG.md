@@ -54,6 +54,12 @@ from a review of the `0.4-sansio` branch.
   wake on the shared handle.
 - A system clock set before 1970 now `warn`s once instead of silently stamping
   `t = 0` into every request.
+- **Flaky E2E tests:** the tuyamock / discovery tests bound fixed ports (567xx) inside
+  Linux's ephemeral range (32768–60999), so an unrelated outgoing connection could
+  be handed the port first; the mock then died on `Address already in use` (its
+  stderr was discarded) and the test only saw `connects: Timeout`. Ports moved below
+  the range, and a resilience-test connect failure now reports the mock's exit state
+  and stderr.
 
 ### Changed
 

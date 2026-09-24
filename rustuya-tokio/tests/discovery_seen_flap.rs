@@ -25,7 +25,7 @@ mod common;
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "seenflap0000000000001a";
-const DISCO_PORT: u16 = 56672;
+const DISCO_PORT: u16 = 26672;
 
 fn v33_response(json: &[u8]) -> Vec<u8> {
     let cipher = TuyaCipher::new(KEY).unwrap();

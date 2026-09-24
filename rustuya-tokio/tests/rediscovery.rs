@@ -23,7 +23,7 @@ mod common;
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "rediscover0000000001ab";
-const DISCO_PORT: u16 = 56670;
+const DISCO_PORT: u16 = 26670;
 
 /// A realistic v3.3 device reply: 55AA/CRC frame of `retcode(0) || ECB(json)`.
 fn v33_response(json: &[u8]) -> Vec<u8> {

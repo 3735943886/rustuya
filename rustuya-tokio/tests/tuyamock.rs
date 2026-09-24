@@ -134,28 +134,28 @@ async fn status_roundtrip(version: Version, wire: &str, port: u16) {
 
 #[tokio::test]
 async fn status_v31() {
-    status_roundtrip(Version::V3_1, "3.1", 56720).await;
+    status_roundtrip(Version::V3_1, "3.1", 26720).await;
 }
 
 #[tokio::test]
 async fn status_v33() {
-    status_roundtrip(Version::V3_3, "3.3", 56721).await;
+    status_roundtrip(Version::V3_3, "3.3", 26721).await;
 }
 
 #[tokio::test]
 async fn status_v34_handshake() {
-    status_roundtrip(Version::V3_4, "3.4", 56722).await;
+    status_roundtrip(Version::V3_4, "3.4", 26722).await;
 }
 
 #[tokio::test]
 async fn status_v35_handshake() {
-    status_roundtrip(Version::V3_5, "3.5", 56723).await;
+    status_roundtrip(Version::V3_5, "3.5", 26723).await;
 }
 
 #[tokio::test]
 async fn set_value_mutates_live_state_v34() {
     let mock = skip_if_absent!(
-        Mock::spawn("3.4", 56724, r#"{"1":true,"20":"white"}"#, false),
+        Mock::spawn("3.4", 26724, r#"{"1":true,"20":"white"}"#, false),
         "set v3.4"
     );
     let dev = connect(Version::V3_4, DeviceType::Auto, mock.port);
@@ -176,7 +176,7 @@ async fn device22_status_v33() {
     // device22: the mock rejects DP_QUERY, so the client falls back to the
     // CONTROL_NEW status path and gets exactly the requested dp (dp 1).
     let mock = skip_if_absent!(
-        Mock::spawn("3.3", 56725, r#"{"1":true,"20":"white"}"#, true),
+        Mock::spawn("3.3", 26725, r#"{"1":true,"20":"white"}"#, true),
         "device22 v3.3"
     );
     let dev = connect(Version::V3_3, DeviceType::Device22, mock.port);

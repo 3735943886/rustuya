@@ -19,7 +19,7 @@ use tokio::net::UdpSocket;
 use rustuya_core::{CommandType, frame};
 use rustuya_tokio::Discovery;
 
-const PORT: u16 = 56680;
+const PORT: u16 = 26680;
 
 fn announcement(id: &str, ip: &str) -> Vec<u8> {
     let json = format!(r#"{{"gwId":"{id}","ip":"{ip}","version":"3.3"}}"#);

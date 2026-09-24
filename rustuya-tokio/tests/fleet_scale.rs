@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use rustuya_tokio::{Device, Discovery, Version};
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
-const DISCO_PORT: u16 = 56673;
+const DISCO_PORT: u16 = 26673;
 const N: usize = 300;
 
 fn device_id(i: usize) -> String {

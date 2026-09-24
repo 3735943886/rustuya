@@ -30,7 +30,7 @@ mod common;
 
 const KEY: &[u8; 16] = b"0123456789abcdef";
 const ID: &str = "seenreloc000000000001a";
-const DISCO_PORT: u16 = 56673;
+const DISCO_PORT: u16 = 26673;
 /// RFC 5737 TEST-NET-1: reserved for documentation, guaranteed never a real host.
 const PLACEHOLDER: &str = "192.0.2.1";
 
