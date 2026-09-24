@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use cipher::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::crypto::TuyaCipher;
 use crate::version::Version;
@@ -35,7 +36,7 @@ pub struct Finished {
     /// Sent to the device in `SessKeyNegFinish`.
     pub finish_hmac: Vec<u8>,
     /// The 16-byte key used to encrypt/HMAC all subsequent messages.
-    pub session_key: Vec<u8>,
+    pub session_key: Zeroizing<Vec<u8>>,
 }
 
 impl Handshake {
@@ -98,7 +99,7 @@ impl Handshake {
         };
         Ok(Finished {
             finish_hmac,
-            session_key,
+            session_key: Zeroizing::new(session_key),
         })
     }
 }

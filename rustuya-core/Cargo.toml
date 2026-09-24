@@ -21,8 +21,8 @@ default = []
 # Minimal, no_std-only dependencies (design invariant 7). Crypto is RustCrypto
 # with default-features off; nothing here pulls std.
 [dependencies]
-aes = { version = "0.9", default-features = false }
-aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 cipher = { version = "0.5", default-features = false }
 ecb = { version = "0.2", default-features = false }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
@@ -36,3 +36,6 @@ rand_core = { version = "0.9", default-features = false }
 # JSON seam (D8): the only non-crypto, non-trivial dep. no_std + alloc; kept
 # behind `src/json.rs` so it can be swapped without touching the byte core.
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+# Best-effort wiping of key material on drop (local key, session key, cipher key
+# schedules). no_std + alloc; RustCrypto already speaks it.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }

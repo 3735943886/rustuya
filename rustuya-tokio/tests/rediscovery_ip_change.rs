@@ -128,7 +128,9 @@ async fn rediscovery_with_changed_ip_redials_the_new_address() {
     .expect("device observes the conn1 drop");
 
     // Announce the device at its NEW IP. The rewake must redial 127.0.0.2:P.
-    let sender = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 1), 0))
+    // Sent from 127.0.0.2 itself: the source-match policy (default on) only accepts
+    // a device that announces from the address it claims.
+    let sender = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
         .await
         .unwrap();
     sender

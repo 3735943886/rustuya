@@ -114,11 +114,20 @@ fn now_since(base: TokioInstant) -> CoreInstant {
 }
 
 /// Wall-clock seconds the core stamps into request envelopes (the `t` field).
+///
+/// A clock set before 1970 yields `0` — and some firmware rejects a wildly skewed
+/// `t` — so say so once rather than silently stamping zeros forever.
 fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("system clock is before the Unix epoch ({e}); stamping t=0 in requests");
+            }
+            0
+        }
+    }
 }
 
 /// The channels the actor publishes out on, grouped so `settle`/`dispatch_events`

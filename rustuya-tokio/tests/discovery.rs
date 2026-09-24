@@ -38,8 +38,10 @@ async fn discovers_a_device_from_a_udp_announcement() {
     // Subscribe *before* sending so the (dedup-once) announcement can't be missed.
     let mut stream = disco.discovered();
 
-    let sender = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-    let pkt = plaintext_announcement("gwtestdevice01", "192.168.1.77", "3.3");
+    // Announce from the address being announced: the source-match policy (on by
+    // default) only believes a device that speaks from where it says it is.
+    let sender = UdpSocket::bind(("127.0.0.77", 0)).await.unwrap();
+    let pkt = plaintext_announcement("gwtestdevice01", "127.0.0.77", "3.3");
     sender.send_to(&pkt, ("127.0.0.1", PORT)).await.unwrap();
 
     let info = tokio::time::timeout(Duration::from_secs(3), async {
@@ -54,7 +56,7 @@ async fn discovers_a_device_from_a_udp_announcement() {
     .await
     .expect("device discovered within 3s");
 
-    assert_eq!(info.ip, "192.168.1.77".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(info.ip, "127.0.0.77".parse::<std::net::IpAddr>().unwrap());
     assert_eq!(info.id, "gwtestdevice01");
 
     disco.close().await;
@@ -71,15 +73,15 @@ async fn find_returns_the_matching_device() {
     // `find` is race-free by construction: it subscribes before checking the
     // cache, so whether the announcement lands before or after the call, it
     // resolves — one datagram is enough, no re-announcement needed.
-    let sender = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-    let pkt = plaintext_announcement("targetdevice0001", "10.0.0.9", "3.3");
+    let sender = UdpSocket::bind(("127.0.0.9", 0)).await.unwrap();
+    let pkt = plaintext_announcement("targetdevice0001", "127.0.0.9", "3.3");
     sender.send_to(&pkt, ("127.0.0.1", PORT + 1)).await.unwrap();
 
     let info = disco
         .find("targetdevice0001", Duration::from_secs(3))
         .await
         .expect("find resolves the device");
-    assert_eq!(info.ip, "10.0.0.9".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(info.ip, "127.0.0.9".parse::<std::net::IpAddr>().unwrap());
 
     disco.close().await;
 }

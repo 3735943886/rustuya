@@ -92,7 +92,9 @@ async fn fleet_reconnects_every_device_from_one_announcement_burst() {
 
     // Burst-announce every device at its new IP, resending only for those not yet
     // connected, until the whole fleet is up.
-    let sender = Arc::new(UdpSocket::bind(("127.0.0.1", 0)).await.unwrap());
+    // Announce from the address being announced (127.0.0.2): the default
+    // source-match policy only believes a device that speaks from where it says.
+    let sender = Arc::new(UdpSocket::bind(("127.0.0.2", 0)).await.unwrap());
     let all_up = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let mut pending = 0;

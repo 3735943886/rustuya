@@ -117,6 +117,12 @@ Linking a `Discovery` to a device (via `.discover()` or `.rediscover()`) lets a
 re-announcement cancel the reconnect backoff and redial immediately — and a
 changed IP self-corrects.
 
+Announcements are unauthenticated (the UDP keys are public), so a `Discovery` only
+believes one whose claimed `ip` is the address it was actually sent from — anyone on
+the LAN could otherwise forge an announcement and redirect a device's reconnect.
+That is `DiscoveryBuilder::require_source_match` (on by default; turn it off only
+behind a relay), and `max_devices` bounds what a flood of forged ids can pin.
+
 ## Design
 
 - **Sans-I/O.** The core decides *which bytes, which port, which timer, whether to

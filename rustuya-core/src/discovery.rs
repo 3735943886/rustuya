@@ -134,7 +134,24 @@ pub struct Config {
     /// probe, which some firmware ignores. The driver sends each probe from the
     /// socket bound to the tagged source (see [`poll_transmit`](Discovery::poll_transmit)).
     pub local_ips: Vec<Ipv4Addr>,
+    /// Drop an announcement whose self-reported `ip` differs from the datagram's
+    /// source address. A real device announces from its own address, so a mismatch
+    /// means a spoof (or a relay) — and since the UDP keys are public constants
+    /// anyone on the LAN can forge an announcement, which the driver would then
+    /// treat as "this device moved" and redial. Dropped announcements are counted
+    /// ([`Discovery::rejected`]). Turn off only for a topology that genuinely
+    /// relays announcements.
+    pub require_source_match: bool,
+    /// Upper bound on remembered devices. A forged-id flood cannot grow the cache
+    /// past this; once full (after expiring stale entries) a *new* id is dropped
+    /// while known ids keep updating.
+    pub max_entries: usize,
 }
+
+/// Longest device id / product key accepted from the wire. Real Tuya ids are ~22
+/// characters; the cap keeps a forged announcement from pinning an 8 KiB string
+/// in the cache.
+const MAX_FIELD_LEN: usize = 64;
 
 struct CacheEntry {
     ip: IpAddr,
@@ -162,6 +179,8 @@ pub struct Discovery {
     next_broadcast: Option<Instant>,
     /// Broadcast rounds still to fire in the current burst (`None` = perpetual).
     bursts_left: Option<u32>,
+    /// Announcements dropped by policy (source mismatch, cache full).
+    rejected: u64,
 }
 
 impl Discovery {
@@ -174,14 +193,24 @@ impl Discovery {
             tx: VecDeque::new(),
             next_broadcast: None,
             bursts_left: None,
+            rejected: 0,
         }
+    }
+
+    /// How many well-formed announcements were dropped by policy so far
+    /// (`require_source_match` mismatch, or the cache being full). Monotonic; a
+    /// driver can diff it to surface a spoofing attempt or an undersized
+    /// `max_entries`. Malformed datagrams are not counted — that is just noise.
+    #[must_use]
+    pub fn rejected(&self) -> u64 {
+        self.rejected
     }
 
     /// Feeds one input. `rng` supplies the fresh GCM IV for v3.5 probes; passive
     /// receive uses none but the signature is uniform.
     pub fn handle_input(&mut self, input: Input<'_>, now: Instant, rng: &mut impl RngCore) {
         match input {
-            Input::Datagram { data, from: _ } => self.on_datagram(data, now),
+            Input::Datagram { data, from } => self.on_datagram(data, from, now),
             Input::StartScan => self.on_start_scan(now, rng),
             Input::StopScan => {
                 self.next_broadcast = None;
@@ -275,12 +304,26 @@ impl Discovery {
         }
     }
 
-    fn on_datagram(&mut self, data: &[u8], now: Instant) {
+    fn on_datagram(&mut self, data: &[u8], from: IpAddr, now: Instant) {
         // Undecodable packets (noise, unknown dialects) are silently ignored —
         // discovery is best-effort.
         let Some(info) = decode(data) else { return };
 
+        // The announcement is unauthenticated (the UDP keys are public), so its
+        // self-reported `ip` is only trusted when it is where the datagram came
+        // from. Otherwise any host on the LAN could relocate a device.
+        if self.cfg.require_source_match && info.ip != from {
+            self.rejected = self.rejected.saturating_add(1);
+            return;
+        }
+
         self.evict_expired(now);
+
+        // Bounded memory: a new id past the cap is dropped, known ids still update.
+        if self.cache.len() >= self.cfg.max_entries && !self.cache.contains_key(&info.id) {
+            self.rejected = self.rejected.saturating_add(1);
+            return;
+        }
 
         let fresh = match self.cache.get(&info.id) {
             Some(entry) if entry.matches(&info) => false, // known & unchanged
@@ -407,9 +450,16 @@ fn parse_json(body: &[u8]) -> Option<DeviceInfo> {
         .get("gwId")
         .or_else(|| obj.get("devId"))
         .or_else(|| obj.get("id"))?
-        .as_str()?
-        .to_string();
+        .as_str()?;
+    // Real ids are short printable ASCII; anything else is noise or a forgery.
+    if id.is_empty() || id.len() > MAX_FIELD_LEN || !id.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    let id = id.to_string();
     let ip = obj.get("ip")?.as_str()?.parse::<IpAddr>().ok()?;
+    if !is_device_ip(ip) {
+        return None;
+    }
     let version = obj
         .get("version")
         .and_then(|v| v.as_str())
@@ -417,6 +467,7 @@ fn parse_json(body: &[u8]) -> Option<DeviceInfo> {
     let product_key = obj
         .get("productKey")
         .and_then(|v| v.as_str())
+        .filter(|k| k.len() <= MAX_FIELD_LEN)
         .map(ToString::to_string);
     Some(DeviceInfo {
         id,
@@ -424,6 +475,17 @@ fn parse_json(body: &[u8]) -> Option<DeviceInfo> {
         version,
         product_key,
     })
+}
+
+/// Whether `ip` can be a Tuya device's LAN address: unicast IPv4. The LAN
+/// protocol is IPv4-only, and an unspecified / multicast / broadcast address is
+/// never a dialable device (it can only come from a malformed or forged
+/// announcement).
+fn is_device_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()),
+        IpAddr::V6(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +522,8 @@ mod tests {
             broadcast_interval: Duration::from_secs(6),
             broadcast_burst: Some(3),
             local_ips: vec![Ipv4Addr::new(192, 168, 0, 100)],
+            require_source_match: false,
+            max_entries: 1024,
         })
     }
 
@@ -656,6 +720,97 @@ mod tests {
         assert_eq!(d.cached(), 0);
     }
 
+    // -- announcement trust / bounds ----------------------------------------
+
+    /// A discovery with the source-match policy on and a small cache cap.
+    fn strict(max_entries: usize) -> Discovery {
+        Discovery::new(Config {
+            cache_ttl: TTL,
+            broadcast_interval: Duration::from_secs(6),
+            broadcast_burst: Some(1),
+            local_ips: vec![],
+            require_source_match: true,
+            max_entries,
+        })
+    }
+
+    fn feed(d: &mut Discovery, data: &[u8], from: IpAddr) {
+        d.handle_input(
+            Input::Datagram { data, from },
+            Instant::from_millis(0),
+            &mut SeededRng(1),
+        );
+    }
+
+    #[test]
+    fn source_match_drops_an_announcement_claiming_another_address() {
+        let mut d = strict(16);
+        // Sent from .42 but claims to be at .99: a spoof (or a relay).
+        feed(&mut d, &packet_6699("dev1", "192.168.0.99"), IP);
+        assert!(
+            d.poll_event().is_none(),
+            "a spoofed announcement is dropped"
+        );
+        assert_eq!(d.cached(), 0, "…and never cached");
+        assert_eq!(d.rejected(), 1);
+
+        // The same device announcing from its own address is accepted.
+        feed(&mut d, &packet_6699("dev1", "192.168.0.42"), IP);
+        assert!(matches!(d.poll_event(), Some(Event::Found(i)) if i.ip == IP));
+        assert_eq!(d.rejected(), 1, "an honest announcement is not counted");
+    }
+
+    #[test]
+    fn source_match_off_trusts_the_announced_address() {
+        let mut d = disco(); // require_source_match: false
+        feed(&mut d, &packet_6699("dev1", "192.168.0.99"), IP);
+        assert!(matches!(d.poll_event(), Some(Event::Found(_))));
+        assert_eq!(d.rejected(), 0);
+    }
+
+    #[test]
+    fn a_full_cache_drops_new_ids_but_keeps_updating_known_ones() {
+        let mut d = strict(2);
+        let a: IpAddr = "192.168.0.1".parse().unwrap();
+        let b: IpAddr = "192.168.0.2".parse().unwrap();
+        let c: IpAddr = "192.168.0.3".parse().unwrap();
+        feed(&mut d, &packet_6699("aa", "192.168.0.1"), a);
+        feed(&mut d, &packet_6699("bb", "192.168.0.2"), b);
+        while d.poll_event().is_some() {}
+        assert_eq!(d.cached(), 2);
+
+        // A third distinct id has nowhere to go.
+        feed(&mut d, &packet_6699("cc", "192.168.0.3"), c);
+        assert!(d.poll_event().is_none());
+        assert_eq!(d.cached(), 2, "the cap holds");
+        assert_eq!(d.rejected(), 1);
+
+        // A device already known still refreshes (a liveness tick, not a drop).
+        feed(&mut d, &packet_6699("aa", "192.168.0.1"), a);
+        assert!(matches!(d.poll_event(), Some(Event::Seen(id)) if id == "aa"));
+        assert_eq!(d.rejected(), 1);
+    }
+
+    #[test]
+    fn implausible_ids_and_addresses_are_not_announcements() {
+        let mut d = disco();
+        let long = "x".repeat(MAX_FIELD_LEN + 1);
+        for (id, ip) in [
+            ("", "192.168.0.10"),            // empty id
+            (long.as_str(), "192.168.0.10"), // oversized id
+            ("bad id", "192.168.0.10"),      // whitespace in the id
+            ("dev1", "0.0.0.0"),             // unspecified
+            ("dev1", "224.0.0.1"),           // multicast
+            ("dev1", "255.255.255.255"),     // broadcast
+            ("dev1", "::1"),                 // the LAN protocol is IPv4-only
+            ("dev1", "fe80::1"),             // ditto
+        ] {
+            feed(&mut d, &packet_55aa_plain(id, ip), IP);
+            assert!(d.poll_event().is_none(), "{id:?} @ {ip} must be ignored");
+        }
+        assert_eq!(d.cached(), 0);
+    }
+
     // -- active broadcast (v2) ----------------------------------------------
 
     /// Drain all queued probe packets, returning (port, decoded DeviceInfo-ok?).
@@ -713,6 +868,8 @@ mod tests {
             broadcast_interval: Duration::from_secs(6),
             broadcast_burst: Some(1),
             local_ips: vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 1, 1)],
+            require_source_match: false,
+            max_entries: 1024,
         });
         let mut rng = SeededRng(7);
         let t0 = Instant::from_millis(0);
@@ -771,6 +928,8 @@ mod tests {
             broadcast_interval: Duration::from_secs(6),
             broadcast_burst: None, // perpetual
             local_ips: Vec::new(),
+            require_source_match: false,
+            max_entries: 1024,
         });
         let mut rng = SeededRng(7);
         let mut t = Instant::from_millis(0);
@@ -802,6 +961,8 @@ mod tests {
             broadcast_interval: Duration::from_secs(6),
             broadcast_burst: None,
             local_ips: vec![Ipv4Addr::new(10, 0, 0, 5)],
+            require_source_match: false,
+            max_entries: 1024,
         });
         let mut rng = SeededRng(7);
         let mut ivs = Vec::new();

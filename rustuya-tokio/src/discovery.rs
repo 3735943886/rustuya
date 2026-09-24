@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use rand::SeedableRng;
@@ -32,6 +32,7 @@ use rustuya_core::time::Instant as CoreInstant;
 
 use crate::actor::Cmd;
 use crate::error::{Result, TuyaError};
+use crate::join_host_port;
 
 /// A discovered device announcement (re-exported from the core).
 pub use rustuya_core::discovery::DeviceInfo;
@@ -44,10 +45,12 @@ const DEFAULT_PORTS: &[u16] = &[6666, 6667, 7000];
 /// already-discovered device immediately instead of only awaiting the next
 /// (dedup-suppressed) announcement. The timestamp is exposed via
 /// [`Discovery::last_seen`] so callers judge staleness themselves — the map keeps
-/// no hidden freshness policy. It does not time-evict: present devices keep their
-/// entries fresh by re-announcing (passive), and a stale entry for a departed
-/// device is harmless (a connect to it just fails). Size is bounded by the
-/// broadcast domain (one entry per device id ever seen), not by a clock.
+/// no hidden freshness policy: reads are not time-filtered, and a stale entry for
+/// a departed device is harmless (a connect to it just fails). Size is bounded by
+/// `max_devices`, not by a clock — when full, the longest-silent entry makes room
+/// (see [`remember`]). A live device re-announces and stays fresh, so what goes is
+/// the departed or the forged; the bound matters because an announcement's id is
+/// attacker-chosen on an open LAN.
 type Known = Arc<Mutex<BTreeMap<String, (DeviceInfo, StdInstant)>>>;
 
 /// A registered device's reconnect route: where to deliver a targeted wake, plus
@@ -71,6 +74,36 @@ struct Route {
 /// lazily pruned when a device's actor has gone (its `cmd_tx` closes).
 type Routes = Arc<Mutex<BTreeMap<String, Route>>>;
 
+/// Lock a discovery map, recovering from poisoning. Every critical section here is
+/// a plain map operation that cannot leave the map half-updated, so a panic
+/// elsewhere while the lock was held must not cascade into every later
+/// `find` / wake on this shared handle.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Record a sighting, keeping `known` within `cap` entries: a *new* id at
+/// capacity evicts the longest-silent one first.
+fn remember(known: &Known, info: &DeviceInfo, cap: usize) {
+    remember_at(known, info, cap, StdInstant::now());
+}
+
+/// [`remember`] with the sighting time supplied, so the eviction order is a plain
+/// input rather than something a test has to wait for the clock to produce.
+fn remember_at(known: &Known, info: &DeviceInfo, cap: usize, at: StdInstant) {
+    let mut map = lock(known);
+    if !map.contains_key(&info.id)
+        && map.len() >= cap
+        && let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(id, _)| id.clone())
+    {
+        map.remove(&oldest);
+    }
+    map.insert(info.id.clone(), (info.clone(), at));
+}
+
 /// Everything the actor pushes results out through, grouped so `run` and `settle`
 /// pass one value instead of a long argument list: the outbound probe sockets
 /// (default + per-source), the announcement bus, the `known` cache, and the
@@ -80,6 +113,8 @@ struct Sinks {
     send_socks: BTreeMap<Ipv4Addr, UdpSocket>,
     found_tx: broadcast::Sender<DeviceInfo>,
     known: Known,
+    /// `known`'s capacity (see [`remember`]).
+    max_known: usize,
     routes: Routes,
 }
 
@@ -94,15 +129,55 @@ fn now_since(base: TokioInstant) -> CoreInstant {
     CoreInstant::from_millis(base.elapsed().as_millis() as u64)
 }
 
-/// Best-effort local IPv4 detection: a connected-but-unsent UDP socket reveals the
-/// interface the kernel would route from. `None` on failure (degrades to 0.0.0.0).
-fn detect_local_ipv4() -> Option<Ipv4Addr> {
-    let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    sock.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;
-    match sock.local_addr().ok()?.ip() {
-        std::net::IpAddr::V4(v4) if !v4.is_unspecified() => Some(v4),
-        _ => None,
+/// Keep only addresses worth stamping into a probe as "reply to me here": a real
+/// unicast IPv4 on a LAN — not loopback, link-local (169.254/16), unspecified,
+/// multicast or broadcast.
+fn usable_sources(addrs: impl IntoIterator<Item = Ipv4Addr>) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = addrs
+        .into_iter()
+        .filter(|ip| {
+            !(ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Best-effort local IPv4 source(s) for v3.5 probes.
+///
+/// First choice is the interface the kernel would route *out of*: a connected but
+/// never-written UDP socket reveals it without sending a byte (the target only
+/// steers the route lookup, so it is an RFC 5737 documentation address — no third
+/// party is named or contacted). That needs a default route, which an isolated
+/// IoT LAN — this library's home turf — often lacks. Then fall back to every
+/// operational, broadcast-capable, non-tunnel interface address: one probe per
+/// source beats the `0.0.0.0` probe the core would otherwise send, which some
+/// firmware ignores. Empty means neither worked (the caller warns).
+fn detect_local_ipv4s() -> Vec<Ipv4Addr> {
+    if let Ok(sock) = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        && sock.connect((Ipv4Addr::new(203, 0, 113, 1), 9)).is_ok()
+        && let Ok(addr) = sock.local_addr()
+        && let std::net::IpAddr::V4(v4) = addr.ip()
+    {
+        let routed = usable_sources([v4]);
+        if !routed.is_empty() {
+            return routed;
+        }
     }
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    usable_sources(ifaces.into_iter().filter_map(|i| match i.addr {
+        if_addrs::IfAddr::V4(v4) if i.is_oper_up() && !i.is_p2p && v4.broadcast.is_some() => {
+            Some(v4.ip)
+        }
+        _ => None,
+    }))
 }
 
 /// Bind a UDP socket for **receiving** broadcasts on `port`, shareable with other
@@ -142,6 +217,8 @@ pub struct DiscoveryBuilder {
     active: bool,
     local_ips: Vec<Ipv4Addr>,
     capacity: usize,
+    require_source_match: bool,
+    max_devices: usize,
 }
 
 impl Default for DiscoveryBuilder {
@@ -159,6 +236,8 @@ impl Default for DiscoveryBuilder {
             // `Discovery` (shared app-wide, not per device), so a round default is
             // fine; tunable via `capacity()`.
             capacity: 256,
+            require_source_match: true,
+            max_devices: 16_384,
         }
     }
 }
@@ -172,7 +251,9 @@ impl DiscoveryBuilder {
         Self::default()
     }
 
-    /// Override the passive receive ports.
+    /// Override the passive **receive** ports. Active probes are not affected: they
+    /// always go to the standard 6666 / 6667 / 7000, because a custom port has no
+    /// defined wire dialect to probe it with.
     #[must_use]
     pub fn ports(mut self, ports: impl Into<Vec<u16>>) -> Self {
         self.ports = ports.into();
@@ -219,6 +300,30 @@ impl DiscoveryBuilder {
         self
     }
 
+    /// Whether to trust an announcement's self-reported `ip` only when it matches
+    /// the datagram's source address (default `true`).
+    ///
+    /// Announcements are unauthenticated — the UDP keys are public — and a
+    /// discovered address is where a device's connection gets redirected, so
+    /// without this check any host on the LAN can relocate a device by forging one.
+    /// A real device announces from its own address. Turn it off only for a
+    /// topology that relays announcements from a different source; dropped
+    /// announcements are logged (first at `warn`, then `debug`).
+    #[must_use]
+    pub fn require_source_match(mut self, on: bool) -> Self {
+        self.require_source_match = on;
+        self
+    }
+
+    /// Most devices remembered at once (default 16 384). Bounds the memory a flood
+    /// of forged announcements can pin; a new device past the cap is ignored (the
+    /// core) or evicts the longest-silent one (the `known` map).
+    #[must_use]
+    pub fn max_devices(mut self, max: usize) -> Self {
+        self.max_devices = max.max(1);
+        self
+    }
+
     /// A local IPv4 stamped into v3.5 probes (so devices know where to reply).
     /// Sets a single source; defaults to best-effort auto-detection of one.
     #[must_use]
@@ -254,7 +359,14 @@ impl DiscoveryBuilder {
 
         // Resolve probe sources: explicit list, else best-effort auto-detect one.
         let local_ips: Vec<Ipv4Addr> = if self.local_ips.is_empty() {
-            detect_local_ipv4().into_iter().collect()
+            let found = detect_local_ipv4s();
+            if found.is_empty() && self.active {
+                log::warn!(
+                    "discovery: no local IPv4 source found; active v3.5 probes will carry \
+                     0.0.0.0, which some firmware ignores — set one with `local_ip()`"
+                );
+            }
+            found
         } else {
             self.local_ips.clone()
         };
@@ -277,6 +389,8 @@ impl DiscoveryBuilder {
             broadcast_interval: crate::core_dur(self.broadcast_interval),
             broadcast_burst: self.broadcast_burst,
             local_ips,
+            require_source_match: self.require_source_match,
+            max_entries: self.max_devices,
         };
 
         let (found_tx, _) = broadcast::channel(self.capacity);
@@ -294,6 +408,7 @@ impl DiscoveryBuilder {
             send_socks,
             found_tx: found_tx.clone(),
             known: known.clone(),
+            max_known: self.max_devices,
             routes: routes.clone(),
         };
         tokio::spawn(run(core, recv_socks, self.active, ctrl_rx, want_rx, sinks));
@@ -377,7 +492,7 @@ impl Discovery {
     /// one falls back to plain backoff). A collision is almost always a
     /// misconfiguration, so it is logged.
     pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
-        let prev = self.routes.lock().unwrap().insert(
+        let prev = lock(&self.routes).insert(
             id.clone(),
             Route {
                 // Downgraded so the registry never keeps a device alive — see `Route`.
@@ -400,7 +515,7 @@ impl Discovery {
         // gap between the cache miss and awaiting the stream, the subscription
         // still catches it — no lost-wakeup.
         let mut stream = self.discovered();
-        if let Some((info, _)) = self.known.lock().unwrap().get(device_id).cloned() {
+        if let Some((info, _)) = lock(&self.known).get(device_id).cloned() {
             return Ok(info);
         }
         // Miss: elicit it with one probe (coalesced), then wait.
@@ -425,9 +540,7 @@ impl Discovery {
     /// own threshold.
     #[must_use]
     pub fn known(&self) -> Vec<DeviceInfo> {
-        self.known
-            .lock()
-            .unwrap()
+        lock(&self.known)
             .values()
             .map(|(info, _)| info.clone())
             .collect()
@@ -442,11 +555,7 @@ impl Discovery {
     /// out long-silent devices at your own threshold.
     #[must_use]
     pub fn last_seen(&self, device_id: &str) -> Option<StdDuration> {
-        self.known
-            .lock()
-            .unwrap()
-            .get(device_id)
-            .map(|(_, at)| at.elapsed())
+        lock(&self.known).get(device_id).map(|(_, at)| at.elapsed())
     }
 
     /// Collect every distinct device seen during a `window` (deduped by id, latest
@@ -565,6 +674,7 @@ async fn run(
     // batch-coalesced below — one probe round per drained burst (single-flight).
     settle(&mut fsm, &sinks).await;
 
+    let mut warned_drop = false;
     loop {
         let deadline = fsm
             .poll_timeout()
@@ -573,7 +683,23 @@ async fn run(
         tokio::select! {
             dgram = dgram_rx.recv() => match dgram {
                 Some((data, from)) => {
+                    let dropped_before = fsm.rejected();
                     fsm.handle_input(Input::Datagram { data: &data, from }, now_since(base), &mut rng);
+                    if fsm.rejected() != dropped_before {
+                        // A well-formed announcement the policy refused: its ip did
+                        // not match its source (spoof/relay), or the cache is full.
+                        // Loud once, then quiet — a flood must not become a log flood.
+                        if warned_drop {
+                            log::debug!("discovery: dropped an announcement from {from}");
+                        } else {
+                            warned_drop = true;
+                            log::warn!(
+                                "discovery: dropped an announcement from {from} (its ip does not \
+                                 match its source, or the device cache is full); further drops \
+                                 are logged at debug"
+                            );
+                        }
+                    }
                 }
                 None => { /* all readers ended; keep serving control/timer */ }
             },
@@ -628,11 +754,7 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
     while let Some(ev) = fsm.poll_event() {
         match ev {
             Event::Found(info) => {
-                sinks
-                    .known
-                    .lock()
-                    .unwrap()
-                    .insert(info.id.clone(), (info.clone(), StdInstant::now()));
+                remember(&sinks.known, &info, sinks.max_known);
                 // Changed/new: wake the registered device at its announced
                 // address, and tell it what the announcement said it speaks.
                 route_wake(
@@ -654,10 +776,7 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
             // device keeps announcing, because every announcement refreshes the
             // cache entry and so the TTL never expires.
             Event::Seen(id) => {
-                let announced = sinks
-                    .known
-                    .lock()
-                    .unwrap()
+                let announced = lock(&sinks.known)
                     .get(&id)
                     .map(|(info, _)| (info.ip.to_string(), info.version));
                 let (ip, version) = match announced {
@@ -682,9 +801,9 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
 /// on the first frame that skipped its handshake.
 fn route_wake(routes: &Routes, id: &str, ip: Option<&str>, version: Option<Version>) {
     use tokio::sync::mpsc::error::TrySendError;
-    let mut map = routes.lock().unwrap();
+    let mut map = lock(routes);
     let Some(route) = map.get(id) else { return };
-    let addr = ip.map(|ip| format!("{ip}:{}", route.port));
+    let addr = ip.map(|ip| join_host_port(ip, route.port));
     // A weak sender that won't upgrade means every real handle is gone: the
     // device was dropped by its owner and its actor has stopped. Prune.
     let Some(cmd_tx) = route.cmd_tx.upgrade() else {
@@ -703,6 +822,69 @@ fn route_wake(routes: &Routes, id: &str, ip: Option<&str>, version: Option<Versi
 mod tests {
     use super::*;
 
+    fn info(id: &str) -> DeviceInfo {
+        DeviceInfo {
+            id: id.to_string(),
+            ip: "192.168.0.9".parse().unwrap(),
+            version: None,
+            product_key: None,
+        }
+    }
+
+    /// `known` never grows past its cap, and what makes room is the entry that has
+    /// been silent longest — a live device that keeps announcing is never the one
+    /// evicted by a flood of new ids.
+    #[test]
+    fn known_is_bounded_and_evicts_the_longest_silent() {
+        let known: Known = Arc::new(Mutex::new(BTreeMap::new()));
+        let t0 = StdInstant::now();
+        let at = |ms| t0 + StdDuration::from_millis(ms);
+        remember_at(&known, &info("old"), 3, at(1));
+        remember_at(&known, &info("mid"), 3, at(2));
+        remember_at(&known, &info("live"), 3, at(3));
+        // Refreshing `old` makes `mid` the longest-silent.
+        remember_at(&known, &info("old"), 3, at(4));
+        remember_at(&known, &info("new"), 3, at(5));
+
+        let map = lock(&known);
+        assert_eq!(map.len(), 3, "the cap holds");
+        assert!(!map.contains_key("mid"), "the longest-silent entry went");
+        assert!(map.contains_key("old") && map.contains_key("live") && map.contains_key("new"));
+    }
+
+    /// A panic while a discovery map is locked must not turn every later access
+    /// on the shared handle into a panic of its own.
+    #[test]
+    fn a_poisoned_map_is_still_usable() {
+        let known: Known = Arc::new(Mutex::new(BTreeMap::new()));
+        let k = Arc::clone(&known);
+        let _ = std::thread::spawn(move || {
+            let _guard = k.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(known.is_poisoned());
+
+        remember(&known, &info("dev"), 8);
+        assert!(lock(&known).contains_key("dev"));
+    }
+
+    #[test]
+    fn probe_sources_are_real_lan_unicast_only() {
+        let ip = |a, b, c, d| Ipv4Addr::new(a, b, c, d);
+        let got = usable_sources([
+            ip(127, 0, 0, 1),       // loopback
+            ip(169, 254, 3, 4),     // link-local
+            ip(0, 0, 0, 0),         // unspecified
+            ip(224, 0, 0, 1),       // multicast
+            ip(255, 255, 255, 255), // broadcast
+            ip(192, 168, 1, 10),
+            ip(10, 0, 0, 5),
+            ip(192, 168, 1, 10), // duplicate
+        ]);
+        assert_eq!(got, vec![ip(10, 0, 0, 5), ip(192, 168, 1, 10)]);
+    }
+
     /// The registry must not accumulate an entry per departed device: once the
     /// owner drops its `Device`, the weak route stops upgrading and the first
     /// wake that reaches it prunes it.
@@ -714,7 +896,7 @@ mod tests {
     fn a_wake_prunes_the_route_of_a_departed_device() {
         let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
-        routes.lock().unwrap().insert(
+        lock(&routes).insert(
             "dev".to_string(),
             Route {
                 cmd_tx: cmd_tx.downgrade(),
@@ -732,17 +914,13 @@ mod tests {
             ),
             "a live route should have been woken at the announced address"
         );
-        assert_eq!(
-            routes.lock().unwrap().len(),
-            1,
-            "a live route must survive its wake"
-        );
+        assert_eq!(lock(&routes).len(), 1, "a live route must survive its wake");
 
         // The owner releases the device: no strong sender left to upgrade to.
         drop(cmd_tx);
         route_wake(&routes, "dev", None, None);
         assert!(
-            routes.lock().unwrap().is_empty(),
+            lock(&routes).is_empty(),
             "the route of a departed device must be pruned by the wake that finds it dead"
         );
 

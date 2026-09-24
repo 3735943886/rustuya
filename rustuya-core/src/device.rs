@@ -26,6 +26,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use rand_core::RngCore;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::CoreError;
 use crate::command::{self, CommandType};
@@ -97,6 +98,12 @@ pub struct Config {
     /// sends `SessKeyNegResp` would stall `Handshaking` forever (idle_timeout only
     /// runs once `Connected`). `None` disables the handshake deadline.
     pub handshake_timeout: Option<Duration>,
+}
+
+impl Drop for Config {
+    fn drop(&mut self) {
+        self.local_key.zeroize();
+    }
 }
 
 /// An input pushed into the state machine by the driver.
@@ -171,7 +178,7 @@ enum State {
 pub struct Device {
     cfg: Config,
     state: State,
-    session_key: Option<Vec<u8>>,
+    session_key: Option<Zeroizing<Vec<u8>>>,
     handshake: Option<Handshake>,
     seqno: u32,
     /// Consecutive failed/lost connections; reset to 0 on reaching `Connected`.
@@ -333,11 +340,11 @@ impl Device {
             let mut nonce = [0u8; 16];
             rng.fill_bytes(&mut nonce);
             let hs = Handshake::new(nonce);
-            let key = self.cfg.local_key;
+            let key = Zeroizing::new(self.cfg.local_key);
             match self.encode(
                 CommandType::SessKeyNegStart as u32,
                 hs.local_nonce(),
-                &key,
+                &key[..],
                 rng,
             ) {
                 Ok(bytes) => {
@@ -442,19 +449,19 @@ impl Device {
         // 4-byte retcode (outside the ECB for 55AA, inside the GCM for 6699) that
         // must be stripped — `has_retcode = true`. A failure at any step lost the
         // negotiation, so disconnect (+ backoff).
-        let key = self.cfg.local_key;
-        let payload = match message::decode_message(self.cfg.version, data, &key, true) {
+        let key = Zeroizing::new(self.cfg.local_key);
+        let payload = match message::decode_message(self.cfg.version, data, &key[..], true) {
             Ok(m) => m.payload,
             Err(e) => return self.fail(e, now, rng),
         };
         let Some(hs) = self.handshake.take() else {
             return self.fail(CoreError::NotConnected, now, rng);
         };
-        let remote_nonce = match hs.verify_response(&payload, &key) {
+        let remote_nonce = match hs.verify_response(&payload, &key[..]) {
             Ok(n) => n,
             Err(e) => return self.fail(e, now, rng),
         };
-        let finished = match hs.finish(self.cfg.version, &remote_nonce, &key) {
+        let finished = match hs.finish(self.cfg.version, &remote_nonce, &key[..]) {
             Ok(f) => f,
             Err(e) => return self.fail(e, now, rng),
         };
@@ -464,7 +471,7 @@ impl Device {
         match self.encode(
             CommandType::SessKeyNegFinish as u32,
             &finished.finish_hmac,
-            &key,
+            &key[..],
             rng,
         ) {
             Ok(bytes) => self.tx.push_back(bytes),
@@ -585,7 +592,9 @@ impl Device {
     }
 
     fn active_key(&self) -> &[u8] {
-        self.session_key.as_deref().unwrap_or(&self.cfg.local_key)
+        self.session_key
+            .as_ref()
+            .map_or(&self.cfg.local_key[..], |k| k.as_slice())
     }
 
     fn encode(
@@ -1139,11 +1148,12 @@ mod tests {
     // -- heartbeat / idle liveness (P4/P5) -----------------------------------
 
     fn cfg_live(heartbeat: Option<Duration>, idle_timeout: Option<Duration>) -> Config {
-        Config {
-            heartbeat,
-            idle_timeout,
-            ..cfg(Version::V3_3)
-        }
+        // Field assignment, not `..cfg(..)`: `Config` wipes its key on drop, so
+        // struct-update syntax (which moves fields out) is not allowed.
+        let mut c = cfg(Version::V3_3);
+        c.heartbeat = heartbeat;
+        c.idle_timeout = idle_timeout;
+        c
     }
 
     /// A valid inbound data frame (retcode(4) || json), as a device would send.
@@ -1295,10 +1305,9 @@ mod tests {
     #[test]
     fn stalled_handshake_times_out_and_reconnects() {
         let mut rng = SeededRng(1);
-        let mut dev = Device::new(Config {
-            handshake_timeout: Some(Duration::from_secs(5)),
-            ..cfg(Version::V3_4)
-        });
+        let mut c = cfg(Version::V3_4);
+        c.handshake_timeout = Some(Duration::from_secs(5));
+        let mut dev = Device::new(c);
         dev.handle_input(Input::Connected, T0, &mut rng);
         let _ = dev.poll_transmit(); // SessKeyNegStart went out
         assert!(!dev.is_connected());
@@ -1319,10 +1328,9 @@ mod tests {
     #[test]
     fn completed_handshake_clears_its_deadline() {
         let mut rng = SeededRng(42);
-        let mut dev = Device::new(Config {
-            handshake_timeout: Some(Duration::from_secs(5)),
-            ..cfg(Version::V3_4)
-        });
+        let mut c = cfg(Version::V3_4);
+        c.handshake_timeout = Some(Duration::from_secs(5));
+        let mut dev = Device::new(c);
         dev.handle_input(Input::Connected, T0, &mut rng);
         assert_eq!(dev.poll_timeout(), Some(Instant::from_millis(5_000)));
         complete_handshake(&mut dev, Version::V3_4, &mut rng);
@@ -1478,10 +1486,8 @@ mod tests {
     #[test]
     fn timer_driven_heartbeats_use_distinct_ivs() {
         let mut rng = SeededRng(3);
-        let cfg = Config {
-            heartbeat: Some(Duration::from_secs(10)),
-            ..cfg(Version::V3_5)
-        };
+        let mut cfg = cfg(Version::V3_5);
+        cfg.heartbeat = Some(Duration::from_secs(10));
         let mut dev = connected_v35(cfg, &mut rng);
         let mut ivs = Vec::new();
         for k in 1..=5u64 {

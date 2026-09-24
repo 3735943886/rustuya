@@ -6,6 +6,64 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.0-beta.3]
+
+Security hardening of discovery and key handling, plus a few correctness fixes,
+from a review of the `0.4-sansio` branch.
+
+### Security
+
+- **Discovery no longer trusts an unauthenticated announcement's claimed address.**
+  The UDP discovery keys are public constants, so anyone on the LAN could forge an
+  announcement for a known device id; its self-reported `ip` was then handed to
+  the linked device as its new dial target. A v3.1/3.3 client would send its
+  encrypted control frames to the attacker; v3.4/3.5 cannot complete the
+  handshake without the local key, so it degraded to a redial loop. The datagram's
+  **source address is now checked against the announced `ip`**
+  (`Config::require_source_match` / `DiscoveryBuilder::require_source_match`,
+  **on by default**); a mismatch is dropped, counted (`Discovery::rejected`) and
+  logged (first at `warn`, then `debug`). Turn it off only behind a relay.
+  See DESIGN R5.
+- **Discovery memory is bounded.** A flood of forged announcements could grow the
+  core cache and the driver's `known` map without limit. New `max_entries` /
+  `DiscoveryBuilder::max_devices` (default 16 384) cap both: the core drops a new id
+  past the cap; `known` evicts the longest-silent entry. Announced ids must be
+  1–64 printable ASCII bytes, `productKey` ≤ 64, and `ip` a unicast IPv4 address
+  (unspecified / multicast / broadcast / IPv6 are not devices).
+- **Key material is wiped on drop (best effort).** The local key (builder, core
+  `Config`), the negotiated session key, and the cipher's key schedules are
+  zeroized (`zeroize`, `no_std`-compatible; `aes`/`aes-gcm` `zeroize` features).
+- **Release pipeline:** a failed `cargo publish` could not be told apart from
+  "already published" (`|| echo` swallowed every error, so a failed publish still
+  went green and cut a GitHub Release). Now only "already uploaded/exists" is
+  tolerated. Third-party actions in `publish-0.4.yml` are pinned to commit SHAs.
+
+### Fixed
+
+- **IPv6 hosts formed a malformed dial address** (`::1:6668`). `host:port` is now
+  bracketed for IPv6 literals in `DeviceBuilder::address` and in rediscovery wakes.
+- **Local-IP auto-detection silently degraded on an isolated LAN.** It probed the
+  route to a hardcoded public address (`8.8.8.8`), so a network with no default
+  route found nothing and fell back to a `0.0.0.0` probe that some firmware
+  ignores — with no log. It now routes toward an RFC 5737 documentation address
+  (no third party named), falls back to enumerating operational, broadcast-capable,
+  non-tunnel interfaces (`if-addrs`), and `warn`s if it still finds none.
+- **`known`'s documented bound wasn't real** (DESIGN R4 promised a TTL prune the code
+  never had); R4 now describes the actual, capped behaviour.
+- A poisoned discovery mutex no longer cascades a panic into every later `find` /
+  wake on the shared handle.
+- A system clock set before 1970 now `warn`s once instead of silently stamping
+  `t = 0` into every request.
+
+### Changed
+
+- `DiscoveryBuilder::ports()` is documented as receive-only: active probes always
+  target 6666 / 6667 / 7000 (a custom port has no defined wire dialect).
+- Crate docs note that `trace` logging prints decoded plaintext payloads.
+- `rustuya_core::session::Finished::session_key` is now `Zeroizing<Vec<u8>>`
+  (derefs to `Vec<u8>`), and core `device::Config` implements `Drop` — build one
+  by field assignment, not struct-update (`..base`) syntax.
+
 ## [0.4.0-beta.2]
 
 ### Fixed

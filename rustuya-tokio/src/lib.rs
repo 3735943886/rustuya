@@ -42,6 +42,14 @@
 //! devices on one loop**, fan them into a [`MultiListener`]. If you only want the
 //! **current value** and don't care to keep up, read [`watch_status`](Device::watch_status)
 //! — state, not events, so it never lags.
+//!
+//! ## Logging
+//!
+//! The driver logs through the [`log`] facade. Connection lifecycle is at `debug`;
+//! authentication failures and dropped discovery announcements are at `warn`. The
+//! local key is never logged. At `trace` the driver emits one line per frame per
+//! device — the raw bytes sent and the **decoded, plaintext payload** received
+//! (device state) — so treat `RUST_LOG=rustuya_tokio=trace` output as sensitive.
 
 mod actor;
 mod discovery;
@@ -49,6 +57,8 @@ mod error;
 
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
+
+use zeroize::{Zeroize, Zeroizing};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio_stream::wrappers::BroadcastStream;
@@ -69,6 +79,16 @@ pub use rustuya_core::{CommandType, CoreError, DeviceType, Version};
 /// Milliseconds → core `Duration` (the core has no `std::time`).
 fn core_dur(d: StdDuration) -> CoreDuration {
     CoreDuration::from_millis(d.as_millis() as u64)
+}
+
+/// `host:port` for `TcpStream::connect`, bracketing an IPv6 literal (`[::1]:6668`).
+/// Bare `format!("{host}:{port}")` turns `::1` into the ambiguous `::1:6668`.
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// A shared cap on how many devices may be **establishing** a connection at the
@@ -162,7 +182,7 @@ impl ConnectLimiter {
 /// required before [`connect`](DeviceBuilder::connect).
 pub struct DeviceBuilder {
     id: String,
-    local_key: Vec<u8>,
+    local_key: Zeroizing<Vec<u8>>,
     address: Option<String>,
     port: u16,
     version: Version,
@@ -190,7 +210,7 @@ impl DeviceBuilder {
     pub fn new(id: impl Into<String>, local_key: impl Into<Vec<u8>>) -> Self {
         Self {
             id: id.into(),
-            local_key: local_key.into(),
+            local_key: Zeroizing::new(local_key.into()),
             address: None,
             port: 6668,
             version: Version::V3_3,
@@ -359,7 +379,7 @@ impl DeviceBuilder {
         let address = self
             .address
             .ok_or(TuyaError::Config("address is required"))?;
-        let local_key: [u8; 16] = self
+        let mut local_key: [u8; 16] = self
             .local_key
             .as_slice()
             .try_into()
@@ -398,6 +418,10 @@ impl DeviceBuilder {
             idle_timeout: self.idle_timeout.map(core_dur),
             handshake_timeout: self.handshake_timeout.map(core_dur),
         };
+        // `CoreConfig` took its own copy (and wipes it on drop); clear this one and
+        // let `self.local_key` (a `Zeroizing`) wipe the builder's buffer as `self`
+        // drops at the end of `connect`.
+        local_key.zeroize();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(self.command_capacity);
         let (bcast_tx, _) = broadcast::channel(self.listener_capacity);
@@ -423,7 +447,7 @@ impl DeviceBuilder {
 
         let acfg = ActorConfig {
             core,
-            addr: format!("{address}:{}", self.port),
+            addr: join_host_port(&address, self.port),
             connect_timeout: self.connect_timeout,
             want_scan,
             connect_limiter: self.connect_limiter,
@@ -894,5 +918,18 @@ impl Stream for MultiListener {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<(String, Event)>> {
         std::pin::Pin::new(&mut self.map).poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod host_port_tests {
+    use super::join_host_port;
+
+    #[test]
+    fn brackets_only_ipv6_literals() {
+        assert_eq!(join_host_port("192.168.1.5", 6668), "192.168.1.5:6668");
+        assert_eq!(join_host_port("plug.local", 6668), "plug.local:6668");
+        assert_eq!(join_host_port("::1", 6668), "[::1]:6668");
+        assert_eq!(join_host_port("fe80::1", 6668), "[fe80::1]:6668");
     }
 }

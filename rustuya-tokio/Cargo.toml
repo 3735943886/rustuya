@@ -33,6 +33,11 @@ rand = "0.9"
 serde = "1.0"
 serde_json = "1.0"
 log = "0.4"
+# Wipe the local key on drop (the builder holds it until `connect`).
+zeroize = "1"
+# Enumerate local interfaces: the fallback for picking discovery probe sources
+# when the default-route trick finds nothing (an isolated LAN with no gateway).
+if-addrs = "0.15"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }

@@ -15,6 +15,7 @@ use aes_gcm::{
 use alloc::vec::Vec;
 use cipher::{Block, BlockModeDecrypt, BlockModeEncrypt};
 use ecb::{Decryptor, Encryptor};
+use zeroize::Zeroize;
 
 use crate::{CoreError, Result};
 
@@ -24,6 +25,14 @@ const BLOCK: usize = 16;
 pub struct TuyaCipher {
     key: [u8; 16],
     gcm: Aes128Gcm,
+}
+
+impl Drop for TuyaCipher {
+    fn drop(&mut self) {
+        // Best effort: the AES/GCM key schedules wipe themselves (`zeroize` feature
+        // on `aes`/`aes-gcm`); this covers the raw copy kept alongside them.
+        self.key.zeroize();
+    }
 }
 
 impl TuyaCipher {
