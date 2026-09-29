@@ -264,6 +264,7 @@ async fn sub_discover_sends_the_gateway_query_envelope() {
     // The gateway side: decode the fired command and assert the LanExtStream
     // envelope went out correctly — `reqType` hoisted to the top, the rest nested
     // under `data` (proves the fire-and-forget sub_discover builds the right frame).
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 4096];
@@ -272,6 +273,7 @@ async fn sub_discover_sends_the_gateway_query_envelope() {
         let env: serde_json::Value = serde_json::from_slice(&req.payload).unwrap();
         assert_eq!(env["reqType"], "subdev_online_stat_query");
         assert_eq!(env["data"]["cids"], serde_json::json!([]));
+        received_tx.send(()).unwrap();
         wait_until_closed(&mut sock).await;
     });
 
@@ -286,6 +288,9 @@ async fn sub_discover_sends_the_gateway_query_envelope() {
         .expect("connects");
     dev.sub_discover().await.expect("sub_discover fires");
 
+    received_rx
+        .await
+        .expect("gateway received the queued command");
     dev.close().await;
     server.await.unwrap();
 }

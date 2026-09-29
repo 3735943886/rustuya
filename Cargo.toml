@@ -9,7 +9,7 @@
 #                     well-known crate name. See rustuya/Cargo.toml.
 #
 # The 0.3 line (the monolithic `rustuya` crate + its Python bindings) lives on
-# `master` and the v0.3.x tags; 0.4 is a pure-Rust redesign — see MILESTONES.md.
+# `master` and the v0.3.x tags; 0.4 is a pure-Rust redesign — see docs/MILESTONES.md.
 [workspace]
 resolver = "2"
 members = ["rustuya-core", "rustuya-tokio", "rustuya"]
@@ -19,7 +19,7 @@ members = ["rustuya-core", "rustuya-tokio", "rustuya"]
 # is one edit, not three. Members opt in with `field.workspace = true` /
 # `dep = { workspace = true, ... }`.
 [workspace.package]
-version = "0.4.0-beta.3"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -27,5 +27,5 @@ repository = "https://github.com/3735943886/rustuya"
 readme = "README.md"
 
 [workspace.dependencies]
-rustuya-core = { path = "rustuya-core", version = "0.4.0-beta.3" }
-rustuya-tokio = { path = "rustuya-tokio", version = "0.4.0-beta.3" }
+rustuya-core = { path = "rustuya-core", version = "0.4.0" }
+rustuya-tokio = { path = "rustuya-tokio", version = "0.4.0" }

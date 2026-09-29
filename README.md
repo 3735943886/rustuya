@@ -19,9 +19,10 @@ abstractions (`OutletDevice`, `CoverDevice`, `BulbDevice`, …) or the Tuya Clou
 API, use [tinytuya](https://github.com/jasonacox/tinytuya) — rustuya deliberately
 stops at the local protocol layer those build on.
 
-> **Status.** 0.4 is a from-scratch redesign on the `0.4-sansio` branch. The
-> shipping 0.3 line — a monolithic `rustuya` crate with Python bindings — lives on
-> `master` and the `v0.3.x` tags. This README covers 0.4.
+> **Status.** 0.4 is the stable pure-Rust sans-I/O release (Rust 1.88+).
+> It is a breaking redesign of 0.3: the Python bindings and blocking/sync API
+> remain on 0.3.x. The 0.4 release branch is `0.4-sansio`; `master` retains 0.3.x.
+> See [Migrating from 0.3](https://github.com/3735943886/rustuya/blob/v0.4.0/docs/MIGRATING-0.4.md) before upgrading.
 
 ## Layout
 

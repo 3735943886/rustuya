@@ -33,15 +33,27 @@ jobs:
         # `[workspace.package]` in the root Cargo.toml (single source of
         # truth), so one check here covers all of them.
         run: |
+          if [[ "$GITHUB_REF" != refs/tags/v0.4.* ]]; then
+            echo "Run this workflow on a v0.4.* tag."
+            exit 1
+          fi
           TAG="${GITHUB_REF#refs/tags/v}"
           VER="$(grep -E '^version\s*=\s*"' Cargo.toml | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')"
           if [ "$TAG" != "$VER" ]; then
             echo "Version mismatch: tag v$TAG != workspace.package.version $VER"
             exit 1
           fi
+          grep -Fq "## [$VER]" CHANGELOG.md || {
+            echo "Missing CHANGELOG.md section for $VER"
+            exit 1
+          }
+
+  checks:
+    needs: [verify-version]
+    uses: ./.github/workflows/ci.yml
 
   publish:
-    needs: [verify-version]
+    needs: [verify-version, checks]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -64,10 +76,9 @@ jobs:
           echo "VER=$VER" >> "$GITHUB_ENV"
 
       # Each publish is idempotent *only* for "this version is already there": a
-      # version's first release is always published manually (crates.io Trusted
-      # Publishing can only be configured for a crate that already exists), so
-      # this workflow's first run against that same tag finds it already
-      # published. Every other failure (bad credentials, network, a rejected
+      # crate's first version was published manually to register its Trusted
+      # Publisher. Subsequent versions are published here; retries may encounter
+      # versions uploaded by an earlier partial run. Every other failure (bad credentials, network, a rejected
       # package) must fail the job — a bare `|| echo` would swallow those too and
       # go green, then cut a GitHub Release for a version that never shipped.
       - name: Publish rustuya-core
@@ -146,8 +157,8 @@ jobs:
             f {print}
           ' CHANGELOG.md > RELEASE_NOTES.md
           if [ ! -s RELEASE_NOTES.md ]; then
-            echo "No section for $VER in CHANGELOG.md; using full file."
-            cp CHANGELOG.md RELEASE_NOTES.md
+            echo "No section for $VER in CHANGELOG.md."
+            exit 1
           fi
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3

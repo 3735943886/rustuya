@@ -6,6 +6,56 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-30
+
+First stable release of the pure-Rust sans-I/O redesign. Includes all changes
+from the 0.4 beta cycle below. Requires Rust 1.88 or later.
+
+### Highlights
+
+- `rustuya-core`: `no_std + alloc` protocol, cryptography, device and discovery
+  state machines, with injected time and RNG; bare-metal RISC-V and Cortex-M builds.
+- `rustuya-tokio`: managed connections, reconnect/backoff, heartbeat, discovery,
+  gateway sub-devices and a shared connection limiter for fleets.
+- `rustuya`: facade with an explicit `tokio` feature and `rustuya::tokio::*` API.
+- Fire-and-forget commands; receive frames through `listener()` (including visible
+  lag), read the last status frame with `watch_status()`, or combine devices with
+  `MultiListener`.
+- Bounded discovery caches, source-address checks enabled by default, and
+  best-effort zeroization of local/session keys.
+
+### Fixed since beta.3
+
+- **An unread TCP peer could freeze the device actor.** A blocked `write_all`
+  prevented reads, heartbeat/idle/handshake deadlines and shutdown from running.
+  Writes now use nonblocking readiness with a retained partial-frame offset;
+  reads and core deadlines continue while the socket applies backpressure.
+- `send_timeout` now bounds the total wait for connection **and command-queue
+  capacity**. Previously a full queue could wait indefinitely.
+- `close()` bypasses the command queue and waits for the actor to exit, including
+  during dial, handshake, permit waits or stalled writes. Pending commands and
+  partial writes are discarded; dropping the last device handle also stops it.
+- Regression tests cover full-queue timeout, shutdown, inbound frames and idle
+  liveness under stalled writes, and byte-exact ordered recovery after partial writes.
+
+### Release verification
+
+- Publishing requires the tag's own reusable CI workflow to pass: formatting,
+  Clippy, unit/loopback/tuyamock tests, bare-metal builds, rustdoc and Rust 1.88.
+- The root Cargo.lock is tracked and CI uses `--locked`; tuyamock is pinned to 0.0.6.
+- Tag/version and changelog-section checks run before publishing the three crates.
+
+### Migrating from 0.3
+
+This is a breaking API release. Enable `features = ["tokio"]`, import from
+`rustuya::tokio`, and use `Device::builder(...).connect()` or explicit shared
+`Discovery`. `status()` becomes `query()`; command calls return `Result<()>`, with
+responses arriving asynchronously. Python bindings and the blocking/sync driver
+are **not provided in 0.4**; those users should stay on 0.3.x. Embassy/ESP32 is
+planned for 0.5+ and is not part of this release.
+
+See [the migration guide](https://github.com/3735943886/rustuya/blob/v0.4.0/docs/MIGRATING-0.4.md) for examples and API mappings.
+
 ## [0.4.0-beta.3]
 
 Security hardening of discovery and key handling, plus a few correctness fixes,

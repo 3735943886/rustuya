@@ -289,7 +289,7 @@ impl DiscoveryBuilder {
     }
 
     /// Depth of the found-device broadcast bus (default 256) — how far a consumer of
-    /// [`found`](Discovery::found) / [`scan`](Discovery::scan) may fall behind before
+    /// [`discovered`](Discovery::discovered) / [`scan`](Discovery::scan) may fall behind before
     /// it loses the oldest sightings (a `Lagged` skip). A `tokio::broadcast` ring
     /// preallocated once per `Discovery` (shared app-wide, not per device), so the
     /// cost is one-time; raise it if you enumerate very large fleets through a slow

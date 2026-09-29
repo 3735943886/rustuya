@@ -315,8 +315,8 @@ impl DeviceBuilder {
         self
     }
 
-    /// How long a fire-and-forget command waits for the connection to come up
-    /// before giving up (default 5 s). Applies to [`query`](Device::query),
+    /// Total time a fire-and-forget command may wait for connection and space
+    /// in the command queue (default 5 s). Applies to [`query`](Device::query),
     /// [`set_dps`](Device::set_dps), [`set_value`](Device::set_value), and
     /// [`send`](Device::send).
     #[must_use]
@@ -424,6 +424,7 @@ impl DeviceBuilder {
         local_key.zeroize();
 
         let (cmd_tx, cmd_rx) = mpsc::channel(self.command_capacity);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (bcast_tx, _) = broadcast::channel(self.listener_capacity);
         // Current-status latch: last-value-wins state feeding `watch_status()`,
         // kept separate from the lossy event bus above so a slow consumer can read
@@ -461,11 +462,13 @@ impl DeviceBuilder {
             status_tx,
             conn_tx,
             autherr_tx,
+            shutdown_rx,
         ));
 
         Ok(Device {
             id: self.id,
             cmd_tx,
+            shutdown_tx,
             bcast_tx,
             status_rx,
             conn_rx,
@@ -502,6 +505,7 @@ impl DeviceBuilder {
 pub struct Device {
     id: String,
     cmd_tx: mpsc::Sender<Cmd>,
+    shutdown_tx: watch::Sender<bool>,
     bcast_tx: broadcast::Sender<Message>,
     status_rx: watch::Receiver<Option<Message>>,
     conn_rx: watch::Receiver<bool>,
@@ -549,7 +553,7 @@ impl Device {
         *self.conn_rx.borrow()
     }
 
-    /// A [`watch`](tokio::sync::watch) of the connection state — `true` once the
+    /// A [`watch`] of the connection state — `true` once the
     /// link is up and past any handshake, `false` while it is down.
     ///
     /// [`is_connected`](Self::is_connected) answers "right now" and
@@ -571,7 +575,7 @@ impl Device {
         self.conn_rx.clone()
     }
 
-    /// A [`watch`](tokio::sync::watch) of the last **authentication** failure —
+    /// A [`watch`] of the last **authentication** failure —
     /// a payload that didn't authenticate, which in practice means a wrong local
     /// key or protocol version. `None` while the connection is healthy (a
     /// successful connect clears it).
@@ -688,12 +692,15 @@ impl Device {
         // Wait for the connection first so a just-spawned device doesn't fail
         // fast while it is still dialing/handshaking. A wrong key/version surfaces
         // here as the real auth error rather than a bare timeout.
-        self.wait_connected(self.send_timeout).await?;
-
-        self.cmd_tx
-            .send(Cmd::Fire { cmd, data, cid })
-            .await
-            .map_err(|_| TuyaError::Closed)
+        tokio::time::timeout(self.send_timeout, async {
+            self.wait_connected(self.send_timeout).await?;
+            self.cmd_tx
+                .send(Cmd::Fire { cmd, data, cid })
+                .await
+                .map_err(|_| TuyaError::Closed)
+        })
+        .await
+        .map_err(|_| TuyaError::Timeout)?
     }
 
     /// A stream of device frames (pushes and query replies) as [`Event`]s. Subscribes
@@ -708,7 +715,7 @@ impl Device {
         }
     }
 
-    /// A [`watch`](tokio::sync::watch) of the device's current status frame — the
+    /// A [`watch`] of the device's current status frame — the
     /// last non-empty frame it sent (a query reply or a state push), or `None` until
     /// the first one. Unlike [`listener`](Self::listener) this is **state, not an
     /// event stream**: it never lags and always holds the latest value, so a consumer
@@ -736,10 +743,13 @@ impl Device {
             .await;
     }
 
-    /// Gracefully stop the driver task. Idempotent; further requests error with
-    /// [`TuyaError::Closed`].
+    /// Stop the driver task and wait for it to exit. Pending commands and partial
+    /// writes are discarded. Shutdown bypasses the command queue, even when a
+    /// peer stops reading. Idempotent; further requests error with [`TuyaError::Closed`].
     pub async fn close(&self) {
-        let _ = self.cmd_tx.send(Cmd::Close).await;
+        let _ = self.shutdown_tx.send(true);
+        let mut conn = self.conn_rx.clone();
+        while conn.changed().await.is_ok() {}
     }
 }
 
@@ -806,7 +816,7 @@ pub enum Event {
 /// A subscription to a device's event bus (pushes + query replies). Created by
 /// [`Device::listener`].
 ///
-/// Implements [`Stream`](futures_core::Stream) with `Item = Event`, so it drives the
+/// Implements [`Stream`] with `Item = Event`, so it drives the
 /// idiom `while let Some(ev) = listener.next().await`, and also offers an explicit
 /// [`recv`](Self::recv). A bus-lag gap is delivered as [`Event::Lagged`] in both,
 /// never silently skipped.

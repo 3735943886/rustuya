@@ -18,11 +18,12 @@
 //! driver injects — a `StdRng` (Send, OS-seeded) so every IV/nonce the core emits
 //! stays unique, and a monotonic `tokio::time::Instant` base for `now`.
 
+use std::collections::VecDeque;
 use std::time::Duration as StdDuration;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::Interest;
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, broadcast, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
@@ -88,8 +89,6 @@ pub(crate) enum Cmd {
         /// `Input::ConnectNow`. `None` from an explicit `connect_now()`.
         version: Option<rustuya_core::Version>,
     },
-    /// Graceful shutdown: exit the task.
-    Close,
 }
 
 /// Everything the actor needs to run one device, moved in at spawn time.
@@ -147,9 +146,33 @@ struct Sinks {
     autherr: watch::Sender<Option<CoreError>>,
 }
 
-/// The actor entry point. Runs until every command sender is dropped or a
-/// [`Cmd::Close`] arrives.
+/// Run until explicitly closed or the last device handle is dropped. Shutdown
+/// is independent of the bounded command queue, including while dialing or
+/// waiting for a fleet permit. Dropping the inner future also drops the socket.
 pub(crate) async fn run(
+    acfg: ActorConfig,
+    cmd_rx: mpsc::Receiver<Cmd>,
+    bcast_tx: broadcast::Sender<Message>,
+    status_tx: watch::Sender<Option<Message>>,
+    conn_tx: watch::Sender<bool>,
+    autherr_tx: watch::Sender<Option<CoreError>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::select! {
+        biased;
+        _ = async {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        } => {},
+        _ = run_inner(acfg, cmd_rx, bcast_tx, status_tx, conn_tx.clone(), autherr_tx) => {},
+    }
+    publish_state(&conn_tx, false);
+}
+
+async fn run_inner(
     acfg: ActorConfig,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     bcast_tx: broadcast::Sender<Message>,
@@ -182,6 +205,7 @@ pub(crate) async fn run(
     let base = TokioInstant::now();
 
     let mut stream: Option<TcpStream> = None;
+    let mut tx = PendingWrites::default();
     // TCP read chunk. Any size is correct — the core's RxBuffer reassembles frames
     // across reads — so this is purely a syscall-count/throughput knob, not a frame
     // bound. 8 KiB comfortably holds a typical status frame in one read.
@@ -232,7 +256,7 @@ pub(crate) async fn run(
                     }
                 }
             }
-            settle(&id, &mut fsm, &mut stream, &sinks, base, &mut rng).await;
+            settle(&id, &mut fsm, &mut stream, &sinks, &mut tx);
             // A failed dial (or a v3.1–v3.3 connect, which needs no handshake)
             // already resolved the attempt — give the slot back now.
             if !fsm.is_establishing() {
@@ -248,7 +272,7 @@ pub(crate) async fn run(
 
         // (C) Whichever fires first drives the FSM.
         tokio::select! {
-            cmd = cmd_rx.recv() => match cmd {
+            cmd = cmd_rx.recv(), if tx.is_empty() => match cmd {
                 Some(Cmd::Fire { cmd, data, cid }) => {
                     // Fire-and-forget: only emit if the socket is up. The handle
                     // already waited for `connected`, so a drop here is just a
@@ -272,24 +296,32 @@ pub(crate) async fn run(
                     }
                     fsm.handle_input(Input::ConnectNow { version }, now_since(base), &mut rng);
                 }
-                // All senders dropped, or an explicit Close: shut the task down.
-                Some(Cmd::Close) | None => {
+                // All command senders dropped: shut the task down.
+                None => {
                     publish_state(&sinks.conn, false);
                     return;
                 }
             },
-            r = read_some(&mut stream, &mut rbuf), if stream.is_some() => match r {
-                Ok(0) => {
-                    // Peer EOF. Worth a line of its own: "the device hung up on
-                    // us" and "we timed out on a silent link" produce the same
-                    // offline state but have opposite causes, and without this
-                    // the first one is completely silent.
-                    log::debug!("{id}: peer closed the connection");
-                    fsm.handle_input(Input::Closed, now_since(base), &mut rng);
-                }
-                Ok(n) => fsm.handle_input(Input::Received(&rbuf[..n]), now_since(base), &mut rng),
-                Err(e) => {
-                    log::debug!("{id}: read error: {e}");
+            ready = socket_ready(&stream, !tx.is_empty()), if stream.is_some() => {
+                let result = ready.and_then(|ready| {
+                    let socket = stream.as_ref().expect("guarded by select");
+                    if ready.is_readable() {
+                        match socket.try_read(&mut rbuf) {
+                            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                            Ok(n) => fsm.handle_input(Input::Received(&rbuf[..n]), now_since(base), &mut rng),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    // Never send bytes from the old session after a received
+                    // frame has caused the FSM to tear that session down.
+                    if ready.is_writable() && (fsm.is_establishing() || fsm.is_connected()) {
+                        tx.try_write(socket)?;
+                    }
+                    Ok(())
+                });
+                if let Err(e) = result {
+                    log::debug!("{id}: socket error: {e}");
                     fsm.handle_input(Input::Closed, now_since(base), &mut rng);
                 }
             },
@@ -298,7 +330,7 @@ pub(crate) async fn run(
             }
         }
 
-        settle(&id, &mut fsm, &mut stream, &sinks, base, &mut rng).await;
+        settle(&id, &mut fsm, &mut stream, &sinks, &mut tx);
         // The handshake finished, timed out, or the link dropped: in every case
         // the establishment window is over and the slot belongs to the next
         // device in line.
@@ -330,7 +362,7 @@ async fn await_permit(
             p = &mut acquire => return Some(p),
             cmd = cmd_rx.recv() => match cmd {
                 // Shutdown, or every handle dropped: abandon the slot request.
-                Some(Cmd::Close) | None => return None,
+                None => return None,
                 // A rewake may carry a freshly-discovered address. Adopt it so
                 // the dial we're queued for targets the *current* IP rather than
                 // the stale one. The `ConnectNow` itself is a no-op — the FSM is
@@ -354,71 +386,81 @@ async fn await_permit(
     }
 }
 
-/// One socket read into `buf`. Split out so the `select!` precondition
-/// (`if stream.is_some()`) gates the `unwrap`.
-async fn read_some(stream: &mut Option<TcpStream>, buf: &mut [u8]) -> std::io::Result<usize> {
+/// Wait for readiness only; the actual reads/writes below are nonblocking.
+/// Cancelling this wait never loses a partially written frame.
+async fn socket_ready(
+    stream: &Option<TcpStream>,
+    writing: bool,
+) -> std::io::Result<tokio::io::Ready> {
+    let interest = if writing {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    };
     stream
-        .as_mut()
-        .expect("guarded by `if stream.is_some()`")
-        .read(buf)
+        .as_ref()
+        .expect("guarded by select")
+        .ready(interest)
         .await
 }
 
-/// Push everything the FSM produced out to the world: bytes to the socket, events
-/// to the listener bus. Re-runs once if a write fails (feeding the core `Closed`,
-/// which enqueues `Disconnected` for us to dispatch), so the loop runs at most twice
-/// and always leaves the FSM's queues empty.
-async fn settle(
+/// Retain the exact write offset across socket reads and timer ticks. Commands
+/// are only dequeued once these frames drain, so backpressure stays at the
+/// bounded command channel instead of becoming an unbounded driver queue.
+#[derive(Default)]
+struct PendingWrites {
+    frames: VecDeque<Vec<u8>>,
+    offset: usize,
+}
+
+impl PendingWrites {
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.offset = 0;
+    }
+
+    fn try_write(&mut self, socket: &TcpStream) -> std::io::Result<()> {
+        if let Some(frame) = self.frames.front() {
+            match socket.try_write(&frame[self.offset..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    self.offset += n;
+                    if self.offset == frame.len() {
+                        self.frames.pop_front();
+                        self.offset = 0;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Drain core events and enqueue outbound frames without awaiting socket I/O.
+/// The main select keeps servicing reads, deadlines and shutdown while writing.
+fn settle(
     id: &str,
     fsm: &mut Device,
     stream: &mut Option<TcpStream>,
     sinks: &Sinks,
-    base: TokioInstant,
-    rng: &mut StdRng,
+    tx: &mut PendingWrites,
 ) {
-    loop {
-        // Bytes out. A write failure is just another `Closed` input to the core.
-        if let Err(e) = flush_tx(id, fsm, stream).await {
-            log::debug!("{id}: write error: {e}");
-            *stream = None;
-            fsm.handle_input(Input::Closed, now_since(base), rng);
-            // The Closed produced a Disconnected event; dispatch it next turn.
-            continue;
-        }
-        // Events out. If the core tore the connection down, drop the socket so the
-        // next dial gets a fresh one.
-        if dispatch_events(id, fsm, sinks) {
-            *stream = None;
-        }
-        return;
+    if dispatch_events(id, fsm, sinks) {
+        *stream = None;
+        tx.clear();
     }
-}
-
-/// Drain `poll_transmit` to the socket. Errors surface for the `Closed` re-feed.
-async fn flush_tx(
-    id: &str,
-    fsm: &mut Device,
-    stream: &mut Option<TcpStream>,
-) -> std::io::Result<()> {
     while let Some(bytes) = fsm.poll_transmit() {
-        // Pairs with the `rx` line in `dispatch_events`: together they are a full
-        // wire transcript, which is what a device that hangs up on a particular
-        // frame (a keepalive it dislikes, say) needs to be diagnosed. The frame
-        // is shown raw — decoding it here would hide exactly the malformation
-        // being hunted.
-        //
-        // `trace`, not `debug`: this is one line per frame per device, so at
-        // fleet scale it is a firehose, and `debug` is where an operator expects
-        // connection lifecycle. Reach for it deliberately, per crate
-        // (`RUST_LOG=rustuya_tokio=trace`).
         log::trace!("{id}: tx {} bytes: {:?}", bytes.len(), DebugBytes(&bytes));
-        // No socket to write to (torn down mid-drain) → drop the bytes; the core
-        // re-establishes state on the next connect.
-        if let Some(s) = stream.as_mut() {
-            s.write_all(&bytes).await?;
+        if stream.is_some() {
+            tx.frames.push_back(bytes);
         }
     }
-    Ok(())
 }
 
 /// Publish a value on a state `watch`, waking consumers **only on an actual
@@ -464,7 +506,7 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
                 // payload goes out as an escaped string — a *garbled* payload is
                 // exactly the case worth seeing, so it must not be assumed UTF-8.
                 //
-                // `trace` for the same reason as the `tx` line in `flush_tx`.
+                // `trace` for the same reason as the `tx` line in `settle`.
                 log::trace!(
                     "{id}: rx cmd=0x{:02x} seqno={} retcode={:?} len={} payload={:?}",
                     msg.cmd,
@@ -608,8 +650,8 @@ mod permit_tests {
         assert_eq!(addr, "192.168.1.9:6668", "the new address was not adopted");
     }
 
-    /// A close must not sit behind a fleet's worth of handshakes: it is answered
-    /// while the device is still queued, without ever taking a permit.
+    /// A closed command channel abandons a permit wait without taking a slot.
+    /// Explicit Device shutdown additionally cancels the entire inner task.
     #[tokio::test(flavor = "current_thread")]
     async fn a_close_while_queued_abandons_the_slot_request() {
         let limiter = ConnectLimiter::new(1);
@@ -627,10 +669,10 @@ mod permit_tests {
         };
         tokio::task::yield_now().await;
 
-        cmd_tx.send(Cmd::Close).await.unwrap();
+        drop(cmd_tx);
         assert!(
             !waiter.await.unwrap(),
-            "a queued device must abandon its slot request on Close"
+            "a queued device must abandon its slot request when the channel closes"
         );
         drop(held);
         assert_eq!(limiter.available(), 1, "no permit should have been taken");

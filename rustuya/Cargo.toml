@@ -30,6 +30,9 @@ description = "Facade crate for the sans-I/O rustuya Tuya local-protocol library
 repository.workspace = true
 readme.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 tokio = ["dep:rustuya-tokio"]

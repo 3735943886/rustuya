@@ -7,6 +7,7 @@ on:
       - 0.4-sansio
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -15,32 +16,49 @@ jobs:
   rust-checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
           targets: riscv32imc-unknown-none-elf, thumbv7em-none-eabi
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint with Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: no_std acceptance gate (rustuya-core)
         # The core must build with no std on both an RV32 and a Cortex-M target —
         # the design invariant that keeps the ESP32/Embassy driver reachable.
         run: |
-          cargo build -p rustuya-core --no-default-features --target riscv32imc-unknown-none-elf
-          cargo build -p rustuya-core --no-default-features --target thumbv7em-none-eabi
+          cargo build --locked -p rustuya-core --no-default-features --target riscv32imc-unknown-none-elf
+          cargo build --locked -p rustuya-core --no-default-features --target thumbv7em-none-eabi
       - name: Install the tuyamock device emulator
         # Independent, tinytuya-validated emulator; drives the real wire path
         # (framing, crypto, the v3.4/v3.5 handshake, discovery, fault injection).
-        # Installed unpinned (latest); pin here if an upstream release breaks CI.
+        # Pin the release oracle so a new emulator cannot change the gate mid-release.
         run: |
           python3 -m venv .venv
-          .venv/bin/pip install --upgrade pip tuyamock
+          .venv/bin/pip install tuyamock==0.0.6
       - name: Run tests (unit + loopback + tuyamock E2E)
         env:
           RUSTUYA_TUYAMOCK: ${{ github.workspace }}/.venv/bin/tuyamock
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --all-features --no-deps
+      - name: Verify release packages
+        run: cargo package --locked --workspace --all-features
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: '1.88.0'
+      - run: cargo check --locked --workspace --all-targets --all-features
 
   supply-chain:
     # Advisories + license/source policy. Non-blocking advisory failures by
@@ -50,8 +68,10 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit || true
       - name: cargo audit
