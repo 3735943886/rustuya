@@ -1,0 +1,38 @@
+---
+layout: default
+---
+<style>
+  .docs-versions { display: flex; flex-wrap: wrap; gap: .6rem 1.4rem; padding-bottom: 1rem; border-bottom: 1px solid #dce6f0; }
+  .docs-versions a[aria-current="true"] { font-weight: 700; text-decoration: underline; }
+  .docs-notice { margin: 1.2rem 0; padding: 1rem 1.2rem; background: #f0f7f4; border-left: 4px solid #159957; color: #244637; }
+  .docs-notice.archive { background: #fff8e6; border-color: #b77708; color: #59410d; }
+  .docs-links { display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; margin: 1rem 0 2rem; }
+</style>
+<nav class="docs-versions" aria-label="Documentation version">
+  <span>Documentation</span>
+  <a href="{{ '/' | relative_url }}"{% if page.doc_version == '0.4' %} aria-current="true"{% endif %}>0.4 · Current</a>
+  <a href="{{ '/0.3/' | relative_url }}"{% if page.doc_version == '0.3' %} aria-current="true"{% endif %}>0.3 · Archive</a>
+</nav>
+{% if page.doc_version == '0.3' %}
+<aside class="docs-notice archive">
+  <strong>Archived documentation for rustuya 0.3.</strong>
+  These Rust, sync and Python APIs apply to 0.3.x.
+  <a href="{{ '/MIGRATING-0.4.html' | relative_url }}">Migrating to 0.4?</a>
+  <a href="https://github.com/3735943886/rustuya/tree/0.3-stable">View 0.3 source</a>.
+</aside>
+<nav class="docs-links" aria-label="0.3 guides">
+  <a href="{{ '/0.3/getting-started.html' | relative_url }}">Getting started</a>
+  <a href="{{ '/0.3/rust-api.html' | relative_url }}">Rust API</a>
+  <a href="{{ '/0.3/python-api.html' | relative_url }}">Python API</a>
+  <a href="{{ '/0.3/python-examples.html' | relative_url }}">Python examples</a>
+</nav>
+{% else %}
+<nav class="docs-links" aria-label="0.4 guides">
+  <a href="{{ '/getting-started.html' | relative_url }}">Getting started</a>
+  <a href="{{ '/rust-api.html' | relative_url }}">Rust API</a>
+  <a href="{{ '/discovery.html' | relative_url }}">Discovery</a>
+  <a href="{{ '/MIGRATING-0.4.html' | relative_url }}">Migration</a>
+  <a href="{{ '/faq.html' | relative_url }}">FAQ</a>
+</nav>
+{% endif %}
+{{ content }}

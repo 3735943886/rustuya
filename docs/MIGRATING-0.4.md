@@ -1,3 +1,7 @@
+---
+title: "Migrating from rustuya 0.3 to 0.4"
+---
+
 # Migrating from rustuya 0.3 to 0.4
 
 0.4 is a breaking, pure-Rust redesign. It requires Rust 1.88+. Python bindings
@@ -24,7 +28,7 @@ Commands return after entering the bounded queue. Success does not mean the
 device received or acknowledged the command. The protocol does not reliably
 correlate responses with requests, so responses and pushes share an event stream.
 
-```rust
+```rust,no_run
 use rustuya::tokio::{Device, Event, Version};
 
 #[tokio::main]

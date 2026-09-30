@@ -1,0 +1,19 @@
+title: Rustuya
+description: Local Tuya control in Rust · 0.4 documentation
+url: https://3735943886.github.io
+baseurl: /rustuya
+theme: jekyll-theme-cayman
+github_url: https://github.com/3735943886/rustuya
+plugins:
+  - jekyll-relative-links
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: docs
+      doc_version: "0.4"
+  - scope:
+      path: "0.3"
+    values:
+      doc_version: "0.3"
+      description: Archived 0.3 documentation · Rust async, sync and Python

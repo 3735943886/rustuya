@@ -25,6 +25,11 @@ stops at the local protocol layer those build on.
 > [`0.3-stable`](https://github.com/3735943886/rustuya/tree/0.3-stable).
 > See [Migrating from 0.3](https://github.com/3735943886/rustuya/blob/v0.4.0/docs/MIGRATING-0.4.md) before upgrading.
 
+## Documentation
+
+- [0.4 documentation](https://3735943886.github.io/rustuya/) — getting started, API, discovery and migration.
+- [0.3 documentation archive](https://3735943886.github.io/rustuya/0.3/) — the previous Rust async/sync API and Python bindings.
+
 ## Layout
 
 | crate | what it is |

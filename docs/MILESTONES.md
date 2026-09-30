@@ -1,3 +1,7 @@
+---
+title: "rustuya 0.4 — Sans-I/O Redesign Milestones"
+---
+
 # rustuya 0.4 — Sans-I/O Redesign Milestones
 
 Splits rustuya into a **pure, `no_std` protocol/state-machine core** plus **thin

@@ -1,3 +1,7 @@
+---
+title: "rustuya 0.4 — Core Design Decisions"
+---
+
 # rustuya 0.4 — Core Design Decisions
 
 The 0.4 `rustuya-core` is a clean-slate rewrite of the Tuya local protocol, not a

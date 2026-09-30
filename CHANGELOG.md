@@ -6,6 +6,12 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+### Documentation
+
+- GitHub Pages now serves 0.4 guides by default, with the 0.3 documentation
+  preserved at `/rustuya/0.3/` and version navigation on every page.
+- Restored Pages deployment from master, with rendered-link checks before deploy.
+
 ### Repository
 
 - `master` now tracks 0.4. The previous master is preserved unchanged on
