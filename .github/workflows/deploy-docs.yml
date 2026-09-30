@@ -40,7 +40,7 @@ jobs:
           toolchain: stable
       - name: Compile guide examples
         run: |
-          cargo fetch --locked
+          cargo fetch
           python3 .github/scripts/check-doc-examples.py
       - name: Upload artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
