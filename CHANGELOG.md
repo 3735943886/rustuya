@@ -6,6 +6,8 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-30
+
 ### Changed
 
 - **MSRV is now Rust 1.89** (required by `aes` 0.9.3).
