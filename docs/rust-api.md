@@ -5,7 +5,7 @@ title: Rust API guide for 0.4
 # Rust API guide for 0.4
 
 Import from `rustuya::tokio`. For signatures and all builder options, use the
-[0.4.1 API reference](https://docs.rs/rustuya-tokio/0.4.1/rustuya_tokio/).
+[0.4.2 API reference](https://docs.rs/rustuya-tokio/0.4.2/rustuya_tokio/).
 
 ## Device commands
 
