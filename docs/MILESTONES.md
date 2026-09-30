@@ -4,9 +4,10 @@ Splits rustuya into a **pure, `no_std` protocol/state-machine core** plus **thin
 I/O drivers**, so the same protocol logic runs on a Linux/tokio host (fleet
 scale) *and* on an ESP32-class microcontroller (single-device controller).
 
-Long-lived branch `0.4-sansio`. The `0.3.x` line stays the prior stable release;
-nothing here lands on `master` until a phase is oracle-green. 0.4 is a **pure-Rust
-library** — the deliverable is the `rustuya-tokio` (and later `rustuya-embassy`)
+Developed on `0.4-sansio` and promoted to `master` after the 0.4.0 release.
+The previous master, including the `0.3.x` implementation and Python bindings,
+is preserved on `0.3-stable`. 0.4 is a **pure-Rust library** — the deliverable is
+the `rustuya-tokio` (and later `rustuya-embassy`)
 Rust API. Design-decision detail lives in [`DESIGN.md`](DESIGN.md) (IDs S/P/Q/R).
 
 ---
@@ -30,7 +31,7 @@ Rust API. Design-decision detail lives in [`DESIGN.md`](DESIGN.md) (IDs S/P/Q/R)
   (the superset — compiles under both); the ESP32 flavour is a Phase-3 decision.
 - **Not** zero-alloc. `alloc` is assumed; `heapless`/`serde-json-core` is a later
   option if RAM demands it, not a v0.4 requirement.
-- `master` / `0.3.x` is **not** destabilised.
+- The `0.3.x` implementation is preserved on `0.3-stable`.
 
 ## Design invariants (hold across every phase)
 

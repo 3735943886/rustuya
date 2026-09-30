@@ -21,7 +21,8 @@ stops at the local protocol layer those build on.
 
 > **Status.** 0.4 is the stable pure-Rust sans-I/O release (Rust 1.88+).
 > It is a breaking redesign of 0.3: the Python bindings and blocking/sync API
-> remain on 0.3.x. The 0.4 release branch is `0.4-sansio`; `master` retains 0.3.x.
+> remain on 0.3.x. `master` now tracks 0.4; the previous master is preserved on
+> [`0.3-stable`](https://github.com/3735943886/rustuya/tree/0.3-stable).
 > See [Migrating from 0.3](https://github.com/3735943886/rustuya/blob/v0.4.0/docs/MIGRATING-0.4.md) before upgrading.
 
 ## Layout

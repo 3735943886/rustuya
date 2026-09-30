@@ -14,8 +14,3 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-
-  - package-ecosystem: "cargo"
-    directory: "/python"
-    schedule:
-      interval: "weekly"

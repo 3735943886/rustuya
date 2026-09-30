@@ -1,10 +1,9 @@
 name: Publish 0.4
 
 # Release pipeline for the 0.4 sans-io line: rustuya-core, rustuya-tokio, and
-# the rustuya facade. Lives only on `0.4-sansio` — a `v0.4.*` tag pointing at
-# a commit on this branch's history runs the workflow file as it exists on
-# that commit, so this never collides with master's `publish.yml` (0.3.x +
-# Python), which lives on a disjoint history.
+# the rustuya facade. `master` tracks 0.4; the prior 0.3.x + Python release
+# workflow is preserved on `0.3-stable`. A tag runs the workflow files from
+# its own commit, so v0.4.* tags use this pipeline.
 #
 # Third-party actions are pinned to commit SHAs (the publish job holds an OIDC
 # `id-token: write` credential trusted by crates.io); bump them deliberately.

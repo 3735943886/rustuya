@@ -6,6 +6,12 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+### Repository
+
+- `master` now tracks 0.4. The previous master is preserved unchanged on
+  `0.3-stable`, including the 0.3 Rust implementation and Python bindings.
+- Removed the default-branch Dependabot entry for the absent `/python` workspace.
+
 ## [0.4.0] — 2026-09-30
 
 First stable release of the pure-Rust sans-I/O redesign. Includes all changes
