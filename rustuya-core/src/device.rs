@@ -25,7 +25,7 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-use rand_core::RngCore;
+use rand_core::Rng;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::CoreError;
@@ -55,7 +55,7 @@ pub struct Backoff {
 
 impl Backoff {
     /// The delay for a given 0-based attempt number.
-    fn delay(&self, attempt: u32, rng: &mut impl RngCore) -> Duration {
+    fn delay(&self, attempt: u32, rng: &mut impl Rng) -> Duration {
         // 2^attempt, saturating: attempt >= 64 (never realistic) pins to u64::MAX,
         // then `base * factor` saturates and is capped by `max` anyway.
         let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
@@ -220,7 +220,7 @@ impl Device {
 
     /// Feeds one input into the machine, queuing any resulting transmits/events.
     /// `now` is the driver's monotonic clock; the core never reads a clock itself.
-    pub fn handle_input(&mut self, input: Input<'_>, now: Instant, rng: &mut impl RngCore) {
+    pub fn handle_input(&mut self, input: Input<'_>, now: Instant, rng: &mut impl Rng) {
         match input {
             Input::Connected => self.on_connected(now, rng),
             Input::ConnectFailed => self.on_connect_failed(now, rng),
@@ -240,7 +240,7 @@ impl Device {
     ///    also emit a doomed heartbeat;
     ///  * `Connected` heartbeat elapsed → emit a keepalive frame (needs the
     ///    injected RNG for the v3.5 GCM IV) and re-arm.
-    pub fn handle_timeout(&mut self, now: Instant, rng: &mut impl RngCore) {
+    pub fn handle_timeout(&mut self, now: Instant, rng: &mut impl Rng) {
         match self.state {
             State::Backoff => {
                 if let Some(deadline) = self.deadline
@@ -332,7 +332,7 @@ impl Device {
 
     // -- transitions ---------------------------------------------------------
 
-    fn on_connected(&mut self, now: Instant, rng: &mut impl RngCore) {
+    fn on_connected(&mut self, now: Instant, rng: &mut impl Rng) {
         if self.state != State::Connecting {
             return; // stray Connected (e.g. during backoff) — ignore
         }
@@ -365,7 +365,7 @@ impl Device {
         }
     }
 
-    fn on_connect_failed(&mut self, now: Instant, rng: &mut impl RngCore) {
+    fn on_connect_failed(&mut self, now: Instant, rng: &mut impl Rng) {
         if self.state == State::Connecting {
             self.arm_backoff(now, rng);
         }
@@ -398,7 +398,7 @@ impl Device {
         }
     }
 
-    fn on_received(&mut self, data: &[u8], now: Instant, rng: &mut impl RngCore) {
+    fn on_received(&mut self, data: &[u8], now: Instant, rng: &mut impl Rng) {
         // Only buffer bytes while a connection is live; stray bytes in any other
         // state belong to a dead socket and are dropped.
         if !matches!(self.state, State::Handshaking | State::Connected) {
@@ -425,7 +425,7 @@ impl Device {
     }
 
     /// Dispatch one fully-reassembled frame by connection state.
-    fn on_frame(&mut self, frame: &[u8], now: Instant, rng: &mut impl RngCore) {
+    fn on_frame(&mut self, frame: &[u8], now: Instant, rng: &mut impl Rng) {
         match self.state {
             State::Handshaking => self.on_handshake_response(frame, now, rng),
             State::Connected => {
@@ -443,7 +443,7 @@ impl Device {
         }
     }
 
-    fn on_handshake_response(&mut self, data: &[u8], now: Instant, rng: &mut impl RngCore) {
+    fn on_handshake_response(&mut self, data: &[u8], now: Instant, rng: &mut impl Rng) {
         // The SessKeyNegResp payload is `remote_nonce(16) || HMAC(32)`, framed
         // with the local key. Like every device→client message it carries a
         // 4-byte retcode (outside the ECB for 55AA, inside the GCM for 6699) that
@@ -488,7 +488,7 @@ impl Device {
         cid: Option<&str>,
         t: u64,
         now: Instant,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) {
         if self.state != State::Connected {
             self.events
@@ -522,7 +522,7 @@ impl Device {
         }
     }
 
-    fn on_closed(&mut self, now: Instant, rng: &mut impl RngCore) {
+    fn on_closed(&mut self, now: Instant, rng: &mut impl Rng) {
         match self.state {
             State::Handshaking | State::Connected => self.disconnect(now, rng),
             // Aborted mid-dial: never was up, so no Disconnected event — just retry.
@@ -535,7 +535,7 @@ impl Device {
 
     /// Leaving a live (Handshaking/Connected) state: surface Disconnected, clear
     /// session state, and re-arm backoff (or go terminal).
-    fn disconnect(&mut self, now: Instant, rng: &mut impl RngCore) {
+    fn disconnect(&mut self, now: Instant, rng: &mut impl Rng) {
         self.session_key = None;
         self.handshake = None;
         self.events.push_back(Event::Disconnected);
@@ -543,7 +543,7 @@ impl Device {
     }
 
     /// Compute the next redial deadline (or go terminal if `!auto_reconnect`).
-    fn arm_backoff(&mut self, now: Instant, rng: &mut impl RngCore) {
+    fn arm_backoff(&mut self, now: Instant, rng: &mut impl Rng) {
         self.session_key = None;
         self.handshake = None;
         self.next_heartbeat = None; // no keepalive/liveness timing while down
@@ -573,7 +573,7 @@ impl Device {
 
     /// Emit a keepalive `HeartBeat` frame. Its payload carries no timestamp
     /// (`{gwId, devId}`), so a wall-clock `t` is irrelevant here.
-    fn send_heartbeat(&mut self, rng: &mut impl RngCore) {
+    fn send_heartbeat(&mut self, rng: &mut impl Rng) {
         let (code, value) = command::generate(
             self.cfg.version,
             self.cfg.dev_type,
@@ -602,7 +602,7 @@ impl Device {
         cmd: u32,
         plaintext: &[u8],
         key: &[u8],
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> Result<Vec<u8>, CoreError> {
         let mut iv = [0u8; 12];
         rng.fill_bytes(&mut iv);
@@ -613,7 +613,7 @@ impl Device {
 
     /// Protocol error on a live (handshaking/connected) path: surface it, then
     /// disconnect and re-arm backoff with the injected `now`/`rng`.
-    fn fail(&mut self, e: CoreError, now: Instant, rng: &mut impl RngCore) {
+    fn fail(&mut self, e: CoreError, now: Instant, rng: &mut impl Rng) {
         self.events.push_back(Event::ProtocolError(e));
         self.disconnect(now, rng);
     }
@@ -640,23 +640,25 @@ mod tests {
     const ID: &str = "01234567890123456789ab";
     const T0: Instant = Instant::from_millis(0);
 
-    // A tiny deterministic RngCore so tests don't need `rand`.
+    // A tiny deterministic Rng so tests don't need `rand`.
     struct SeededRng(u64);
-    impl RngCore for SeededRng {
-        fn next_u32(&mut self) -> u32 {
+    impl rand_core::TryRng for SeededRng {
+        type Error = core::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
             self.0 = self
                 .0
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
+            Ok((self.0 >> 33) as u32)
         }
-        fn next_u64(&mut self) -> u64 {
-            (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32())
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok((u64::from(self.next_u32()) << 32) | u64::from(self.next_u32()))
         }
-        fn fill_bytes(&mut self, dst: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             for b in dst.iter_mut() {
                 *b = self.next_u32() as u8;
             }
+            Ok(())
         }
     }
 
@@ -679,7 +681,7 @@ mod tests {
     }
 
     /// Connect a legacy device and drain the `Ready` event, returning it ready.
-    fn connected(cfg: Config, rng: &mut impl RngCore) -> Device {
+    fn connected(cfg: Config, rng: &mut impl Rng) -> Device {
         let mut dev = Device::new(cfg);
         dev.handle_input(Input::Connected, T0, rng);
         while dev.poll_event().is_some() {}
@@ -738,7 +740,7 @@ mod tests {
     }
 
     /// Drives a v3.4/v3.5 handshake to Connected in one feed.
-    fn complete_handshake(dev: &mut Device, version: Version, rng: &mut impl RngCore) {
+    fn complete_handshake(dev: &mut Device, version: Version, rng: &mut impl Rng) {
         let resp = craft_handshake_response(dev, version);
         dev.handle_input(Input::Received(&resp), T0, rng);
     }
@@ -1435,7 +1437,7 @@ mod tests {
     }
 
     /// A v3.5 device driven through the handshake to Connected, transmits drained.
-    fn connected_v35(cfg: Config, rng: &mut impl RngCore) -> Device {
+    fn connected_v35(cfg: Config, rng: &mut impl Rng) -> Device {
         let mut dev = Device::new(cfg);
         dev.handle_input(Input::Connected, T0, rng);
         complete_handshake(&mut dev, Version::V3_5, rng);

@@ -18,7 +18,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-use rand::SeedableRng;
 use rand::rngs::StdRng;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
@@ -635,7 +634,7 @@ async fn run(
     sinks: Sinks,
 ) {
     let mut fsm = DiscoveryFsm::new(core);
-    let mut rng = StdRng::from_os_rng();
+    let mut rng = rand::make_rng::<StdRng>();
     let base = TokioInstant::now();
 
     // One reader task per socket → a single datagram channel. Depth 256 bounds the

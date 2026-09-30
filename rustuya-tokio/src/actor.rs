@@ -21,7 +21,6 @@
 use std::collections::VecDeque;
 use std::time::Duration as StdDuration;
 
-use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::io::Interest;
 use tokio::net::TcpStream;
@@ -201,7 +200,7 @@ async fn run_inner(
     // A Send CSPRNG (ChaCha), seeded from the OS. One instance for the task's
     // lifetime is fine: its period dwarfs any device's frame count, and pinning
     // it here keeps the actor future `Send` (a `ThreadRng` would not be).
-    let mut rng = StdRng::from_os_rng();
+    let mut rng = rand::make_rng::<StdRng>();
     let base = TokioInstant::now();
 
     let mut stream: Option<TcpStream> = None;

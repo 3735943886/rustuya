@@ -21,7 +21,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr};
-use rand_core::RngCore;
+use rand_core::Rng;
 
 use crate::command::CommandType;
 use crate::crypto::TuyaCipher;
@@ -208,7 +208,7 @@ impl Discovery {
 
     /// Feeds one input. `rng` supplies the fresh GCM IV for v3.5 probes; passive
     /// receive uses none but the signature is uniform.
-    pub fn handle_input(&mut self, input: Input<'_>, now: Instant, rng: &mut impl RngCore) {
+    pub fn handle_input(&mut self, input: Input<'_>, now: Instant, rng: &mut impl Rng) {
         match input {
             Input::Datagram { data, from } => self.on_datagram(data, from, now),
             Input::StartScan => self.on_start_scan(now, rng),
@@ -221,7 +221,7 @@ impl Discovery {
 
     /// Fires the broadcast timer: if a round is due, queue a probe per port and
     /// schedule (or end) the next round.
-    pub fn handle_timeout(&mut self, now: Instant, rng: &mut impl RngCore) {
+    pub fn handle_timeout(&mut self, now: Instant, rng: &mut impl Rng) {
         if let Some(next) = self.next_broadcast
             && now >= next
         {
@@ -263,7 +263,7 @@ impl Discovery {
 
     // -- internals -----------------------------------------------------------
 
-    fn on_start_scan(&mut self, now: Instant, _rng: &mut impl RngCore) {
+    fn on_start_scan(&mut self, now: Instant, _rng: &mut impl Rng) {
         // A zero-count burst would scan nothing; treat it as "don't start".
         if self.cfg.broadcast_burst == Some(0) {
             return;
@@ -272,7 +272,7 @@ impl Discovery {
         self.next_broadcast = Some(now); // first round is immediate
     }
 
-    fn emit_probes(&mut self, rng: &mut impl RngCore) {
+    fn emit_probes(&mut self, rng: &mut impl Rng) {
         for probe in DEFAULT_PROBES {
             match probe.dialect {
                 Dialect::Legacy => {
@@ -359,7 +359,7 @@ impl Discovery {
 
 /// Build one v3.5 (6699/GCM) active probe carrying `src` as the reply address
 /// (`0.0.0.0` when `None`). A fresh IV is drawn from the injected RNG.
-fn build_v35_probe(src: Option<Ipv4Addr>, rng: &mut impl RngCore) -> Option<Vec<u8>> {
+fn build_v35_probe(src: Option<Ipv4Addr>, rng: &mut impl Rng) -> Option<Vec<u8>> {
     let ip = src.map_or_else(|| "0.0.0.0".to_string(), |i| i.to_string());
     let payload = alloc::format!(r#"{{"from":"app","ip":"{ip}"}}"#).into_bytes();
     let mut iv = [0u8; 12];
@@ -498,21 +498,23 @@ mod tests {
     const TTL: Duration = Duration::from_secs(60);
 
     struct SeededRng(u64);
-    impl RngCore for SeededRng {
-        fn next_u32(&mut self) -> u32 {
+    impl rand_core::TryRng for SeededRng {
+        type Error = core::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
             self.0 = self
                 .0
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
+            Ok((self.0 >> 33) as u32)
         }
-        fn next_u64(&mut self) -> u64 {
-            (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32())
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok((u64::from(self.next_u32()) << 32) | u64::from(self.next_u32()))
         }
-        fn fill_bytes(&mut self, dst: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             for b in dst.iter_mut() {
                 *b = self.next_u32() as u8;
             }
+            Ok(())
         }
     }
 
