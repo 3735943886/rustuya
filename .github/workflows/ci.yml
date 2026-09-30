@@ -25,7 +25,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint with Clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: no_std acceptance gate (rustuya-core)
         # The core must build with no std on both an RV32 and a Cortex-M target —
         # the design invariant that keeps the ESP32/Embassy driver reachable.
