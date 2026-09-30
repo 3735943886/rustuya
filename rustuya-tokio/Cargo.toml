@@ -29,7 +29,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 socket2 = { version = "0.6", features = ["all"] }
 # The RNG the core never generates itself: a Send CSPRNG (ChaCha), OS-seeded,
 # injected into every handle_input/handle_timeout so IVs/nonces stay unique.
-rand = "0.9"
+rand = "0.10"
 serde = "1.0"
 serde_json = "1.0"
 log = "0.4"
