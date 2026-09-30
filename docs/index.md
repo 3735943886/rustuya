@@ -8,7 +8,7 @@ Control and discover Tuya devices on your local network in pure Rust.
 Rustuya provides raw data points (DPS), managed connections and fleet discovery,
 with a `no_std + alloc` protocol core and a Tokio driver.
 
-**Current stable version: 0.4.0. Requires Rust 1.88 or later.**
+**Current stable version: 0.4.1. Requires Rust 1.89 or later.**
 
 ```toml
 [dependencies]
@@ -43,8 +43,8 @@ See [Migrating from 0.3](MIGRATING-0.4.md) for the API mapping.
 
 ## API reference and source
 
-- [rustuya 0.4.0 API](https://docs.rs/rustuya/0.4.0/rustuya/) — facade with the `tokio` feature.
-- [rustuya-tokio 0.4.0 API](https://docs.rs/rustuya-tokio/0.4.0/rustuya_tokio/) — the Tokio driver.
-- [rustuya-core 0.4.0 API](https://docs.rs/rustuya-core/0.4.0/rustuya_core/) — the sans-I/O core.
-- [Release notes](https://github.com/3735943886/rustuya/releases/tag/v0.4.0).
+- [rustuya 0.4.1 API](https://docs.rs/rustuya/0.4.1/rustuya/) — facade with the `tokio` feature.
+- [rustuya-tokio 0.4.1 API](https://docs.rs/rustuya-tokio/0.4.1/rustuya_tokio/) — the Tokio driver.
+- [rustuya-core 0.4.1 API](https://docs.rs/rustuya-core/0.4.1/rustuya_core/) — the sans-I/O core.
+- [Release notes](https://github.com/3735943886/rustuya/releases/tag/v0.4.1).
 - [Source on master](https://github.com/3735943886/rustuya), [0.3 source archive](https://github.com/3735943886/rustuya/tree/0.3-stable).

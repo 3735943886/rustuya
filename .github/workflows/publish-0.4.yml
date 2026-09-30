@@ -82,7 +82,7 @@ jobs:
       # go green, then cut a GitHub Release for a version that never shipped.
       - name: Publish rustuya-core
         run: |
-          if ! out="$(cargo publish -p rustuya-core --locked 2>&1)"; then
+          if ! out="$(cargo publish -p rustuya-core 2>&1)"; then
             echo "$out"
             echo "$out" | grep -qE "already (uploaded|exists)" || exit 1
             echo "rustuya-core already published; continuing"
@@ -108,7 +108,7 @@ jobs:
 
       - name: Publish rustuya-tokio
         run: |
-          if ! out="$(cargo publish -p rustuya-tokio --locked 2>&1)"; then
+          if ! out="$(cargo publish -p rustuya-tokio 2>&1)"; then
             echo "$out"
             echo "$out" | grep -qE "already (uploaded|exists)" || exit 1
             echo "rustuya-tokio already published; continuing"
@@ -130,7 +130,7 @@ jobs:
 
       - name: Publish rustuya (facade)
         run: |
-          if ! out="$(cargo publish -p rustuya --locked 2>&1)"; then
+          if ! out="$(cargo publish -p rustuya 2>&1)"; then
             echo "$out"
             echo "$out" | grep -qE "already (uploaded|exists)" || exit 1
             echo "rustuya already published; continuing"
