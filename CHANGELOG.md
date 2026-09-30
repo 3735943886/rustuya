@@ -6,6 +6,12 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-30
+
+Re-release of 0.4.1 with no code changes: the v0.4.1 tag was moved during a
+manual release, so its GitHub Release and published sources did not line up.
+See 0.4.1 below for the changes since 0.4.0.
+
 ## [0.4.1] — 2026-09-30
 
 ### Changed
