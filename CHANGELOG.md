@@ -6,6 +6,12 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+### Changed
+
+- **MSRV is now Rust 1.89** (required by `aes` 0.9.3).
+- `rustuya-core` now depends on `rand_core` 0.10: the injected RNG bound is
+  `rand_core::Rng` (formerly `RngCore`). `rustuya-tokio` moves to `rand` 0.10.
+
 ### Documentation
 
 - GitHub Pages now serves 0.4 guides by default, with the 0.3 documentation

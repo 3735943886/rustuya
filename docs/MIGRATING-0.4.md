@@ -4,7 +4,7 @@ title: "Migrating from rustuya 0.3 to 0.4"
 
 # Migrating from rustuya 0.3 to 0.4
 
-0.4 is a breaking, pure-Rust redesign. It requires Rust 1.88+. Python bindings
+0.4 is a breaking, pure-Rust redesign. It requires Rust 1.89+. Python bindings
 and the blocking/sync API remain on 0.3.x; there is no 0.4 replacement for those
 interfaces yet. The previous master is preserved on the
 [`0.3-stable`](https://github.com/3735943886/rustuya/tree/0.3-stable) branch;

@@ -22,7 +22,7 @@ members = ["rustuya-core", "rustuya-tokio", "rustuya"]
 [workspace.package]
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/3735943886/rustuya"
 readme = "README.md"
