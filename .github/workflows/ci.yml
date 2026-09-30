@@ -30,8 +30,8 @@ jobs:
         # The core must build with no std on both an RV32 and a Cortex-M target —
         # the design invariant that keeps the ESP32/Embassy driver reachable.
         run: |
-          cargo build --locked -p rustuya-core --no-default-features --target riscv32imc-unknown-none-elf
-          cargo build --locked -p rustuya-core --no-default-features --target thumbv7em-none-eabi
+          cargo build -p rustuya-core --no-default-features --target riscv32imc-unknown-none-elf
+          cargo build -p rustuya-core --no-default-features --target thumbv7em-none-eabi
       - name: Install the tuyamock device emulator
         # Independent, tinytuya-validated emulator; drives the real wire path
         # (framing, crypto, the v3.4/v3.5 handshake, discovery, fault injection).
@@ -42,14 +42,14 @@ jobs:
       - name: Run tests (unit + loopback + tuyamock E2E)
         env:
           RUSTUYA_TUYAMOCK: ${{ github.workspace }}/.venv/bin/tuyamock
-        run: cargo test --locked --workspace --all-features
+        run: cargo test --workspace --all-features
 
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --workspace --all-features --no-deps
+        run: cargo doc --workspace --all-features --no-deps
       - name: Verify release packages
-        run: cargo package --locked --workspace --all-features
+        run: cargo package --workspace --all-features
 
   msrv:
     runs-on: ubuntu-latest
@@ -58,7 +58,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: '1.88.0'
-      - run: cargo check --locked --workspace --all-targets --all-features
+      - run: cargo check --workspace --all-targets --all-features
 
   supply-chain:
     # Advisories + license/source policy. Non-blocking advisory failures by
@@ -73,10 +73,10 @@ jobs:
         with:
           toolchain: stable
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit || true
+        run: cargo install cargo-audit || true
       - name: cargo audit
         run: cargo audit --deny warnings || true
       - name: Install cargo-deny
-        run: cargo install --locked cargo-deny || true
+        run: cargo install cargo-deny || true
       - name: cargo deny check
         run: cargo deny check advisories bans sources || true
