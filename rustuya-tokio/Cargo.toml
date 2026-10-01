@@ -40,7 +40,7 @@ zeroize = "1"
 if-addrs = "0.15"
 
 [dev-dependencies]
-tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 # For crafting a v3.4 SessKeyNegResp in the handshake loopback test (same
 # versions as rustuya-core, so no duplicate in the tree).
 hmac = "0.13"
