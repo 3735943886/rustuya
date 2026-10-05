@@ -6,6 +6,22 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-10-06
+
+### Added
+
+- Log one warning when reconnect backoff first reaches its nonzero maximum
+  during an outage. Discovery wakes preserve the failure count; a successful
+  connection resets it. Individual connection failures remain debug logs.
+- `rustuya-core::device::Event::ReconnectBackoffCapped` reports the maximum
+  backoff (before jitter) and consecutive failed/lost connection count.
+  Consumers exhaustively matching the core event enum must handle this variant.
+
+### Fixed
+
+- Re-registering a device after its previous handle was dropped no longer
+  reports a duplicate live discovery route.
+
 ## [0.4.2] — 2026-09-30
 
 Re-release of 0.4.1 with no code changes: the v0.4.1 tag was moved during a
