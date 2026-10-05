@@ -54,12 +54,17 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// The delay for a given 0-based attempt number.
-    fn delay(&self, attempt: u32, rng: &mut impl Rng) -> Duration {
+    /// The exponential term for a given 0-based attempt, before jitter.
+    fn capped_delay(&self, attempt: u32) -> Duration {
         // 2^attempt, saturating: attempt >= 64 (never realistic) pins to u64::MAX,
         // then `base * factor` saturates and is capped by `max` anyway.
         let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
-        let capped = self.base.saturating_mul(factor).min(self.max);
+        self.base.saturating_mul(factor).min(self.max)
+    }
+
+    /// The delay for a given attempt, including jitter.
+    fn delay(&self, attempt: u32, rng: &mut impl Rng) -> Duration {
+        let capped = self.capped_delay(attempt);
         let jitter = match self.jitter.as_millis() {
             0 => 0,
             j => rng.next_u64() % j,
@@ -156,6 +161,9 @@ pub enum Event {
     /// A live connection was lost (only emitted when leaving a connected state,
     /// not on each failed retry).
     Disconnected,
+    /// Reconnect backoff first reached its nonzero maximum since the last
+    /// successful connection. The maximum excludes jitter.
+    ReconnectBackoffCapped { max: Duration, failures: u32 },
     /// A protocol-level error occurred while processing input.
     ProtocolError(CoreError),
 }
@@ -551,7 +559,17 @@ impl Device {
         self.handshake_deadline = None;
         self.rx.clear(); // any buffered bytes belong to the dead connection
         if self.cfg.auto_reconnect {
-            let delay = self.cfg.backoff.delay(self.attempt, rng);
+            let backoff = &self.cfg.backoff;
+            if backoff.max != Duration::ZERO
+                && backoff.capped_delay(self.attempt) == backoff.max
+                && (self.attempt == 0 || backoff.capped_delay(self.attempt - 1) < backoff.max)
+            {
+                self.events.push_back(Event::ReconnectBackoffCapped {
+                    max: backoff.max,
+                    failures: self.attempt.saturating_add(1),
+                });
+            }
+            let delay = backoff.delay(self.attempt, rng);
             self.attempt = self.attempt.saturating_add(1);
             self.deadline = Some(now.saturating_add(delay));
             self.state = State::Backoff;
@@ -974,6 +992,83 @@ mod tests {
             Some(now + Duration::from_secs(2)),
             "curve reset to base"
         );
+    }
+
+    #[test]
+    fn cap_event_is_once_per_outage_even_with_discovery_wakes() {
+        let backoff = Backoff {
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(3),
+            // Jitter can take the actual delay past max before the curve caps.
+            jitter: Duration::from_secs(10),
+        };
+        let mut rng = SeededRng(7);
+        let mut dev = Device::new(cfg_with(Version::V3_3, true, backoff));
+        let now = Instant::from_millis(0);
+        for _ in 0..2 {
+            for failure in 1..=6 {
+                let was_connected = dev.is_connected();
+                dev.handle_input(
+                    if was_connected {
+                        Input::Closed
+                    } else {
+                        Input::ConnectFailed
+                    },
+                    now,
+                    &mut rng,
+                );
+                let mut expected = if failure == 3 {
+                    vec![Event::ReconnectBackoffCapped {
+                        max: backoff.max,
+                        failures: 3,
+                    }]
+                } else {
+                    vec![]
+                };
+                if was_connected {
+                    expected.insert(0, Event::Disconnected);
+                }
+                assert_eq!(drain_events(&mut dev), expected);
+                dev.handle_input(Input::ConnectNow { version: None }, now, &mut rng);
+                assert!(dev.wants_connect());
+            }
+            dev.handle_input(Input::Connected, now, &mut rng);
+            assert_eq!(drain_events(&mut dev), vec![Event::Ready]);
+        }
+    }
+
+    #[test]
+    fn cap_event_handles_initial_cap_zero_max_and_disabled_reconnect() {
+        for (base, max, auto_reconnect, expected_count) in
+            [(2, 1, true, 1), (1, 0, true, 0), (1, 1, false, 0)]
+        {
+            let mut rng = SeededRng(7);
+            let mut dev = Device::new(cfg_with(
+                Version::V3_3,
+                auto_reconnect,
+                Backoff {
+                    base: Duration::from_secs(base),
+                    max: Duration::from_secs(max),
+                    jitter: Duration::ZERO,
+                },
+            ));
+            let now = Instant::from_millis(0);
+            for failure in 0..3 {
+                dev.handle_input(Input::ConnectFailed, now, &mut rng);
+                let events = drain_events(&mut dev);
+                assert_eq!(events.len(), if failure == 0 { expected_count } else { 0 });
+                if expected_count == 1 && failure == 0 {
+                    assert_eq!(
+                        events,
+                        vec![Event::ReconnectBackoffCapped {
+                            max: Duration::from_secs(max),
+                            failures: 1,
+                        }]
+                    );
+                }
+                dev.handle_input(Input::ConnectNow { version: None }, now, &mut rng);
+            }
+        }
     }
 
     #[test]

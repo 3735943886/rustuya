@@ -527,6 +527,13 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
                 tore_down = true;
                 publish_state(&sinks.conn, false);
             }
+            Event::ReconnectBackoffCapped { max, failures } => {
+                log::warn!(
+                    "{id}: reconnect backoff reached its maximum ({} ms) after \
+                     {failures} consecutive failed/lost connections; retries will continue",
+                    max.as_millis(),
+                );
+            }
             Event::ProtocolError(e) => {
                 if e.is_auth_failure() {
                     // A CRC/HMAC/GCM failure means the payload didn't authenticate
