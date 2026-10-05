@@ -489,17 +489,16 @@ impl Discovery {
     /// **Last-wins** upsert (mirrors the 0.3 bridge's same-id defense): a second
     /// device registered under an id supersedes the first's route (the displaced
     /// one falls back to plain backoff). A collision is almost always a
-    /// misconfiguration, so it is logged.
+    /// misconfiguration, so it is logged — but only against a *live* device: a
+    /// dropped one's route lingers until a wake prunes it, and replacing that is
+    /// an ordinary re-add, not a collision.
     pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
-        let prev = lock(&self.routes).insert(
-            id.clone(),
-            Route {
-                // Downgraded so the registry never keeps a device alive — see `Route`.
-                cmd_tx: cmd_tx.downgrade(),
-                port,
-            },
-        );
-        if prev.is_some() {
+        let route = Route {
+            // Downgraded so the registry never keeps a device alive — see `Route`.
+            cmd_tx: cmd_tx.downgrade(),
+            port,
+        };
+        if register_route(&self.routes, id.clone(), route) {
             log::warn!("discovery: device id {id} re-registered; superseding previous route");
         }
     }
@@ -788,6 +787,15 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
     }
 }
 
+/// Upsert `id`'s route, returning whether it displaced a route whose device is
+/// still alive. A displaced route that no longer upgrades belongs to a device
+/// its owner already dropped (it just hasn't been woken, and so pruned, yet).
+fn register_route(routes: &Routes, id: String, route: Route) -> bool {
+    lock(routes)
+        .insert(id, route)
+        .is_some_and(|prev| prev.cmd_tx.upgrade().is_some())
+}
+
 /// Wake the device registered under `id`, if any: a non-blocking `try_send` of
 /// `ConnectNow`, carrying `ip` (joined to the registered port) when the address
 /// may have changed, and `version` when the announcement declared one. A closed
@@ -926,5 +934,35 @@ mod tests {
         // And waking an id that is no longer registered is a no-op, not a panic —
         // every later announcement for that device takes this path.
         route_wake(&routes, "dev", Some("192.168.1.5"), None);
+    }
+
+    /// Re-registering an id is a collision only while the previous device is
+    /// still alive. A dropped device's route lingers until a wake prunes it, so
+    /// a remove-then-re-add (or a clear-then-re-add) replaces a dead route —
+    /// which must not be reported as a superseded one.
+    #[test]
+    fn re_registering_over_a_dropped_device_is_not_a_collision() {
+        let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+        let route = |tx: &mpsc::Sender<Cmd>| Route {
+            cmd_tx: tx.downgrade(),
+            port: 6668,
+        };
+        let (first, _rx1) = mpsc::channel::<Cmd>(4);
+        let (second, _rx2) = mpsc::channel::<Cmd>(4);
+        let (third, _rx3) = mpsc::channel::<Cmd>(4);
+
+        assert!(!register_route(&routes, "dev".into(), route(&first)));
+        assert!(
+            register_route(&routes, "dev".into(), route(&second)),
+            "displacing a live device's route is a real collision"
+        );
+
+        // The owner drops the device; no wake has pruned its route yet.
+        drop(second);
+        assert!(
+            !register_route(&routes, "dev".into(), route(&third)),
+            "replacing a dropped device's lingering route is not a collision"
+        );
+        assert_eq!(lock(&routes).len(), 1);
     }
 }
