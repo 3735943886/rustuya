@@ -317,6 +317,13 @@ impl Device {
         self.state == State::Connecting
     }
 
+    /// Currently selected protocol version. `Auto` remains unresolved until a
+    /// concrete version is supplied by discovery via `Input::ConnectNow`.
+    #[must_use]
+    pub fn version(&self) -> Version {
+        self.cfg.version
+    }
+
     /// Whether the device is connected and past any handshake.
     #[must_use]
     pub fn is_connected(&self) -> bool {
@@ -1200,7 +1207,7 @@ mod tests {
             T0,
             &mut rng,
         );
-        assert_eq!(dev.cfg.version, Version::V3_4, "announcement not adopted");
+        assert_eq!(dev.version(), Version::V3_4, "announcement not adopted");
         assert!(dev.wants_connect(), "and the wake still redials");
     }
 

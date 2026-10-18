@@ -123,7 +123,10 @@ let dev = rustuya::tokio::Device::builder("device_id_22chars0000", "0123456789ab
 To register immediately even while the device is absent, use
 `Device::builder(id, key).version(Version::Auto).rediscover(&disco).connect()?`
 without an address. `Version::Auto` adopts the announced protocol version; an
-explicit version is preserved.
+explicit version is preserved. A known IP with `Auto` also waits for a concrete
+announced version before dialing; an announcement without a version is not
+sufficient. `Auto` requires linked discovery. Explicit address and version can
+connect without discovery.
 Resolution misses and TCP failures use the same reconnect backoff; discovery
 announcements wake the existing actor. No placeholder address is used.
 `watch_connection_state()` distinguishes initial `Pending`, actual

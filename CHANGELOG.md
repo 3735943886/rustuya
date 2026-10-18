@@ -6,6 +6,24 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-10-18
+
+### Fixed
+
+- Resolve both address and protocol version before dialing: a known IP with
+  `Version::Auto` now waits for a concrete discovery version instead of falling
+  back to v3.3 and reporting TCP-only success. Versionless announcements remain
+  unresolved. Discovery misses use the existing reconnect backoff and acquire no
+  connection-limiter permit; later announcements wake the same actor.
+- Reject `Version::Auto` without linked discovery as a configuration error.
+  Explicit protocol versions continue to work without discovery and take
+  precedence over announced versions.
+
+### Added
+
+- `rustuya_core::device::Device::version()` exposes the currently selected
+  version so the driver can check readiness without duplicating resolution state.
+
 ## [0.4.5] — 2026-10-18
 
 ### Added

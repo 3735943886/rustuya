@@ -391,10 +391,11 @@ impl DeviceBuilder {
     }
 
     /// Spawn the device actor and return a handle. Fails if
-    /// neither an address nor discovery is configured, the local key is not
-    /// 16 bytes, or the heartbeat interval is zero. Addressless devices linked
-    /// through [`rediscover`](Self::rediscover) resolve in the background and
-    /// retry with the same backoff as failed TCP connections.
+    /// neither an address nor discovery is configured, `Version::Auto` has no
+    /// discovery, the local key is not 16 bytes, or the heartbeat interval is zero.
+    /// A missing address or `Auto` version resolves in the background through
+    /// [`rediscover`](Self::rediscover). Both must be resolved before dialing;
+    /// misses retry with the same backoff as failed TCP connections.
     /// Positive fractions of a millisecond round up for core timers.
     pub fn connect(self) -> Result<Device> {
         if self.heartbeat.is_some_and(|d| d.is_zero()) {
@@ -404,6 +405,11 @@ impl DeviceBuilder {
         }
         if self.address.is_none() && self.rediscover.is_none() {
             return Err(TuyaError::Config("address or discovery is required"));
+        }
+        if self.version == Version::Auto && self.rediscover.is_none() {
+            return Err(TuyaError::Config(
+                "auto protocol version requires discovery",
+            ));
         }
         let mut local_key: [u8; 16] = self
             .local_key

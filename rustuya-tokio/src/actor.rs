@@ -220,7 +220,8 @@ async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &S
         //     backoff timer).
         if fsm.wants_connect() {
             // Resolution is part of establishment, not a separate supervisor.
-            // No socket or limiter permit is used until an address is available.
+            // No socket or limiter permit is used until both address and protocol
+            // version are resolved. The core owns the selected version.
             if let Some(info) = discovery.as_ref().and_then(|d| d.get(&id)) {
                 if addr.is_none() {
                     addr = Some(join_host_port(&info.ip.to_string(), port));
@@ -233,8 +234,10 @@ async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &S
                     &mut rng,
                 );
             }
-            if addr.is_none() {
-                log::debug!("{id}: address not discovered; retrying with connection backoff");
+            if addr.is_none() || fsm.version() == rustuya_core::Version::Auto {
+                log::debug!(
+                    "{id}: address or protocol version not discovered; retrying with connection backoff"
+                );
                 if let Some(disco) = &discovery {
                     disco.request_scan();
                 }
