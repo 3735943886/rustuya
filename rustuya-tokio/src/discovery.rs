@@ -21,8 +21,8 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 use rand::rngs::StdRng;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinSet;
 use tokio::time::Instant as TokioInstant;
 
 use rustuya_core::Version;
@@ -61,16 +61,36 @@ struct Route {
     /// only pruned when the channel closes, nothing would ever remove it either.
     /// The device would go on reconnecting forever, invisible to its owner. A
     /// `WeakSender` doesn't hold the channel open, so the actor exits when its
-    /// last real handle goes and the next wake prunes the dead route.
+    /// last real handle goes; its Registration guard then removes the route.
     cmd_tx: mpsc::WeakSender<Cmd>,
     port: u16,
+    token: Arc<()>,
+}
+
+/// Removes only this actor's registration, even when its id was re-registered.
+pub(crate) struct Registration {
+    routes: Routes,
+    id: String,
+    token: Arc<()>,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut routes = lock(&self.routes);
+        if routes
+            .get(&self.id)
+            .is_some_and(|route| Arc::ptr_eq(&route.token, &self.token))
+        {
+            routes.remove(&self.id);
+        }
+    }
 }
 
 /// `id → route`. This is the reconnect fast-path: on a device announcement the
 /// actor does **one** map lookup and wakes only that device — O(1), replacing an
 /// O(N) per-device broadcast-subscribe-and-filter forwarder (which made the fleet
 /// O(N²) and could drop the reconnect trigger under bus lag). Entries are
-/// lazily pruned when a device's actor has gone (its `cmd_tx` closes).
+/// removed by the actor's registration guard on exit; wakes also prune dead routes.
 type Routes = Arc<Mutex<BTreeMap<String, Route>>>;
 
 /// Lock a discovery map, recovering from poisoning. Every critical section here is
@@ -279,7 +299,8 @@ impl DiscoveryBuilder {
     /// rounds by `interval` (robustness against UDP loss). `None` makes a scan
     /// **perpetual** once triggered (the 0.3 always-on behavior) — an explicit
     /// opt-in that runs until the discovery is dropped, since there is no runtime
-    /// stop; prefer a small `Some(n)` for a polite network.
+    /// stop; prefer a small `Some(n)` for a polite network. Repeated rounds
+    /// require a positive interval; fractions of a millisecond round up.
     #[must_use]
     pub fn probe_cadence(mut self, interval: StdDuration, burst: Option<u32>) -> Self {
         self.broadcast_interval = interval;
@@ -341,8 +362,17 @@ impl DiscoveryBuilder {
     }
 
     /// Bind the sockets and spawn the discovery actor. Must be called inside a
-    /// tokio runtime. Fails only if **every** requested port fails to bind.
+    /// tokio runtime. Fails if every requested port fails to bind or repeated
+    /// probes have a zero interval. Positive fractions of a millisecond round up.
     pub fn build(self) -> Result<Discovery> {
+        if self.broadcast_interval.is_zero()
+            && self.broadcast_burst != Some(0)
+            && self.broadcast_burst != Some(1)
+        {
+            return Err(TuyaError::Config(
+                "repeated probes require a positive interval",
+            ));
+        }
         // Bind each requested port; tolerate individual failures (a port already
         // held elsewhere) as long as at least one succeeds.
         let mut recv_socks = Vec::new();
@@ -410,10 +440,16 @@ impl DiscoveryBuilder {
             max_known: self.max_devices,
             routes: routes.clone(),
         };
-        tokio::spawn(run(core, recv_socks, self.active, ctrl_rx, want_rx, sinks));
+        let (done_tx, done) = watch::channel(());
+        let active = self.active;
+        tokio::spawn(async move {
+            let _done = done_tx;
+            run(core, recv_socks, active, ctrl_rx, want_rx, sinks).await;
+        });
 
         Ok(Discovery {
             ctrl_tx,
+            done,
             want_tx,
             found_tx,
             known,
@@ -427,6 +463,7 @@ impl DiscoveryBuilder {
 #[derive(Clone)]
 pub struct Discovery {
     ctrl_tx: mpsc::Sender<Ctrl>,
+    done: watch::Receiver<()>,
     /// Demand signal for an on-demand active probe. Sent by `find`/`scan` and by a
     /// device that just failed to dial; the actor batch-drains these and emits at
     /// most one probe round per drain (single-flight). Non-blocking `try_send`, so
@@ -484,22 +521,34 @@ impl Discovery {
     /// Register a device's actor so the discovery loop can wake it directly (O(1))
     /// when that id announces — the reconnect fast-path replacing a per-device
     /// broadcast forwarder. `port` rebuilds `ip:port` from an announced IP. The
-    /// entry is pruned automatically once the actor's channel closes.
+    /// returned guard removes the entry when the actor exits.
     ///
     /// **Last-wins** upsert (mirrors the 0.3 bridge's same-id defense): a second
     /// device registered under an id supersedes the first's route (the displaced
     /// one falls back to plain backoff). A collision is almost always a
     /// misconfiguration, so it is logged — but only against a *live* device: a
-    /// dropped one's route lingers until a wake prunes it, and replacing that is
+    /// dropped one's actor may still be exiting, and replacing its route is
     /// an ordinary re-add, not a collision.
-    pub(crate) fn register(&self, id: String, cmd_tx: mpsc::Sender<Cmd>, port: u16) {
+    pub(crate) fn register(
+        &self,
+        id: String,
+        cmd_tx: mpsc::Sender<Cmd>,
+        port: u16,
+    ) -> Registration {
+        let token = Arc::new(());
         let route = Route {
             // Downgraded so the registry never keeps a device alive — see `Route`.
             cmd_tx: cmd_tx.downgrade(),
             port,
+            token: token.clone(),
         };
         if register_route(&self.routes, id.clone(), route) {
             log::warn!("discovery: device id {id} re-registered; superseding previous route");
+        }
+        Registration {
+            routes: self.routes.clone(),
+            id,
+            token,
         }
     }
 
@@ -576,9 +625,11 @@ impl Discovery {
         seen.into_values().collect()
     }
 
-    /// Stop the discovery task and its readers.
+    /// Stop the discovery task and wait for its readers to exit. Idempotent.
     pub async fn close(&self) {
         let _ = self.ctrl_tx.send(Ctrl::Close).await;
+        let mut done = self.done.clone();
+        while done.changed().await.is_ok() {}
     }
 }
 
@@ -640,11 +691,10 @@ async fn run(
     // inbound-announce backlog before a reader backpressures (a whole fleet
     // announcing at once); the actor drains it promptly, so it rarely fills.
     let (dgram_tx, mut dgram_rx) = mpsc::channel::<(Vec<u8>, std::net::IpAddr)>(256);
-    let mut readers: Vec<JoinHandle<()>> = Vec::new();
+    let mut readers = JoinSet::new();
     for sock in recv_socks {
-        let sock = Arc::new(sock);
         let tx = dgram_tx.clone();
-        readers.push(tokio::spawn(async move {
+        readers.spawn(async move {
             // UDP has no reassembly: one datagram, one recv, and `recv_from`
             // silently truncates anything past the buffer. Announce datagrams run a
             // few hundred bytes; 8 KiB is generous headroom so an oversized one is
@@ -663,7 +713,7 @@ async fn run(
                     }
                 }
             }
-        }));
+        });
     }
     drop(dgram_tx); // only the reader tasks keep the sender alive
 
@@ -673,13 +723,15 @@ async fn run(
     settle(&mut fsm, &sinks).await;
 
     let mut warned_drop = false;
+    let mut receiving = true;
+    let mut wants_open = true;
     loop {
         let deadline = fsm
             .poll_timeout()
             .map(|d| base + StdDuration::from_millis(d.as_millis()));
 
         tokio::select! {
-            dgram = dgram_rx.recv() => match dgram {
+            dgram = dgram_rx.recv(), if receiving => match dgram {
                 Some((data, from)) => {
                     let dropped_before = fsm.rejected();
                     fsm.handle_input(Input::Datagram { data: &data, from }, now_since(base), &mut rng);
@@ -699,12 +751,12 @@ async fn run(
                         }
                     }
                 }
-                None => { /* all readers ended; keep serving control/timer */ }
+                None => receiving = false,
             },
             // Demand-driven active probe. Drain the whole burst so N simultaneous
             // requests collapse to one `StartScan` (single-flight). `active(false)`
             // discovery ignores the demand (passive only).
-            want = want_rx.recv() => match want {
+            want = want_rx.recv(), if wants_open => match want {
                 Some(()) => {
                     while want_rx.try_recv().is_ok() {} // coalesce the burst
                     if active {
@@ -713,13 +765,11 @@ async fn run(
                         fsm.handle_input(Input::StartScan, now_since(base), &mut rng);
                     }
                 }
-                None => { /* all want-senders dropped; keep serving */ }
+                None => wants_open = false,
             },
             ctrl = ctrl_rx.recv() => match ctrl {
                 Some(Ctrl::Close) | None => {
-                    for r in readers {
-                        r.abort();
-                    }
+                    readers.shutdown().await;
                     return;
                 }
             },
@@ -774,9 +824,10 @@ async fn settle(fsm: &mut DiscoveryFsm, sinks: &Sinks) {
             // device keeps announcing, because every announcement refreshes the
             // cache entry and so the TTL never expires.
             Event::Seen(id) => {
-                let announced = lock(&sinks.known)
-                    .get(&id)
-                    .map(|(info, _)| (info.ip.to_string(), info.version));
+                let announced = lock(&sinks.known).get_mut(&id).map(|(info, at)| {
+                    *at = StdInstant::now();
+                    (info.ip.to_string(), info.version)
+                });
                 let (ip, version) = match announced {
                     Some((ip, version)) => (Some(ip), version),
                     None => (None, None),
@@ -835,6 +886,164 @@ mod tests {
             ip: "192.168.0.9".parse().unwrap(),
             version: None,
             product_key: None,
+        }
+    }
+
+    fn config() -> CoreConfig {
+        CoreConfig {
+            cache_ttl: rustuya_core::time::Duration::from_secs(60),
+            broadcast_interval: rustuya_core::time::Duration::from_secs(6),
+            broadcast_burst: Some(1),
+            local_ips: Vec::new(),
+            require_source_match: true,
+            max_entries: 8,
+        }
+    }
+
+    fn sinks() -> Sinks {
+        let (found_tx, _) = broadcast::channel(8);
+        Sinks {
+            default_send: bind_send_from(Ipv4Addr::LOCALHOST).unwrap(),
+            send_socks: BTreeMap::new(),
+            found_tx,
+            known: Arc::new(Mutex::new(BTreeMap::new())),
+            max_known: 8,
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_inputs_wait_without_self_waking_and_still_accept_close() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (want_tx, want_rx) = mpsc::channel(1);
+        drop(want_tx);
+        // No readers closes the datagram input as well.
+        let driver = run(config(), Vec::new(), false, ctrl_rx, want_rx, sinks());
+        tokio::pin!(driver);
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(count.0.load(Ordering::Relaxed), 0);
+        ctrl_tx.send(Ctrl::Close).await.unwrap();
+        driver.await;
+    }
+
+    #[tokio::test]
+    async fn unchanged_announcements_refresh_last_seen_and_eviction_order() {
+        let sinks = sinks();
+        let old = StdInstant::now() - StdDuration::from_secs(10);
+        let mut info = info("live");
+        info.ip = Ipv4Addr::LOCALHOST.into();
+        remember_at(&sinks.known, &info, 2, old);
+        remember_at(
+            &sinks.known,
+            &self::info("silent"),
+            2,
+            old + StdDuration::from_secs(1),
+        );
+        let data = br#"{"gwId":"live","ip":"127.0.0.1","version":"3.3"}"#;
+        let mut fsm = DiscoveryFsm::new(config());
+        let mut rng = rand::make_rng::<StdRng>();
+        let input = || Input::Datagram {
+            data,
+            from: Ipv4Addr::LOCALHOST.into(),
+        };
+        fsm.handle_input(input(), CoreInstant::from_millis(0), &mut rng);
+        // Discard Found: the stale timestamp above represents that first sighting.
+        assert!(matches!(fsm.poll_event(), Some(Event::Found(_))));
+        let before = StdInstant::now();
+        fsm.handle_input(input(), CoreInstant::from_millis(1), &mut rng);
+        settle(&mut fsm, &sinks).await;
+        assert!(lock(&sinks.known)["live"].1 >= before);
+        remember(&sinks.known, &self::info("new"), 2);
+        assert!(lock(&sinks.known).contains_key("live"));
+        assert!(!lock(&sinks.known).contains_key("silent"));
+    }
+
+    #[tokio::test]
+    async fn registration_drop_removes_only_its_own_route() {
+        let disco = Discovery::builder()
+            .ports(vec![0])
+            .active(false)
+            .build()
+            .unwrap();
+        let (first, _rx1) = mpsc::channel(1);
+        let (second, _rx2) = mpsc::channel(1);
+        let old = disco.register("dev".into(), first, 6668);
+        let new = disco.register("dev".into(), second, 6668);
+        drop(old);
+        assert_eq!(lock(&disco.routes).len(), 1);
+        drop(new);
+        assert!(lock(&disco.routes).is_empty());
+        disco.close().await;
+    }
+
+    #[tokio::test]
+    async fn device_exit_removes_route_without_another_announcement() {
+        let disco = Discovery::builder()
+            .ports(vec![0])
+            .active(false)
+            .build()
+            .unwrap();
+        let dev = crate::Device::builder("dev", b"0123456789abcdef".to_vec())
+            .address("127.0.0.1")
+            .port(1)
+            .rediscover(&disco)
+            .connect()
+            .unwrap();
+        assert_eq!(lock(&disco.routes).len(), 1);
+        dev.close().await;
+        assert!(lock(&disco.routes).is_empty());
+        disco.close().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_driver_releases_reader_socket_before_returning() {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (_want_tx, want_rx) = mpsc::channel(1);
+        ctrl_tx.send(Ctrl::Close).await.unwrap();
+        run(config(), vec![sock], false, ctrl_rx, want_rx, sinks()).await;
+        let _rebound = std::net::UdpSocket::bind(addr).unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_readers_and_is_idempotent() {
+        let disco = Discovery::builder()
+            .ports(vec![0])
+            .active(false)
+            .build()
+            .unwrap();
+        let other = disco.clone();
+        tokio::join!(disco.close(), other.close());
+        assert!(disco.done.has_changed().is_err());
+        disco.close().await;
+        assert!(disco.ctrl_tx.is_closed());
+    }
+
+    #[test]
+    fn repeated_probes_reject_zero_interval_before_binding() {
+        for burst in [Some(2), None] {
+            assert!(matches!(
+                Discovery::builder()
+                    .probe_cadence(StdDuration::ZERO, burst)
+                    .build(),
+                Err(TuyaError::Config(
+                    "repeated probes require a positive interval"
+                ))
+            ));
         }
     }
 
@@ -908,6 +1117,7 @@ mod tests {
             Route {
                 cmd_tx: cmd_tx.downgrade(),
                 port: 6668,
+                token: Arc::new(()),
             },
         );
 
@@ -946,6 +1156,7 @@ mod tests {
         let route = |tx: &mpsc::Sender<Cmd>| Route {
             cmd_tx: tx.downgrade(),
             port: 6668,
+            token: Arc::new(()),
         };
         let (first, _rx1) = mpsc::channel::<Cmd>(4);
         let (second, _rx2) = mpsc::channel::<Cmd>(4);

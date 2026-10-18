@@ -513,7 +513,7 @@ impl Device {
             t,
         );
         let plaintext = json::to_bytes(&value);
-        let key = self.active_key().to_vec();
+        let key = Zeroizing::new(self.active_key().to_vec());
         match self.encode(code, &plaintext, &key, rng) {
             Ok(bytes) => {
                 self.tx.push_back(bytes);
@@ -602,7 +602,7 @@ impl Device {
             0,
         );
         let plaintext = json::to_bytes(&value);
-        let key = self.active_key().to_vec();
+        let key = Zeroizing::new(self.active_key().to_vec());
         match self.encode(code, &plaintext, &key, rng) {
             Ok(bytes) => self.tx.push_back(bytes),
             Err(e) => self.events.push_back(Event::ProtocolError(e)),

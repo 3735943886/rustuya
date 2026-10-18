@@ -6,6 +6,7 @@
 //! command-generation / response-parsing layer does. See `docs/MILESTONES.md` (D8)
 //! and `docs/DESIGN.md`.
 
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 pub use serde_json::{Map, Value};
@@ -13,7 +14,9 @@ pub use serde_json::{Map, Value};
 /// Serializes a JSON value to bytes for the wire.
 #[must_use]
 pub fn to_bytes(value: &Value) -> Vec<u8> {
-    serde_json::to_vec(value).unwrap_or_default()
+    // Value has no fallible custom serializers; formatting into a String is
+    // infallible and cannot turn an error into an empty wire payload.
+    value.to_string().into_bytes()
 }
 
 /// Parses JSON bytes, returning `None` on malformed input.

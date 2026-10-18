@@ -76,9 +76,11 @@ pub use rustuya_core::json::Value;
 pub use rustuya_core::message::Message;
 pub use rustuya_core::{CommandType, CoreError, DeviceType, Version};
 
-/// Milliseconds → core `Duration` (the core has no `std::time`).
+/// Convert std durations to core milliseconds, rounding positive fractions up.
 fn core_dur(d: StdDuration) -> CoreDuration {
-    CoreDuration::from_millis(d.as_millis() as u64)
+    // Preserve positive sub-millisecond delays and saturate instead of wrapping.
+    let millis = d.as_nanos().div_ceil(1_000_000).min(u128::from(u64::MAX));
+    CoreDuration::from_millis(millis as u64)
 }
 
 /// `host:port` for `TcpStream::connect`, bracketing an IPv6 literal (`[::1]:6668`).
@@ -287,7 +289,8 @@ impl DeviceBuilder {
         self
     }
 
-    /// Keepalive interval, or `None` to disable heartbeats.
+    /// Keepalive interval, or `None` to disable heartbeats. Zero is rejected by
+    /// `connect`; positive fractions of a millisecond round up.
     #[must_use]
     pub fn heartbeat(mut self, interval: Option<StdDuration>) -> Self {
         self.heartbeat = interval;
@@ -374,8 +377,14 @@ impl DeviceBuilder {
     }
 
     /// Spawn the device actor and return a handle. Fails if `address` is unset or
-    /// the local key is not 16 bytes.
+    /// the local key is not 16 bytes, or the heartbeat interval is zero.
+    /// Positive fractions of a millisecond round up for core timers.
     pub fn connect(self) -> Result<Device> {
+        if self.heartbeat.is_some_and(|d| d.is_zero()) {
+            return Err(TuyaError::Config(
+                "heartbeat must be positive; use None to disable",
+            ));
+        }
         let address = self
             .address
             .ok_or(TuyaError::Config("address is required"))?;
@@ -441,10 +450,11 @@ impl DeviceBuilder {
         // unchanged sighting (same-IP reconnect, backoff cancellation, P3). No
         // per-device forwarder task, no broadcast subscription for the fast path.
         // The actor also gets the demand sender so a failed dial re-elicits a probe.
-        let want_scan = self.rediscover.as_ref().map(|disco| {
-            disco.register(self.id.clone(), cmd_tx.clone(), self.port);
-            disco.want_sender()
-        });
+        let registration = self
+            .rediscover
+            .as_ref()
+            .map(|disco| disco.register(self.id.clone(), cmd_tx.clone(), self.port));
+        let want_scan = self.rediscover.as_ref().map(Discovery::want_sender);
 
         let acfg = ActorConfig {
             core,
@@ -455,15 +465,19 @@ impl DeviceBuilder {
         };
 
         let bcast_for_actor = bcast_tx.clone();
-        tokio::spawn(actor::run(
-            acfg,
-            cmd_rx,
-            bcast_for_actor,
-            status_tx,
-            conn_tx,
-            autherr_tx,
-            shutdown_rx,
-        ));
+        tokio::spawn(async move {
+            let _registration = registration;
+            actor::run(
+                acfg,
+                cmd_rx,
+                bcast_for_actor,
+                status_tx,
+                conn_tx,
+                autherr_tx,
+                shutdown_rx,
+            )
+            .await;
+        });
 
         Ok(Device {
             id: self.id,
@@ -932,8 +946,30 @@ impl Stream for MultiListener {
 }
 
 #[cfg(test)]
-mod host_port_tests {
-    use super::join_host_port;
+mod tests {
+    use super::{Device, StdDuration, TuyaError, core_dur, join_host_port};
+
+    #[test]
+    fn duration_conversion_preserves_positive_delays_and_saturates() {
+        assert_eq!(core_dur(StdDuration::ZERO).as_millis(), 0);
+        assert_eq!(core_dur(StdDuration::from_nanos(1)).as_millis(), 1);
+        assert_eq!(core_dur(StdDuration::from_micros(1_001)).as_millis(), 2);
+        assert_eq!(core_dur(StdDuration::from_millis(5)).as_millis(), 5);
+        assert_eq!(core_dur(StdDuration::MAX).as_millis(), u64::MAX);
+    }
+
+    #[test]
+    fn zero_heartbeat_is_rejected_before_spawning() {
+        assert!(matches!(
+            Device::builder("dev", b"0123456789abcdef".to_vec())
+                .address("127.0.0.1")
+                .heartbeat(Some(StdDuration::ZERO))
+                .connect(),
+            Err(TuyaError::Config(
+                "heartbeat must be positive; use None to disable"
+            ))
+        ));
+    }
 
     #[test]
     fn brackets_only_ipv6_literals() {
