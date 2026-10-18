@@ -120,6 +120,16 @@ let dev = rustuya::tokio::Device::builder("device_id_22chars0000", "0123456789ab
     .await?;
 ```
 
+To register immediately even while the device is absent, use
+`Device::builder(id, key).version(Version::Auto).rediscover(&disco).connect()?`
+without an address. `Version::Auto` adopts the announced protocol version; an
+explicit version is preserved.
+Resolution misses and TCP failures use the same reconnect backoff; discovery
+announcements wake the existing actor. No placeholder address is used.
+`watch_connection_state()` distinguishes initial `Pending`, actual
+`Disconnected` (including the first failure), and `Connected`. Repeated failures
+notify only once until a successful connection.
+
 Linking a `Discovery` to a device (via `.discover()` or `.rediscover()`) lets a
 re-announcement cancel the reconnect backoff and redial immediately — and a
 changed IP self-corrects.

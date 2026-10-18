@@ -296,7 +296,7 @@ async fn sub_discover_sends_the_gateway_query_envelope() {
 }
 
 #[tokio::test]
-async fn connect_requires_an_address() {
+async fn connect_requires_an_address_or_discovery() {
     let err = Device::builder(ID, *KEY)
         .connect()
         .expect_err("no address → error");

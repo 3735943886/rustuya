@@ -6,6 +6,24 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-10-18
+
+### Added
+
+- Addressless `DeviceBuilder::rediscover(&discovery).connect()` registers an
+  actor immediately. Missing addresses request discovery and enter the existing
+  reconnect backoff; later announcements supply address/version and wake it.
+  Unresolved devices do not acquire connection-limiter permits.
+- `ConnectionState` and `Device::watch_connection_state()` distinguish startup
+  from a failed first attempt. Repeated failures do not repeat notifications.
+- `Discovery::get(id)` reads one cached announcement without scanning the fleet.
+
+### Fixed
+
+- Preserve announced protocol versions received while waiting for a connection
+  permit, applying them before dialing instead of dropping them.
+
+
 ## [0.4.4] — 2026-10-18
 
 ### Fixed

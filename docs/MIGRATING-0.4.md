@@ -81,6 +81,8 @@ closing. Dropping the last device handle also stops the actor.
 
 Share one `Discovery` across devices. `.discover()` links it for later IP
 changes and reconnect wakes; for a known IP, use `.rediscover(&disco)`.
+For immediate addressless registration with background retry (0.4.5+), use
+`.rediscover(&disco).connect()` without an address.
 Discovery checks the announced IP against the UDP source by default. If an
 intentional relay changes that source, configure `require_source_match(false)`
 explicitly. `max_devices` bounds the discovery cache.

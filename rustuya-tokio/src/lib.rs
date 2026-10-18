@@ -76,6 +76,18 @@ pub use rustuya_core::json::Value;
 pub use rustuya_core::message::Message;
 pub use rustuya_core::{CommandType, CoreError, DeviceType, Version};
 
+/// Outcome of connection establishment, including the first failed attempt.
+/// Repeated failures remain `Disconnected` until a connection succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// No connection attempt has completed yet.
+    Pending,
+    /// TCP and any required protocol handshake completed successfully.
+    Connected,
+    /// Address resolution, connection, or the established link failed.
+    Disconnected,
+}
+
 /// Convert std durations to core milliseconds, rounding positive fractions up.
 fn core_dur(d: StdDuration) -> CoreDuration {
     // Preserve positive sub-millisecond delays and saturate instead of wrapping.
@@ -243,7 +255,7 @@ impl DeviceBuilder {
         }
     }
 
-    /// Device IP or hostname (required).
+    /// Device IP or hostname. Optional when discovery is linked via `rediscover`.
     #[must_use]
     pub fn address(mut self, address: impl Into<String>) -> Self {
         self.address = Some(address.into());
@@ -360,7 +372,9 @@ impl DeviceBuilder {
     /// `ConnectNow`, DESIGN P3). Independent of [`address`](Self::address):
     /// use it with a fixed address to cut reconnect latency when the device
     /// reappears, instead of waiting out the backoff. [`discover`](Self::discover)
-    /// links this automatically.
+    /// links this automatically. Without an address, the actor resolves through
+    /// this discovery and retries misses with its normal connection backoff.
+    /// Set [`Version::Auto`] to adopt the announced protocol version.
     #[must_use]
     pub fn rediscover(mut self, disco: &Discovery) -> Self {
         self.rediscover = Some(disco.clone());
@@ -376,8 +390,11 @@ impl DeviceBuilder {
         self
     }
 
-    /// Spawn the device actor and return a handle. Fails if `address` is unset or
-    /// the local key is not 16 bytes, or the heartbeat interval is zero.
+    /// Spawn the device actor and return a handle. Fails if
+    /// neither an address nor discovery is configured, the local key is not
+    /// 16 bytes, or the heartbeat interval is zero. Addressless devices linked
+    /// through [`rediscover`](Self::rediscover) resolve in the background and
+    /// retry with the same backoff as failed TCP connections.
     /// Positive fractions of a millisecond round up for core timers.
     pub fn connect(self) -> Result<Device> {
         if self.heartbeat.is_some_and(|d| d.is_zero()) {
@@ -385,9 +402,9 @@ impl DeviceBuilder {
                 "heartbeat must be positive; use None to disable",
             ));
         }
-        let address = self
-            .address
-            .ok_or(TuyaError::Config("address is required"))?;
+        if self.address.is_none() && self.rediscover.is_none() {
+            return Err(TuyaError::Config("address or discovery is required"));
+        }
         let mut local_key: [u8; 16] = self
             .local_key
             .as_slice()
@@ -440,6 +457,7 @@ impl DeviceBuilder {
         // the latest value without ever lagging.
         let (status_tx, status_rx) = watch::channel(None);
         let (conn_tx, conn_rx) = watch::channel(false);
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Pending);
         // Carries the last authentication failure (wrong key / version) so a
         // connect attempt reports *why* rather than only timing out.
         let (autherr_tx, autherr_rx) = watch::channel(None);
@@ -454,13 +472,16 @@ impl DeviceBuilder {
             .rediscover
             .as_ref()
             .map(|disco| disco.register(self.id.clone(), cmd_tx.clone(), self.port));
-        let want_scan = self.rediscover.as_ref().map(Discovery::want_sender);
 
         let acfg = ActorConfig {
             core,
-            addr: join_host_port(&address, self.port),
+            addr: self
+                .address
+                .as_deref()
+                .map(|address| join_host_port(address, self.port)),
+            port: self.port,
             connect_timeout: self.connect_timeout,
-            want_scan,
+            discovery: self.rediscover,
             connect_limiter: self.connect_limiter,
         };
 
@@ -470,10 +491,13 @@ impl DeviceBuilder {
             actor::run(
                 acfg,
                 cmd_rx,
-                bcast_for_actor,
-                status_tx,
-                conn_tx,
-                autherr_tx,
+                actor::Sinks {
+                    bcast: bcast_for_actor,
+                    status: status_tx,
+                    conn: conn_tx,
+                    state: state_tx,
+                    autherr: autherr_tx,
+                },
                 shutdown_rx,
             )
             .await;
@@ -486,6 +510,7 @@ impl DeviceBuilder {
             bcast_tx,
             status_rx,
             conn_rx,
+            state_rx,
             autherr_rx,
             send_timeout: self.send_timeout,
         })
@@ -523,6 +548,7 @@ pub struct Device {
     bcast_tx: broadcast::Sender<Message>,
     status_rx: watch::Receiver<Option<Message>>,
     conn_rx: watch::Receiver<bool>,
+    state_rx: watch::Receiver<ConnectionState>,
     autherr_rx: watch::Receiver<Option<CoreError>>,
     send_timeout: StdDuration,
 }
@@ -587,6 +613,15 @@ impl Device {
     #[must_use]
     pub fn watch_connected(&self) -> watch::Receiver<bool> {
         self.conn_rx.clone()
+    }
+
+    /// A watch distinguishing startup (`Pending`) from an actual failed attempt
+    /// (`Disconnected`). Read the initial value as well as subsequent changes:
+    /// establishment may finish before a subscriber attaches. Repeated failures
+    /// do not notify again; a successful connection transitions to `Connected`.
+    #[must_use]
+    pub fn watch_connection_state(&self) -> watch::Receiver<ConnectionState> {
+        self.state_rx.clone()
     }
 
     /// A [`watch`] of the last **authentication** failure —

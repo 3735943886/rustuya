@@ -503,12 +503,6 @@ impl Discovery {
         let _ = self.want_tx.try_send(());
     }
 
-    /// The demand sender, handed to a device actor so a failed dial can ask for a
-    /// probe (active-only devices, or a moved IP the cache hasn't caught).
-    pub(crate) fn want_sender(&self) -> mpsc::Sender<()> {
-        self.want_tx.clone()
-    }
-
     /// Fire an active scan and collect every device seen during `window` (deduped
     /// by id). The standalone enumerate — "list the Tuya devices on my LAN" — that
     /// needs no [`Device`](crate::Device). `window` is caller-chosen (no library
@@ -562,7 +556,7 @@ impl Discovery {
         // gap between the cache miss and awaiting the stream, the subscription
         // still catches it — no lost-wakeup.
         let mut stream = self.discovered();
-        if let Some((info, _)) = lock(&self.known).get(device_id).cloned() {
+        if let Some(info) = self.get(device_id) {
             return Ok(info);
         }
         // Miss: elicit it with one probe (coalesced), then wait.
@@ -580,6 +574,16 @@ impl Discovery {
             Ok(r) => r,
             Err(_) => Err(TuyaError::Timeout),
         }
+    }
+
+    /// The most recently cached announcement for one device, if known.
+    /// Does not wait or request a probe; a stale address recovers through the
+    /// device's normal reconnect and discovery path.
+    #[must_use]
+    pub fn get(&self, device_id: &str) -> Option<DeviceInfo> {
+        lock(&self.known)
+            .get(device_id)
+            .map(|(info, _)| info.clone())
     }
 
     /// A snapshot of every device discovered so far (id → info). Not time-filtered;

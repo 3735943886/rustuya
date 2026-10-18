@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, broadcast, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
 
-use crate::ConnectLimiter;
+use crate::{ConnectLimiter, ConnectionState, Discovery, join_host_port};
 
 use rustuya_core::device::{Config as CoreConfig, Device, Event, Input};
 use rustuya_core::json::Value;
@@ -93,12 +93,11 @@ pub(crate) enum Cmd {
 /// Everything the actor needs to run one device, moved in at spawn time.
 pub(crate) struct ActorConfig {
     pub core: CoreConfig,
-    pub addr: String,
+    pub addr: Option<String>,
+    pub port: u16,
     pub connect_timeout: StdDuration,
-    /// Demand signal to the linked discovery: pinged on a failed dial so an
-    /// active-only device (or one that moved IP) gets re-elicited. `None` when no
-    /// discovery is linked. Coalesced at the discovery end (single-flight).
-    pub want_scan: Option<mpsc::Sender<()>>,
+    /// Shared cache and coalesced probe requests for unresolved or stale addresses.
+    pub discovery: Option<Discovery>,
     /// Fleet-wide cap on simultaneous connection establishment, or `None` for no
     /// cap (the default). A permit is taken before each dial and released the
     /// moment the FSM leaves `is_establishing()`.
@@ -130,19 +129,34 @@ fn unix_secs() -> u64 {
 
 /// The channels the actor publishes out on, grouped so `settle`/`dispatch_events`
 /// take one value instead of a growing argument list.
-struct Sinks {
+pub(crate) struct Sinks {
     /// The push/response bus feeding every [`Listener`](crate::Listener).
-    bcast: broadcast::Sender<Message>,
+    pub(crate) bcast: broadcast::Sender<Message>,
     /// Latch of the device's current status frame (last non-empty frame), feeding
     /// [`watch_status`](crate::Device::watch_status). State, not an event: a slow
     /// consumer that only wants the latest value reads this instead of the lossy bus.
-    status: watch::Sender<Option<Message>>,
+    pub(crate) status: watch::Sender<Option<Message>>,
     /// Connection-up state feeding `is_connected` / `wait_connected`.
-    conn: watch::Sender<bool>,
+    pub(crate) conn: watch::Sender<bool>,
+    pub(crate) state: watch::Sender<ConnectionState>,
     /// The last authentication failure (wrong key / version), or `None` while the
     /// connection is healthy — so `wait_connected` can report *why* it won't come
     /// up instead of just timing out (the 0.3 "key or version" diagnostic).
-    autherr: watch::Sender<Option<CoreError>>,
+    pub(crate) autherr: watch::Sender<Option<CoreError>>,
+}
+
+impl Sinks {
+    fn connection(&self, connected: bool) {
+        publish_state(&self.conn, connected);
+        publish_state(
+            &self.state,
+            if connected {
+                ConnectionState::Connected
+            } else {
+                ConnectionState::Disconnected
+            },
+        );
+    }
 }
 
 /// Run until explicitly closed or the last device handle is dropped. Shutdown
@@ -151,10 +165,7 @@ struct Sinks {
 pub(crate) async fn run(
     acfg: ActorConfig,
     cmd_rx: mpsc::Receiver<Cmd>,
-    bcast_tx: broadcast::Sender<Message>,
-    status_tx: watch::Sender<Option<Message>>,
-    conn_tx: watch::Sender<bool>,
-    autherr_tx: watch::Sender<Option<CoreError>>,
+    sinks: Sinks,
     mut shutdown: watch::Receiver<bool>,
 ) {
     tokio::select! {
@@ -166,33 +177,21 @@ pub(crate) async fn run(
                 }
             }
         } => {},
-        _ = run_inner(acfg, cmd_rx, bcast_tx, status_tx, conn_tx.clone(), autherr_tx) => {},
+        _ = run_inner(acfg, cmd_rx, &sinks) => {},
     }
-    publish_state(&conn_tx, false);
+    sinks.connection(false);
 }
 
-async fn run_inner(
-    acfg: ActorConfig,
-    mut cmd_rx: mpsc::Receiver<Cmd>,
-    bcast_tx: broadcast::Sender<Message>,
-    status_tx: watch::Sender<Option<Message>>,
-    conn_tx: watch::Sender<bool>,
-    autherr_tx: watch::Sender<Option<CoreError>>,
-) {
+async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &Sinks) {
     let ActorConfig {
         core,
         mut addr,
+        port,
         connect_timeout,
-        want_scan,
+        discovery,
         connect_limiter,
     } = acfg;
 
-    let sinks = Sinks {
-        bcast: bcast_tx,
-        status: status_tx,
-        conn: conn_tx,
-        autherr: autherr_tx,
-    };
     // Every log line this task emits is prefixed with it: one bridge drives a
     // whole fleet through identical code, so an unattributed line is unreadable.
     let id = core.device_id.clone();
@@ -220,42 +219,72 @@ async fn run_inner(
         //     another input; the core decides what happens next (handshake, or a
         //     backoff timer).
         if fsm.wants_connect() {
+            // Resolution is part of establishment, not a separate supervisor.
+            // No socket or limiter permit is used until an address is available.
+            if let Some(info) = discovery.as_ref().and_then(|d| d.get(&id)) {
+                if addr.is_none() {
+                    addr = Some(join_host_port(&info.ip.to_string(), port));
+                }
+                fsm.handle_input(
+                    Input::ConnectNow {
+                        version: info.version,
+                    },
+                    now_since(base),
+                    &mut rng,
+                );
+            }
+            if addr.is_none() {
+                log::debug!("{id}: address not discovered; retrying with connection backoff");
+                if let Some(disco) = &discovery {
+                    disco.request_scan();
+                }
+                fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
+                sinks.connection(false);
+                settle(&id, &mut fsm, &mut stream, sinks, &mut tx);
+                continue;
+            }
+            let dial_addr = addr.as_mut().expect("resolved before dialing");
             if let Some(limiter) = &connect_limiter {
-                match await_permit(limiter, &mut cmd_rx, &mut addr).await {
-                    Some(p) => permit = Some(p),
+                match await_permit(limiter, &mut cmd_rx, dial_addr).await {
+                    Some((p, version)) => {
+                        permit = Some(p);
+                        fsm.handle_input(Input::ConnectNow { version }, now_since(base), &mut rng);
+                    }
                     // Closed while queued for a slot: never dial, just stop.
                     None => {
-                        publish_state(&sinks.conn, false);
+                        sinks.connection(false);
                         return;
                     }
                 }
             }
-            match timeout(connect_timeout, TcpStream::connect(&addr)).await {
+            match timeout(connect_timeout, TcpStream::connect(dial_addr.as_str())).await {
                 Ok(Ok(s)) => {
                     let _ = s.set_nodelay(true);
                     stream = Some(s);
                     fsm.handle_input(Input::Connected, now_since(base), &mut rng);
                 }
                 Ok(Err(e)) => {
-                    log::debug!("{id}: connect {addr} failed: {e}");
+                    log::debug!("{id}: connect {dial_addr} failed: {e}");
                     stream = None;
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
                     // Ask discovery to re-elicit: the address may be stale, or this
                     // is an active-only device passive can't hear. Coalesced there.
-                    if let Some(w) = &want_scan {
-                        let _ = w.try_send(());
+                    sinks.connection(false);
+                    if let Some(disco) = &discovery {
+                        disco.request_scan();
                     }
                 }
                 Err(_) => {
-                    log::debug!("{id}: connect {addr} timed out");
+                    log::debug!("{id}: connect {dial_addr} timed out");
                     stream = None;
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
-                    if let Some(w) = &want_scan {
-                        let _ = w.try_send(());
+                    sinks.connection(false);
+                    if let Some(disco) = &discovery {
+                        disco.request_scan();
                     }
                 }
             }
-            settle(&id, &mut fsm, &mut stream, &sinks, &mut tx);
+            settle(&id, &mut fsm, &mut stream, sinks, &mut tx);
             // A failed dial (or a v3.1–v3.3 connect, which needs no handshake)
             // already resolved the attempt — give the slot back now.
             if !fsm.is_establishing() {
@@ -291,13 +320,13 @@ async fn run_inner(
                 // than the stale one fixed at spawn.
                 Some(Cmd::ConnectNow { addr: new_addr, version }) => {
                     if let Some(a) = new_addr {
-                        addr = a;
+                        addr = Some(a);
                     }
                     fsm.handle_input(Input::ConnectNow { version }, now_since(base), &mut rng);
                 }
                 // All command senders dropped: shut the task down.
                 None => {
-                    publish_state(&sinks.conn, false);
+                    sinks.connection(false);
                     return;
                 }
             },
@@ -329,7 +358,7 @@ async fn run_inner(
             }
         }
 
-        settle(&id, &mut fsm, &mut stream, &sinks, &mut tx);
+        settle(&id, &mut fsm, &mut stream, sinks, &mut tx);
         // The handshake finished, timed out, or the link dropped: in every case
         // the establishment window is over and the slot belongs to the next
         // device in line.
@@ -353,12 +382,13 @@ async fn await_permit(
     limiter: &ConnectLimiter,
     cmd_rx: &mut mpsc::Receiver<Cmd>,
     addr: &mut String,
-) -> Option<OwnedSemaphorePermit> {
+) -> Option<(OwnedSemaphorePermit, Option<rustuya_core::Version>)> {
+    let mut announced_version = None;
     let acquire = limiter.acquire();
     tokio::pin!(acquire);
     loop {
         tokio::select! {
-            p = &mut acquire => return Some(p),
+            p = &mut acquire => return Some((p, announced_version)),
             cmd = cmd_rx.recv() => match cmd {
                 // Shutdown, or every handle dropped: abandon the slot request.
                 None => return None,
@@ -366,16 +396,13 @@ async fn await_permit(
                 // the dial we're queued for targets the *current* IP rather than
                 // the stale one. The `ConnectNow` itself is a no-op — the FSM is
                 // already in `Connecting`, which is why we're here.
-                Some(Cmd::ConnectNow { addr: new_addr, .. }) => {
+                Some(Cmd::ConnectNow { addr: new_addr, version }) => {
                     if let Some(a) = new_addr {
                         *addr = a;
                     }
-                    // The announced version is dropped here: the FSM isn't
-                    // reachable from this arm, and it would refuse the wake
-                    // anyway (we are queued *because* it is already in
-                    // `Connecting`). A device announces repeatedly, so the next
-                    // one carries it again — at worst one dial goes out on the
-                    // configured version.
+                    if version.is_some() {
+                        announced_version = version;
+                    }
                 }
                 // Dropped exactly as the main loop drops a `Fire` while down:
                 // the caller reads device state off the listener bus.
@@ -493,7 +520,7 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
     while let Some(ev) = fsm.poll_event() {
         match ev {
             Event::Ready => {
-                publish_state(&sinks.conn, true);
+                sinks.connection(true);
                 // A healthy connection clears any stale auth-failure diagnostic.
                 publish_state(&sinks.autherr, None);
             }
@@ -525,7 +552,7 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
             }
             Event::Disconnected => {
                 tore_down = true;
-                publish_state(&sinks.conn, false);
+                sinks.connection(false);
             }
             Event::ReconnectBackoffCapped { max, failures } => {
                 log::warn!(
@@ -626,7 +653,7 @@ mod permit_tests {
     /// A rewake that arrives mid-wait still updates the dial target, so the dial
     /// the device was queued for lands on the freshly-announced IP.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_rewake_mid_wait_updates_the_address() {
+    async fn a_rewake_mid_wait_updates_the_address_and_version() {
         let limiter = ConnectLimiter::new(1);
         let held = limiter.acquire().await;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(4);
@@ -636,7 +663,7 @@ mod permit_tests {
             tokio::spawn(async move {
                 let mut addr = String::from("192.168.1.5:6668");
                 let got = await_permit(&limiter, &mut cmd_rx, &mut addr).await;
-                (got.is_some(), addr)
+                (got, addr)
             })
         };
         tokio::task::yield_now().await;
@@ -644,7 +671,7 @@ mod permit_tests {
         cmd_tx
             .send(Cmd::ConnectNow {
                 addr: Some("192.168.1.9:6668".to_string()),
-                version: None,
+                version: Some(rustuya_core::Version::V3_4),
             })
             .await
             .unwrap();
@@ -652,7 +679,9 @@ mod permit_tests {
         drop(held);
 
         let (got_permit, addr) = waiter.await.unwrap();
-        assert!(got_permit, "the waiter should have been granted the permit");
+        let (_permit, version) =
+            got_permit.expect("the waiter should have been granted the permit");
+        assert_eq!(version, Some(rustuya_core::Version::V3_4));
         assert_eq!(addr, "192.168.1.9:6668", "the new address was not adopted");
     }
 
