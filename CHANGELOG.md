@@ -6,6 +6,23 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-10-18
+
+### Fixed
+
+- Disable closed discovery input channels instead of repeatedly polling them.
+- Refresh last-seen timestamps on unchanged announcements so active devices
+  remain fresh and cache eviction follows the actual sighting order.
+- Zeroize temporary key copies used by commands and heartbeats on drop.
+- Remove discovery routes when their device actor exits, without removing a
+  newer registration for the same device id.
+- Own discovery readers in a `JoinSet`; `Discovery::close()` now waits for the
+  actor and its readers to finish, releasing their sockets before returning.
+- Round positive sub-millisecond core timer intervals up and saturate oversized
+  durations instead of truncating or wrapping. Reject zero heartbeat intervals
+  and zero intervals for repeated discovery probes.
+- Serialize JSON values without silently substituting an empty wire payload.
+
 ## [0.4.3] — 2026-10-06
 
 ### Added
