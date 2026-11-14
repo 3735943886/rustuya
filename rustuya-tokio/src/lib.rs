@@ -697,8 +697,9 @@ impl Device {
 
     /// A [`watch`] of the last **authentication** failure —
     /// a payload that didn't authenticate, which in practice means a wrong local
-    /// key or protocol version. `None` while the connection is healthy (a
-    /// successful connect clears it).
+    /// key or protocol version. `None` until one, and again once a connection
+    /// proves the key: a completed v3.4/v3.5 handshake or a decoded response.
+    /// A v3.1–v3.3 reconnect alone does not clear it — it is only TCP.
     ///
     /// This is the diagnostic [`wait_connected`](Self::wait_connected) reports
     /// instead of a bare [`Timeout`](TuyaError::Timeout); exposed separately so a

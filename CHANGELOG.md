@@ -15,6 +15,13 @@ each tag are the matching `## [version]` section extracted from here.
   stable name (`not_located`, `refused`, `unreachable`, …). Like the other
   watches it publishes changes: the same failure on every retry is written once.
 
+### Fixed
+
+- A v3.1–v3.3 reconnect no longer clears `watch_error`: without a handshake it
+  is only a TCP connect and proves nothing about the key, so a device that
+  rejected us flapped between "up" and "rejected" on every reconnect. A
+  completed v3.4/v3.5 handshake or a decoded response clears it.
+
 ## [0.4.6] — 2026-10-18
 
 ### Fixed

@@ -542,11 +542,20 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks, cause: Option<Link
         match ev {
             Event::Ready => {
                 sinks.connection(true);
-                // A healthy connection clears any stale auth-failure diagnostic.
-                publish_state(&sinks.autherr, None);
                 publish_state(&sinks.failure, None);
+                // A completed handshake proves the key: it clears a stale
+                // auth-failure diagnostic. v3.1–v3.3 have no handshake, so their
+                // `Ready` is only the TCP connect and proves nothing; a decoded
+                // response clears it instead (below). Clearing it here would make
+                // a wrong-key v3.3 device flap between "up" and "rejected us" on
+                // every reconnect.
+                if fsm.version().profile().session_key {
+                    publish_state(&sinks.autherr, None);
+                }
             }
             Event::Response(msg) => {
+                // A frame that decoded authenticated with our key and version.
+                publish_state(&sinks.autherr, None);
                 // One line per decoded frame, for diagnosing a device whose
                 // payloads come out wrong. The retcode is the tell: the decoder
                 // splits it off by protocol rule, so a nonsense value means the
