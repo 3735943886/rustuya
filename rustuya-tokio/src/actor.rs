@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, broadcast, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
 
-use crate::{ConnectLimiter, ConnectionState, Discovery, join_host_port};
+use crate::{ConnectLimiter, ConnectionState, Discovery, LinkFailure, join_host_port};
 
 use rustuya_core::device::{Config as CoreConfig, Device, Event, Input};
 use rustuya_core::json::Value;
@@ -143,9 +143,18 @@ pub(crate) struct Sinks {
     /// connection is healthy — so `wait_connected` can report *why* it won't come
     /// up instead of just timing out (the 0.3 "key or version" diagnostic).
     pub(crate) autherr: watch::Sender<Option<CoreError>>,
+    /// Why the link is down (`None` while connected or before any attempt).
+    pub(crate) failure: watch::Sender<Option<LinkFailure>>,
 }
 
 impl Sinks {
+    /// The link is down, for this reason: the reason first, so a consumer woken
+    /// by the state change already reads it.
+    fn down(&self, why: LinkFailure) {
+        publish_state(&self.failure, Some(why));
+        self.connection(false);
+    }
+
     fn connection(&self, connected: bool) {
         publish_state(&self.conn, connected);
         publish_state(
@@ -242,8 +251,8 @@ async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &S
                     disco.request_scan();
                 }
                 fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
-                sinks.connection(false);
-                settle(&id, &mut fsm, &mut stream, sinks, &mut tx);
+                sinks.down(LinkFailure::NotLocated);
+                settle(&id, &mut fsm, &mut stream, sinks, &mut tx, None);
                 continue;
             }
             let dial_addr = addr.as_mut().expect("resolved before dialing");
@@ -272,7 +281,7 @@ async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &S
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
                     // Ask discovery to re-elicit: the address may be stale, or this
                     // is an active-only device passive can't hear. Coalesced there.
-                    sinks.connection(false);
+                    sinks.down(LinkFailure::Dial(e.kind()));
                     if let Some(disco) = &discovery {
                         disco.request_scan();
                     }
@@ -281,13 +290,13 @@ async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &S
                     log::debug!("{id}: connect {dial_addr} timed out");
                     stream = None;
                     fsm.handle_input(Input::ConnectFailed, now_since(base), &mut rng);
-                    sinks.connection(false);
+                    sinks.down(LinkFailure::DialTimeout);
                     if let Some(disco) = &discovery {
                         disco.request_scan();
                     }
                 }
             }
-            settle(&id, &mut fsm, &mut stream, sinks, &mut tx);
+            settle(&id, &mut fsm, &mut stream, sinks, &mut tx, None);
             // A failed dial (or a v3.1–v3.3 connect, which needs no handshake)
             // already resolved the attempt — give the slot back now.
             if !fsm.is_establishing() {
@@ -301,7 +310,9 @@ async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &S
             .poll_timeout()
             .map(|d| base + StdDuration::from_millis(d.as_millis()));
 
-        // (C) Whichever fires first drives the FSM.
+        // (C) Whichever fires first drives the FSM. `cause` names the reason
+        //     should this turn tear the link down.
+        let mut cause = None;
         tokio::select! {
             cmd = cmd_rx.recv(), if tx.is_empty() => match cmd {
                 Some(Cmd::Fire { cmd, data, cid }) => {
@@ -353,15 +364,17 @@ async fn run_inner(acfg: ActorConfig, mut cmd_rx: mpsc::Receiver<Cmd>, sinks: &S
                 });
                 if let Err(e) = result {
                     log::debug!("{id}: socket error: {e}");
+                    cause = Some(LinkFailure::Closed);
                     fsm.handle_input(Input::Closed, now_since(base), &mut rng);
                 }
             },
             _ = sleep_until(deadline.unwrap_or_else(TokioInstant::now)), if deadline.is_some() => {
+                cause = Some(if fsm.is_connected() { LinkFailure::Silent } else { LinkFailure::HandshakeTimeout });
                 fsm.handle_timeout(now_since(base), &mut rng);
             }
         }
 
-        settle(&id, &mut fsm, &mut stream, sinks, &mut tx);
+        settle(&id, &mut fsm, &mut stream, sinks, &mut tx, cause);
         // The handshake finished, timed out, or the link dropped: in every case
         // the establishment window is over and the slot belongs to the next
         // device in line.
@@ -479,8 +492,9 @@ fn settle(
     stream: &mut Option<TcpStream>,
     sinks: &Sinks,
     tx: &mut PendingWrites,
+    cause: Option<LinkFailure>,
 ) {
-    if dispatch_events(id, fsm, sinks) {
+    if dispatch_events(id, fsm, sinks, cause) {
         *stream = None;
         tx.clear();
     }
@@ -518,14 +532,19 @@ fn publish_state<T: PartialEq>(tx: &watch::Sender<T>, value: T) {
 
 /// Drain `poll_event`, fanning each response out to the listener bus.
 /// Returns `true` if a `Disconnected` was seen (the connection was torn down).
-fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
+/// `cause` is why the input that produced these events would end the link; a
+/// protocol error among them takes precedence, and an unexplained drop reads as
+/// [`LinkFailure::Closed`].
+fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks, cause: Option<LinkFailure>) -> bool {
     let mut tore_down = false;
+    let mut protocol_error = false;
     while let Some(ev) = fsm.poll_event() {
         match ev {
             Event::Ready => {
                 sinks.connection(true);
                 // A healthy connection clears any stale auth-failure diagnostic.
                 publish_state(&sinks.autherr, None);
+                publish_state(&sinks.failure, None);
             }
             Event::Response(msg) => {
                 // One line per decoded frame, for diagnosing a device whose
@@ -555,7 +574,11 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
             }
             Event::Disconnected => {
                 tore_down = true;
-                sinks.connection(false);
+                sinks.down(if protocol_error {
+                    LinkFailure::Protocol
+                } else {
+                    cause.unwrap_or(LinkFailure::Closed)
+                });
             }
             Event::ReconnectBackoffCapped { max, failures } => {
                 log::warn!(
@@ -565,6 +588,7 @@ fn dispatch_events(id: &str, fsm: &mut Device, sinks: &Sinks) -> bool {
                 );
             }
             Event::ProtocolError(e) => {
+                protocol_error = true;
                 if e.is_auth_failure() {
                     // A CRC/HMAC/GCM failure means the payload didn't authenticate
                     // — almost always a wrong local key or protocol version. Surface

@@ -88,6 +88,67 @@ pub enum ConnectionState {
     Disconnected,
 }
 
+/// Why a device's link is down, as last observed — the detail behind
+/// [`ConnectionState::Disconnected`]. Read it with [`Device::watch_failure`].
+///
+/// An authentication failure (wrong local key or protocol version) is reported
+/// separately by [`Device::watch_error`]; a link it tears down shows here as
+/// [`Protocol`](Self::Protocol).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LinkFailure {
+    /// No address or protocol version to dial yet: neither configured nor heard
+    /// in a LAN announcement (discovery off, or the device on another subnet).
+    NotLocated,
+    /// The TCP dial failed with this OS error (refused, unreachable, …).
+    Dial(std::io::ErrorKind),
+    /// The TCP dial did not complete within the connect timeout.
+    DialTimeout,
+    /// The v3.4/v3.5 session-key handshake did not complete in time.
+    HandshakeTimeout,
+    /// An established link went silent past the idle timeout.
+    Silent,
+    /// The device (or the network) closed an established link.
+    Closed,
+    /// A protocol error tore the link down.
+    Protocol,
+}
+
+impl LinkFailure {
+    /// A stable machine-readable name: `not_located`, `refused`, `unreachable`,
+    /// `dial_failed`, `dial_timeout`, `handshake_timeout`, `silent`, `closed`,
+    /// `protocol`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        use std::io::ErrorKind;
+        match self {
+            Self::NotLocated => "not_located",
+            Self::Dial(ErrorKind::ConnectionRefused) => "refused",
+            Self::Dial(ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable) => "unreachable",
+            Self::Dial(_) => "dial_failed",
+            Self::DialTimeout => "dial_timeout",
+            Self::HandshakeTimeout => "handshake_timeout",
+            Self::Silent => "silent",
+            Self::Closed => "closed",
+            Self::Protocol => "protocol",
+        }
+    }
+}
+
+impl core::fmt::Display for LinkFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotLocated => f.write_str("address or protocol version not discovered"),
+            Self::Dial(kind) => write!(f, "connect failed: {kind}"),
+            Self::DialTimeout => f.write_str("connect timed out"),
+            Self::HandshakeTimeout => f.write_str("session handshake timed out"),
+            Self::Silent => f.write_str("no response from the device"),
+            Self::Closed => f.write_str("connection closed"),
+            Self::Protocol => f.write_str("protocol error"),
+        }
+    }
+}
+
 /// Convert std durations to core milliseconds, rounding positive fractions up.
 fn core_dur(d: StdDuration) -> CoreDuration {
     // Preserve positive sub-millisecond delays and saturate instead of wrapping.
@@ -467,6 +528,7 @@ impl DeviceBuilder {
         // Carries the last authentication failure (wrong key / version) so a
         // connect attempt reports *why* rather than only timing out.
         let (autherr_tx, autherr_rx) = watch::channel(None);
+        let (failure_tx, failure_rx) = watch::channel(None);
 
         // If a discovery is linked, register this device's actor so the discovery
         // loop wakes it directly (O(1)) on a re-announcement — carrying the fresh
@@ -503,6 +565,7 @@ impl DeviceBuilder {
                     conn: conn_tx,
                     state: state_tx,
                     autherr: autherr_tx,
+                    failure: failure_tx,
                 },
                 shutdown_rx,
             )
@@ -518,6 +581,7 @@ impl DeviceBuilder {
             conn_rx,
             state_rx,
             autherr_rx,
+            failure_rx,
             send_timeout: self.send_timeout,
         })
     }
@@ -556,6 +620,7 @@ pub struct Device {
     conn_rx: watch::Receiver<bool>,
     state_rx: watch::Receiver<ConnectionState>,
     autherr_rx: watch::Receiver<Option<CoreError>>,
+    failure_rx: watch::Receiver<Option<LinkFailure>>,
     send_timeout: StdDuration,
 }
 
@@ -649,6 +714,16 @@ impl Device {
     #[must_use]
     pub fn watch_error(&self) -> watch::Receiver<Option<CoreError>> {
         self.autherr_rx.clone()
+    }
+
+    /// A [`watch`] of why the link is down: the [`LinkFailure`] behind the last
+    /// failed attempt or lost link, `None` until one and again once connected.
+    ///
+    /// It publishes changes like the other watches: a retry failing the same way
+    /// is not written again, a different reason is.
+    #[must_use]
+    pub fn watch_failure(&self) -> watch::Receiver<Option<LinkFailure>> {
+        self.failure_rx.clone()
     }
 
     /// Wait until the connection is up, or `dur` elapses.

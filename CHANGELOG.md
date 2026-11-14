@@ -6,6 +6,15 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+### Added
+
+- `Device::watch_failure()` and `LinkFailure`: why a link is down — no address
+  or version discovered (`NotLocated`), the TCP dial's OS error (`Dial`, e.g.
+  refused or unreachable), `DialTimeout`, `HandshakeTimeout`, an established
+  link going `Silent` or `Closed`, or a `Protocol` error. `as_str()` gives a
+  stable name (`not_located`, `refused`, `unreachable`, …). Like the other
+  watches it publishes changes: the same failure on every retry is written once.
+
 ## [0.4.6] — 2026-10-18
 
 ### Fixed
