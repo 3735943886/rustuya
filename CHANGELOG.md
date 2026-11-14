@@ -6,6 +6,8 @@ each tag are the matching `## [version]` section extracted from here.
 
 ## [Unreleased]
 
+## [0.4.7] — 2026-11-15
+
 ### Added
 
 - `Device::watch_failure()` and `LinkFailure`: why a link is down — no address
